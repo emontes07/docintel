@@ -51,6 +51,10 @@ class Settings(BaseSettings):
 
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"
+    # Azure OpenAI v1 preview API version for Sora 2 video endpoints.
+    # Sora 2 lives on /openai/v1/videos which requires api-version=preview
+    # (or a specific dated preview). Override via env var if needed.
+    SORA_API_VERSION: str = "preview"
 
     # File storage paths
     UPLOAD_DIR: str = "./static/uploads"

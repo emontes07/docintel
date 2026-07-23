@@ -28,12 +28,12 @@ param containerRegistryName string = 'cr${toLower(uniqueString(resourceGroup().i
 param aiFoundryName string
 @description('Name of the AI Foundry project')
 param aiProjectName string = '${aiFoundryName}-proj'
-@description('Location for AI Foundry (some models are region-specific)')
-param aiFoundryLocation string = 'swedencentral'
+@description('Location for AI Foundry (some models are region-specific). East US 2 catalogs gpt-4o 2024-11-20 (GlobalStandard) and sora-2 as of 2026-07. Override with `azd env set AI_FOUNDRY_LOCATION <region>` if needed.')
+param aiFoundryLocation string = 'eastus2'
 
 // Model deployment names
 @description('Name of the LLM deployment')
-param LLM_DEPLOYMENT string = 'gpt-4o'
+param LLM_DEPLOYMENT string = 'gpt-5'
 @description('Name of the image generation deployment')
 param IMAGEGEN_DEPLOYMENT string = ''
 @description('Name of the gpt-image-1.5 deployment')
@@ -46,8 +46,13 @@ param SORA_DEPLOYMENT string = ''
 param FLUX_KONTEXT_DEPLOYMENT string = ''
 
 // Model types and versions (for Bicep-managed deployments)
-param llmModelType string = 'gpt-4o'
-param llmModelVersion string = '2024-11-20'
+// NOTE: gpt-4o (2024-08-06, 2024-11-20) and gpt-4.1 (2025-04-14) are all in
+// deprecating state and cannot be used for new deployments in eastus2.
+// gpt-5 2025-08-07 is deployable with GlobalStandard SKU
+// (per `az cognitiveservices model list -l eastus2 --query "[?model.name=='gpt-5']"`).
+// Announced inference deprecation: 2027-02-06.
+param llmModelType string = 'gpt-5'
+param llmModelVersion string = '2025-08-07'
 // Image/video models may be deployed via CLI when Bicep doesn't support the format
 @description('Set to true to deploy image gen models via Bicep (requires OpenAI-format models)')
 param deployImageGenModels bool = false
@@ -57,6 +62,12 @@ param imageGen15ModelVersion string = '2024-04-01'
 param imageGen1MiniModelVersion string = '2024-04-01'
 @description('Set to true to deploy Sora via Bicep')
 param deploySoraModel bool = false
+@description('Sora model name in the AI Foundry catalog (e.g., `sora-2`). README documents `sora-2` for video generation.')
+param soraModelName string = 'sora-2'
+// TODO: Confirm the exact published `sora-2` version for your region with:
+//   az cognitiveservices model list -l <region> --query "[?model.name=='sora-2'].model.version" -o tsv
+// The value below is the last known Sora-family version shipped by the template and
+// may need to be updated to a Sora 2 release date before enabling `deploySoraModel`.
 param soraModelVersion string = '2025-05-02'
 
 // Docker images for the backend and frontend container apps
@@ -291,7 +302,7 @@ module soraDeployment './modules/aiFoundryModelDeployment.bicep' = if (deploySor
   params: {
     aiFoundryName: aiFoundryName
     deploymentName: SORA_DEPLOYMENT
-    modelName: 'sora'
+    modelName: soraModelName
     modelVersion: soraModelVersion
     skuCapacity: 1
   }

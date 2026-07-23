@@ -24,6 +24,7 @@ try:
         deployment_name=settings.SORA_DEPLOYMENT,
         credential=credential,
         token_provider=token_provider,
+        api_version=settings.SORA_API_VERSION,
     )
     logger.info(f"Initialized Sora 2 client with Foundry endpoint, deployment: {settings.SORA_DEPLOYMENT}")
 except Exception as e:

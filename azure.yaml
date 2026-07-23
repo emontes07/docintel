@@ -11,6 +11,7 @@ services:
     docker:
       path: ./backend/Dockerfile
       context: .
+      remoteBuild: true
   frontend:
     project: ./frontend
     language: js
@@ -18,6 +19,7 @@ services:
     docker:
       path: ./Dockerfile
       context: .
+      remoteBuild: true
 
 hooks:
   postprovision:

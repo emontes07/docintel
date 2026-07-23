@@ -1,0 +1,57 @@
+# Root-level .dockerignore
+# Both azure.yaml services use `context: .` (repo root), so this applies to
+# the ACR remote-build upload context for backend and frontend.
+# Per-service Dockerfiles already have their own .dockerignore for local builds.
+
+# Agent / IDE tooling metadata (may contain broken symlinks that break remote build)
+.claude/
+.agents/
+.github/copilot-instructions.md
+.vscode/
+.idea/
+
+# Git and CI
+.git/
+.gitignore
+.github/
+
+# Docs and samples not needed at build time
+*.md
+notebooks/
+tests/
+docs/
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+
+# Node / frontend build artifacts (frontend Dockerfile handles its own install)
+**/node_modules/
+**/.next/
+**/out/
+**/coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Azure / azd local state
+.azure/
