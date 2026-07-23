@@ -88,6 +88,7 @@ class GPTImageClient:
             "gpt-image-1.5": settings.IMAGEGEN_DEPLOYMENT,
             "gpt-image-1": settings.IMAGEGEN_DEPLOYMENT,  # legacy alias
             "gpt-image-1-mini": settings.IMAGEGEN_1_MINI_DEPLOYMENT,
+            "gpt-image-2": settings.IMAGEGEN_2_DEPLOYMENT,
             "flux-kontext-pro": settings.FLUX_KONTEXT_DEPLOYMENT,
         }
         deployment = mapping.get(model)

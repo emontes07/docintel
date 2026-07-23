@@ -33,6 +33,7 @@ def env_status():
     optional_vars = [
         'FLUX_KONTEXT_DEPLOYMENT',
         'IMAGEGEN_1_MINI_DEPLOYMENT',
+        'IMAGEGEN_2_DEPLOYMENT',
     ]
 
     set_required_vars = [var for var in required_vars if _is_setting_defined(var)]

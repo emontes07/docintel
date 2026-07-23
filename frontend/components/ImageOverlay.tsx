@@ -563,7 +563,7 @@ export function ImageOverlay({
                     <Select value={model} onValueChange={setModel} disabled={isGenerating}>
                       <SelectTrigger className="h-7 w-auto gap-1 px-2.5 text-xs rounded-md border-0 bg-muted/50 hover:bg-muted">
                         <span>{
-                          { "gpt-image-1.5": "GPT-Image-1.5", "gpt-image-1-mini": "GPT-Image-1 Mini", "flux-kontext-pro": "FLUX Kontext Pro" }[model] ?? model
+                          { "gpt-image-1.5": "GPT-Image-1.5", "gpt-image-1-mini": "GPT-Image-1 Mini", "gpt-image-2": "GPT-Image-2", "flux-kontext-pro": "FLUX Kontext Pro" }[model] ?? model
                         }</span>
                       </SelectTrigger>
                       <SelectContent align="start">
@@ -577,6 +577,12 @@ export function ImageOverlay({
                           <div className="flex flex-col">
                             <span>GPT-Image-1 Mini</span>
                             <span className="text-xs text-muted-foreground">Economical</span>
+                          </div>
+                        </SelectItem>
+                        <SelectItem value="gpt-image-2" className="py-2">
+                          <div className="flex flex-col">
+                            <span>GPT-Image-2</span>
+                            <span className="text-xs text-muted-foreground">Latest, higher quality</span>
                           </div>
                         </SelectItem>
                         <SelectItem value="flux-kontext-pro" className="py-2">
