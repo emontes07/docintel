@@ -112,8 +112,6 @@ class VideoAnalyzer:
             response = await self.async_openai_client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0,
-                seed=0,
                 response_format={"type": "json_object"},
             )
 
@@ -166,8 +164,6 @@ class VideoAnalyzer:
             response = self.openai_client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0,
-                seed=0,
                 response_format={"type": "json_object"},
             )
 
@@ -229,8 +225,6 @@ class ImageAnalyzer:
             response = await self.async_openai_client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0,
-                seed=0,
                 response_format={"type": "json_object"},
             )
 
@@ -284,8 +278,6 @@ class ImageAnalyzer:
             response = self.openai_client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=0,
-                seed=0,
                 response_format={"type": "json_object"},
             )
 
