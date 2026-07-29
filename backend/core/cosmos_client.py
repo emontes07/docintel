@@ -116,8 +116,11 @@ class CosmosDBService:
             if "media_type" not in asset_data:
                 asset_data["media_type"] = "unknown"
 
-            # Add document type for easier querying
-            asset_data["doc_type"] = "asset_metadata"
+            # Add document type for easier querying (only if caller didn't set one).
+            # Folder placeholders pass doc_type="folder_placeholder"; overwriting it
+            # would make them invisible to the media_type-filtered folder listing.
+            if "doc_type" not in asset_data:
+                asset_data["doc_type"] = "asset_metadata"
 
             # Create the document
             created_item = self.container.create_item(body=asset_data)
