@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import Image from "next/image";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { X, ArrowUp, Settings, Eye, Loader2, Wand2, RectangleHorizontal, RectangleVertical, SignalMedium, SignalHigh, Timer, FolderTree, Plus, RefreshCw, PlusCircle } from "lucide-react";
+import { X, ArrowUp, Settings, Eye, Loader2, Wand2, RectangleHorizontal, RectangleVertical, SignalMedium, SignalHigh, Timer, FolderTree, Plus, RefreshCw, PlusCircle, Check } from "lucide-react";
 import {
   Select,
   SelectContent,
@@ -149,6 +149,22 @@ export function VideoOverlay({
   // Client-side detection (same as ImageOverlay)
   useEffect(() => {
     setIsClient(true);
+  }, []);
+
+  // Layer 1/2 UX state: "just queued" (button cooldown) + persistent banner.
+  // Refs (not state) for the guard so their updates don't trigger re-renders.
+  const [justQueued, setJustQueued] = useState(false);
+  const [bannerVisible, setBannerVisible] = useState(false);
+  const justQueuedTimerRef = useRef<number | null>(null);
+  const bannerTimerRef = useRef<number | null>(null);
+  const lastSubmittedPromptRef = useRef<string | null>(null);
+  const lastSubmittedAtRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (justQueuedTimerRef.current) window.clearTimeout(justQueuedTimerRef.current);
+      if (bannerTimerRef.current) window.clearTimeout(bannerTimerRef.current);
+    };
   }, []);
 
   // Listen for prompt-suggestion events fired by the video queue when the
@@ -408,6 +424,39 @@ export function VideoOverlay({
   const handleSubmit = () => {
     if (!prompt.trim()) return;
 
+    // Layer 3: same-prompt guard. Confirm before spending another Sora job on
+    // the identical prompt that was submitted less than 60s ago.
+    const trimmed = prompt.trim();
+    const now = Date.now();
+    const lastAt = lastSubmittedAtRef.current;
+    if (
+      lastSubmittedPromptRef.current === trimmed &&
+      lastAt !== null &&
+      now - lastAt < 60_000
+    ) {
+      const secsAgo = Math.max(1, Math.round((now - lastAt) / 1000));
+      const proceed =
+        typeof window !== "undefined" &&
+        window.confirm(
+          `You just submitted this same prompt ${secsAgo} seconds ago. ` +
+            `Do you want to submit it again? Each submission uses a paid Sora job.`
+        );
+      if (!proceed) return;
+    }
+
+    // Record this submission for the guard + banner
+    lastSubmittedPromptRef.current = trimmed;
+    lastSubmittedAtRef.current = now;
+
+    // Layer 1 (button cooldown): keep the button visibly "queued" for 8s
+    // Layer 2 (banner): keep the inline confirmation for 30s
+    setJustQueued(true);
+    if (justQueuedTimerRef.current) window.clearTimeout(justQueuedTimerRef.current);
+    justQueuedTimerRef.current = window.setTimeout(() => setJustQueued(false), 8000);
+    setBannerVisible(true);
+    if (bannerTimerRef.current) window.clearTimeout(bannerTimerRef.current);
+    bannerTimerRef.current = window.setTimeout(() => setBannerVisible(false), 30_000);
+
     onGenerate({
       prompt,
       aspectRatio,
@@ -541,6 +590,33 @@ export function VideoOverlay({
                 )}
               </div>
             )}
+            {bannerVisible && (
+              <div
+                className={cn(
+                  "flex items-center gap-2 rounded-md px-3 py-2 text-sm mb-1 border",
+                  isDarkTheme
+                    ? "bg-green-500/10 border-green-500/30 text-green-100"
+                    : "bg-green-50 border-green-200 text-green-800"
+                )}
+              >
+                <Check className="h-4 w-4 flex-shrink-0" />
+                <span className="flex-1">
+                  Video queued. It will appear in your gallery in ~1\u20132 minutes.{" "}
+                  <a href="/jobs" className="underline underline-offset-2 font-medium">
+                    Track progress in Jobs
+                  </a>
+                  .
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setBannerVisible(false)}
+                  aria-label="Dismiss"
+                  className="opacity-60 hover:opacity-100 -mr-1"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
             <div className="flex items-center gap-3">
               <Button
                 variant="ghost"
@@ -668,14 +744,18 @@ export function VideoOverlay({
                     ? "bg-white/10 hover:bg-white/20 text-white" 
                     : "bg-gray-100 hover:bg-gray-200 text-gray-900"
                 )}
-                disabled={isGenerating || !prompt.trim()}
+                disabled={isGenerating || justQueued || !prompt.trim()}
               >
-                {isGenerating ? (
+                {(isGenerating || justQueued) ? (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                 ) : (
                   <ArrowUp className="h-4 w-4 mr-2" />
                 )}
-                {isGenerating ? "Generating..." : "Generate"}
+                {justQueued
+                  ? "Video queued \u2713"
+                  : isGenerating
+                  ? "Generating\u2026"
+                  : "Generate"}
               </Button>
             </div>
 

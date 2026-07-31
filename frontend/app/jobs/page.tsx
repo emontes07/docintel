@@ -28,7 +28,7 @@ function JobsPageContent() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const isMountedRef = useRef(false)
-  const [autoRefresh, setAutoRefresh] = useState(false)
+  const [autoRefresh, setAutoRefresh] = useState(true)
   const intervalRef = useRef<NodeJS.Timeout | null>(null)
 
   // Stats
