@@ -1056,6 +1056,44 @@ export async function moderationSafeRewrite(prompt: string): Promise<string> {
   return data.rewritten_prompt;
 }
 
+export interface FinalizeVideoJobResult {
+  success: boolean;
+  job_id: string;
+  status?: string;
+  message?: string;
+  generations: Array<{
+    generation_id: string;
+    already_finalized: boolean;
+    blob_name?: string;
+    url?: string;
+  }>;
+}
+
+/**
+ * Server-side finalize a completed Sora job: download the video(s) from Sora
+ * and upload to the gallery. Idempotent \u2014 safe to call multiple times.
+ * Recovers "orphaned" jobs where the client-side polling never uploaded.
+ */
+export async function finalizeVideoJob(
+  jobId: string,
+  folderPath?: string
+): Promise<FinalizeVideoJobResult> {
+  const params = new URLSearchParams();
+  if (folderPath) params.append('folder_path', folderPath);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const url = `${API_BASE_URL}/videos/jobs/${jobId}/finalize${suffix}`;
+
+  const response = await fetch(url, { method: 'POST' });
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to finalize job: ${response.status} ${response.statusText}`
+    );
+  }
+
+  return response.json();
+}
+
 /**
  * Enhance a prompt using the backend API (for videos)
  */

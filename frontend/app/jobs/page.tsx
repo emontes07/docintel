@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState, useCallback, useRef, Suspense } from "react"
-import { listVideoGenerationJobs } from "@/services/api"
+import { listVideoGenerationJobs, finalizeVideoJob } from "@/services/api"
 import { RefreshCw, Clock } from "lucide-react"
 import { PageHeader } from "@/components/page-header"
 import { useJobs } from "@/context/jobs-context"
@@ -77,6 +77,21 @@ function JobsPageContent() {
             inProgress,
             completed,
             failed
+          })
+
+          // Recovery: silently server-side-finalize any completed jobs whose
+          // client-side upload never fired. The backend endpoint is idempotent
+          // (skips generations already in the gallery), so this is a no-op
+          // when everything is healthy and a rescue when it isn't.
+          const toFinalize = data.filter(
+            (job) => job.status === "succeeded" || job.status === "completed"
+          )
+          toFinalize.forEach((job) => {
+            finalizeVideoJob(job.id).catch((err) => {
+              // Recovery is best-effort; user can still use the per-row
+              // "Save to gallery" button if this fails.
+              console.warn("auto-finalize failed for", job.id, err)
+            })
           })
         }
       }, 0);

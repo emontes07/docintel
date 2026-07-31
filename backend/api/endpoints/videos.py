@@ -258,6 +258,201 @@ async def delete_failed_video_generation_jobs():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/jobs/{job_id}/finalize")
+async def finalize_video_job(
+    job_id: str,
+    folder_path: Optional[str] = None,
+    cosmos_service: Optional[CosmosDBService] = Depends(get_cosmos_service),
+):
+    """
+    Server-side finalizer: for a completed Sora job, download the generated
+    video(s) from Sora, upload to blob storage, and write metadata to Cosmos.
+
+    This recovers "orphaned" jobs whose client-side upload never fired (e.g.,
+    the user closed the browser tab before the polling loop completed). Safe
+    to call multiple times \u2014 duplicate detection short-circuits when the
+    generation already has a matching gallery record.
+    """
+    import tempfile
+    from azure.storage.blob import ContentSettings
+    from backend.core.azure_storage import AzureBlobStorageService
+
+    if sora_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Video generation service is currently unavailable.",
+        )
+
+    try:
+        job = await sora_client.get_video_generation_job(job_id)
+    except Exception as e:
+        logger.error(f"finalize_video_job: cannot fetch job {job_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"Cannot fetch job: {e}")
+
+    status_str = job.get("status")
+    if status_str not in ("succeeded", "completed"):
+        return {
+            "success": False,
+            "job_id": job_id,
+            "status": status_str,
+            "message": f"Job is not complete yet (status={status_str}).",
+            "generations": [],
+        }
+
+    generations = job.get("generations") or []
+    if not generations:
+        return {
+            "success": False,
+            "job_id": job_id,
+            "status": status_str,
+            "message": "Job succeeded but has no generations.",
+            "generations": [],
+        }
+
+    prompt = (job.get("prompt") or "").strip()
+    n_seconds = job.get("n_seconds")
+    width = job.get("width")
+    height = job.get("height")
+
+    azure_service = AzureBlobStorageService()
+    normalized_folder = (
+        azure_service.normalize_folder_path(folder_path) if folder_path else ""
+    )
+
+    results = []
+    for gen in generations:
+        gen_id = gen.get("id")
+        if not gen_id:
+            continue
+
+        # Idempotency: skip if this generation already has a gallery record
+        already = None
+        if cosmos_service:
+            try:
+                existing = await asyncio.to_thread(
+                    lambda: list(
+                        cosmos_service.container.query_items(
+                            query=(
+                                "SELECT TOP 1 c.blob_name, c.url FROM c "
+                                "WHERE c.doc_type = 'asset_metadata' "
+                                "AND c.media_type = 'video' "
+                                "AND (c.generation_id = @gid "
+                                "OR c.custom_metadata.generationId = @gid)"
+                            ),
+                            parameters=[{"name": "@gid", "value": gen_id}],
+                            enable_cross_partition_query=True,
+                        )
+                    )
+                )
+                if existing:
+                    already = existing[0]
+            except Exception as e:
+                logger.warning(
+                    f"finalize_video_job: cosmos duplicate-check failed for {gen_id}: {e}"
+                )
+
+        if already:
+            results.append(
+                {
+                    "generation_id": gen_id,
+                    "already_finalized": True,
+                    "blob_name": already.get("blob_name"),
+                    "url": already.get("url"),
+                }
+            )
+            continue
+
+        # Download from Sora into a temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
+            temp_file_path = temp_file.name
+
+        try:
+            downloaded_path = await sora_client.get_video_generation_video_content(
+                gen_id,
+                os.path.basename(temp_file_path),
+                os.path.dirname(temp_file_path),
+            )
+
+            # Build a filename similar to the client-side helper
+            slug = re.sub(r"[^a-zA-Z0-9_-]", "_", prompt[:50]).strip("_") or "video"
+            base_filename = f"{slug}_{gen_id}.mp4"
+            final_filename = f"{normalized_folder}{base_filename}"
+
+            container_client = azure_service.blob_service_client.get_container_client(
+                "videos"
+            )
+            blob_client = container_client.get_blob_client(final_filename)
+
+            def _sync_upload() -> None:
+                with open(downloaded_path, "rb") as f:
+                    blob_client.upload_blob(
+                        data=f,
+                        content_settings=ContentSettings(content_type="video/mp4"),
+                        overwrite=True,
+                    )
+
+            await asyncio.to_thread(_sync_upload)
+            blob_url = blob_client.url
+
+            # Best-effort Cosmos metadata
+            if cosmos_service:
+                try:
+                    asset_id = final_filename.split(".")[0].split("/")[-1]
+                    cosmos_metadata = {
+                        "id": asset_id,
+                        "media_type": "video",
+                        "blob_name": final_filename,
+                        "container": "videos",
+                        "url": blob_url,
+                        "filename": base_filename,
+                        "size": os.stat(downloaded_path).st_size,
+                        "content_type": "video/mp4",
+                        "folder_path": normalized_folder,
+                        "prompt": prompt,
+                        "model": "sora",
+                        "generation_id": gen_id,
+                        "has_analysis": False,
+                        "duration": n_seconds,
+                        "resolution": (
+                            f"{width}x{height}" if width and height else ""
+                        ),
+                        "custom_metadata": {
+                            "sourceJobId": job_id,
+                            "generationId": gen_id,
+                            "finalized_server_side": "true",
+                        },
+                    }
+                    await asyncio.to_thread(
+                        cosmos_service.create_asset_metadata, cosmos_metadata
+                    )
+                except Exception as cosmos_error:
+                    logger.warning(
+                        f"finalize_video_job: cosmos create failed for {gen_id}: {cosmos_error}"
+                    )
+
+            results.append(
+                {
+                    "generation_id": gen_id,
+                    "already_finalized": False,
+                    "blob_name": final_filename,
+                    "url": blob_url,
+                }
+            )
+        finally:
+            try:
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+            except Exception:
+                pass
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "status": status_str,
+        "generations": results,
+    }
+
+
 @router.post("/generate-with-analysis/stream")
 async def stream_video_generation_with_analysis(
     prompt: str = Form(...),

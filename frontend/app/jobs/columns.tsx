@@ -1,11 +1,14 @@
 "use client"
 
-import { Check, X, RefreshCw, Clock, ArrowUpDown } from "lucide-react"
+import { useState } from "react"
+import { Check, X, RefreshCw, Clock, ArrowUpDown, Save } from "lucide-react"
 import { ColumnDef } from "@tanstack/react-table"
+import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { VideoJob } from "@/types/jobs"
+import { finalizeVideoJob } from "@/services/api"
 
 // Helper function to format timestamps from the API (which are in seconds)
 function formatApiTimestamp(timestamp?: number): string {
@@ -129,4 +132,68 @@ export const columns: ColumnDef<VideoJob>[] = [
       return <div>{formatApiTimestamp(timestamp)}</div>
     },
   },
-] 
+  {
+    id: "actions",
+    header: "",
+    enableSorting: false,
+    cell: ({ row }) => {
+      const status = row.getValue("status") as string
+      const jobId = row.getValue("id") as string
+      const isCompleted = status === "succeeded" || status === "completed"
+      if (!isCompleted) return null
+      return <FinalizeJobButton jobId={jobId} />
+    },
+  },
+]
+
+// Inline button used in the actions column. Server-finalizes a completed Sora
+// job \u2014 downloads the video to blob + writes Cosmos metadata \u2014 so it
+// shows up in the gallery even if the client-side polling never ran.
+function FinalizeJobButton({ jobId }: { jobId: string }) {
+  const [busy, setBusy] = useState(false)
+  const onClick = async () => {
+    if (busy) return
+    setBusy(true)
+    const workingId = toast.loading("Saving video to gallery\u2026")
+    try {
+      const res = await finalizeVideoJob(jobId)
+      const gens = res.generations || []
+      if (gens.length === 0) {
+        toast.error("Nothing to save", {
+          id: workingId,
+          description: res.message || "Job is not complete yet.",
+        })
+      } else if (gens.every((g) => g.already_finalized)) {
+        toast.success("Already in gallery", {
+          id: workingId,
+          description: "This video is already saved.",
+        })
+      } else {
+        toast.success("Saved to gallery", {
+          id: workingId,
+          description: `${gens.length} video${gens.length === 1 ? "" : "s"} added.`,
+        })
+      }
+    } catch (err) {
+      toast.error("Could not save video", {
+        id: workingId,
+        description: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={onClick}
+      disabled={busy}
+      className="h-7 px-2"
+      title="Save this video to the gallery"
+    >
+      <Save className={"h-4 w-4 mr-1 " + (busy ? "animate-pulse" : "")} />
+      {busy ? "Saving\u2026" : "Save to gallery"}
+    </Button>
+  )
+}
