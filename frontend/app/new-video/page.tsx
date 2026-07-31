@@ -532,13 +532,27 @@ function NewVideoPageContent() {
             error !== null &&
             typeof error === "object" &&
             ("handled" in error || (error as { name?: string }).name === "HandledQueueError");
-          if (!handled) {
+          const rawMessage = error instanceof Error ? error.message : String(error ?? "");
+          // Detect Sora rate-limit surfacing as an HTTP 500 with the raw 429 text.
+          const isRateLimit =
+            /rate.?limit/i.test(rawMessage) ||
+            /429\b/.test(rawMessage) ||
+            /too many requests/i.test(rawMessage);
+          if (handled) {
+            toast.dismiss(toastId);
+          } else if (isRateLimit) {
+            toast.error("Sora is rate-limited", {
+              id: toastId,
+              description:
+                "You're hitting the Sora deployment's per-minute quota. Wait ~30–60 seconds and try again. " +
+                "If this happens often, increase the Sora deployment capacity in Azure AI Foundry.",
+              duration: 15000,
+            });
+          } else {
             toast.error("Could not connect to the backend API", {
               id: toastId,
               description: "Please try again later"
             });
-          } else {
-            toast.dismiss(toastId);
           }
           setIsGenerating(false);
         }

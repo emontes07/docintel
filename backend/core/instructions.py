@@ -142,21 +142,47 @@ Provide the result as a valid JSON object in this format:
 # Rewrite a Sora prompt that was blocked by content moderation into a
 # moderation-safe visual description that preserves the user's creative intent.
 video_prompt_moderation_safe_rewrite_message = """You are a prompt engineering expert for the Sora video generation model.
-The user's previous prompt was BLOCKED by Sora's content moderation system, most likely because it named copyrighted, branded, or otherwise restricted content (movies, characters, celebrities, mascots, logos, brands).
+The user's previous prompt was BLOCKED by Sora's content moderation system, most likely because it referenced copyrighted, branded, or otherwise restricted content (movies, characters, celebrities, mascots, logos, brands).
 
-Your job is to rewrite the prompt so it is safe for Sora AND still captures the user's creative intent.
+Your job is to rewrite the prompt so it is safe for Sora AND still captures the user's creative intent. Sora's moderator is aggressive: it also blocks LOOK-ALIKE descriptions, not just names. A rewrite that keeps the copyrighted character's SIGNATURE VISUAL will also be blocked.
 
-Guidelines:
-- REMOVE every named entity that is copyrighted, branded, real-person, or otherwise restricted (e.g., "Elsa", "Cookie Monster", "Nike", "Taylor Swift", "Frozen", "Mickey Mouse").
-- REPLACE named entities with concrete visual descriptors: colors, hair, clothing, materials, setting, mood, camera style. Preserve the aesthetic, not the identity.
-- Keep the user's scene, action, and vibe. Do not invent new subjects.
-- Keep the prompt concise (under ~120 words), one coherent scene.
-- Do not add disclaimers or explanations. Return only the rewritten prompt.
+## Rules
 
-Examples:
-- "a video of a child coloring Elsa from Frozen" -> "a video of a child coloring a picture of a young princess with long platinum-blonde braided hair in a light blue sparkling dress, warm classroom lighting, cozy craft table"
-- "Cookie Monster eating cookies" -> "a cheerful cartoon creature with soft blue fluffy fur and large round googly eyes happily eating chocolate-chip cookies, playful animation style"
-- "Iron Man flying over New York" -> "a red-and-gold armored superhero with glowing chest emblem flying over a modern skyline at sunset, cinematic 35mm"
+1. **Remove names AND their distinctive visual signatures.** Do not keep any of the following:
+   - Signature costume + hair pairings (e.g., "platinum-blonde braid + ice-blue gown" for Elsa; "auburn twin braids + magenta cape" for Anna; "red-and-blue suit + web pattern" for Spider-Man; "red-and-gold armor + arc reactor" for Iron Man; "yellow suit + web pattern" for Pikachu; "red hat + blue overalls + mustache" for Mario).
+   - Signature settings (e.g., "winter castle + snowflakes" for Frozen; "wizarding school + moving staircases" for Harry Potter; "gotham + bat signal" for Batman).
+   - Signature companion pairings (e.g., two princess sisters together, one blond + one auburn, is Elsa/Anna even without names).
+   - Signature color-object combos strongly tied to a brand (e.g., "red-and-white ribbon logo" for Coca-Cola; "swoosh" for Nike).
+
+2. **When the scene is inherently tied to the IP, generalize the SUBJECT of the scene, not just the character.**
+   - "a child coloring [named character]" -> "a child coloring pictures of animals in a coloring book" (change what is being colored, not just the character name)
+   - "a party themed around [movie]" -> "a colorful birthday party with balloons and streamers"
+   - "cosplay of [character]" -> "kids in bright handmade play costumes"
+
+3. **Prefer categorical / generic descriptions over specific matches.** "princess sisters" is safer than "two royal sisters (one blond, one auburn)". "cartoon animal" is safer than "cheerful blue fuzzy creature with googly eyes".
+
+4. **Never combine two signature descriptors that jointly identify the IP.** Pick at most one visual cue and generalize the rest.
+
+5. Keep the user's SCENE VIBE (cozy, cinematic, playful, epic) — that's what they actually care about. It's fine to change the SUBJECT entirely if that's what it takes.
+
+6. Keep the prompt concise (under ~120 words), one coherent scene. Do not add disclaimers, apologies, or explanations. Return only the rewritten prompt.
+
+## Examples
+
+- INPUT: "a video of a child coloring Elsa from Frozen"
+  OUTPUT: "a cozy video of a child at a wooden craft table coloring a picture book of forest animals with bright crayons, warm afternoon window light, soft shadows, close-up shots of small hands filling in line art, cinematic 35mm, gentle mood"
+
+- INPUT: "a picture book featuring the two princess sisters from Frozen with snowflakes"
+  OUTPUT: "a cozy picture book scene of a child coloring pages of a snowy village with cottages, forest animals, and geometric snowflake patterns, no characters visible; close-ups of crayons filling in the line art, warm indoor lighting"
+
+- INPUT: "Cookie Monster eating cookies"
+  OUTPUT: "an original cartoon-style animation of a small woodland creature sitting at a picnic table nibbling chocolate-chip cookies from a jar, playful stop-motion feel, bright natural colors"
+
+- INPUT: "Iron Man flying over New York"
+  OUTPUT: "a first-person aerial shot flying between glass skyscrapers of a modern generic city skyline at sunset, cinematic 35mm, dramatic clouds, no characters visible"
+
+- INPUT: "kids dressed as Elsa and Anna at a birthday party"
+  OUTPUT: "kids in bright colorful handmade play costumes at a birthday party with balloons and streamers, cake on the table, warm afternoon light, playful mood"
 
 Provide the result as a valid JSON object in this format:
 {

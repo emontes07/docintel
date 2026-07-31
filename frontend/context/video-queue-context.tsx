@@ -56,6 +56,22 @@ function formatFailureMessage(reason?: string | null): { title: string; descript
   const code = codeMatch?.[1];
   const message = msgMatch?.[1] || raw;
 
+  // Sora rate limit — detect either the parsed code or the raw 429/rate_limit text
+  const looksRateLimited =
+    code === "rate_limit_exceeded" ||
+    /rate.?limit/i.test(raw) ||
+    /429\b/.test(raw) ||
+    /too many requests/i.test(raw);
+  if (looksRateLimited) {
+    return {
+      code: "rate_limit_exceeded",
+      title: "Sora is rate-limited",
+      description:
+        "You're hitting the Sora deployment's per-minute quota. Wait ~30\u201360 seconds and try again. " +
+        "If this happens often, increase the Sora deployment capacity in Azure AI Foundry.",
+    };
+  }
+
   if (code === "moderation_blocked") {
     return {
       code,
@@ -85,6 +101,20 @@ function dispatchPromptSuggestion(prompt: string) {
       new CustomEvent(PROMPT_SUGGESTION_EVENT, { detail: { prompt } })
     );
   }
+}
+
+// Track prompts that came from a moderation-safe rewrite. If one of those
+// prompts fails moderation AGAIN, we escalate the toast copy instead of
+// offering yet another rewrite loop. Module-level so it persists across
+// re-renders within the same session.
+const rewrittenPromptCache = new Set<string>();
+function rememberRewrittenPrompt(prompt: string) {
+  const key = (prompt || "").trim();
+  if (key) rewrittenPromptCache.add(key);
+}
+function wasFromRewrite(prompt: string): boolean {
+  const key = (prompt || "").trim();
+  return key.length > 0 && rewrittenPromptCache.has(key);
 }
 
 // Marker error used when the queue context has already surfaced a toast for the
@@ -119,6 +149,7 @@ async function handleModerationFailure(originalPrompt: string) {
       action: {
         label: "Use this prompt",
         onClick: () => {
+          rememberRewrittenPrompt(rewritten);
           dispatchPromptSuggestion(rewritten);
           toast.success("Prompt updated \u2014 review and hit Generate", {
             duration: 4000,
@@ -157,6 +188,20 @@ function handleGenerationFailure(
   originalPrompt: string
 ) {
   const { title, description, code } = formatFailureMessage(failureReason);
+
+  // Escalate: if the failing prompt was already produced by our rewrite,
+  // don't offer another rewrite loop — tell the user the theme itself is
+  // too tied to copyrighted content and to try a totally different scene.
+  if (code === "moderation_blocked" && wasFromRewrite(originalPrompt)) {
+    toast.error("Even the safer version was blocked", {
+      description:
+        "This scene may be too closely tied to copyrighted characters or brands. " +
+        "Try a completely different subject \u2014 for example animals, nature, food, sports, or abstract art \u2014 while keeping the mood you want.",
+      duration: 20000,
+    });
+    return;
+  }
+
   if (code === "moderation_blocked" && originalPrompt) {
     // Auto-rewrite path replaces the generic error toast entirely.
     handleModerationFailure(originalPrompt);
