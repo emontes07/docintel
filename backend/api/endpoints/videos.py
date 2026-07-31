@@ -25,6 +25,7 @@ from backend.core.instructions import (
     analyze_video_system_message,
     filename_system_message,
     video_prompt_enhancement_system_message,
+    video_prompt_moderation_safe_rewrite_message,
 )
 from backend.models.videos import (
     VideoFilenameGenerateRequest,
@@ -36,6 +37,8 @@ from backend.models.videos import (
     VideoGenerationWithAnalysisResponse,
     VideoPromptEnhancementRequest,
     VideoPromptEnhancementResponse,
+    VideoPromptModerationSafeRewriteRequest,
+    VideoPromptModerationSafeRewriteResponse,
     CameoReference,
     RemixVideoRequest,
 )
@@ -1297,6 +1300,63 @@ async def enhance_video_prompt(req: VideoPromptEnhancementRequest):
 
     except Exception as e:
         logger.error(f"Error enhancing video prompt: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post(
+    "/prompt/moderation-safe-rewrite",
+    response_model=VideoPromptModerationSafeRewriteResponse,
+)
+async def moderation_safe_rewrite_video_prompt(
+    req: VideoPromptModerationSafeRewriteRequest,
+):
+    """
+    Rewrite a Sora prompt that was blocked by content moderation into a
+    moderation-safe visual description that preserves the user's creative intent.
+
+    The rewrite replaces named copyrighted/branded/celebrity entities with
+    concrete visual descriptors (colors, hair, clothing, setting, mood) so the
+    user can regenerate without triggering the moderator.
+    """
+    try:
+        if async_llm_client is None:
+            raise HTTPException(
+                status_code=503,
+                detail="LLM service is currently unavailable. Please check your environment configuration.",
+            )
+
+        original_prompt = (req.original_prompt or "").strip()
+        if not original_prompt:
+            raise HTTPException(status_code=400, detail="original_prompt is required")
+
+        messages = [
+            {"role": "system", "content": video_prompt_moderation_safe_rewrite_message},
+            {"role": "user", "content": original_prompt},
+        ]
+        response = await async_llm_client.chat.completions.create(
+            messages=messages,
+            model=settings.LLM_DEPLOYMENT,
+            response_format={"type": "json_object"},
+        )
+        rewritten_prompt = json.loads(
+            response.choices[0].message.content
+        ).get("prompt") or ""
+        if not rewritten_prompt.strip():
+            raise HTTPException(
+                status_code=502,
+                detail="The rewrite service returned an empty prompt. Please try again.",
+            )
+        return VideoPromptModerationSafeRewriteResponse(
+            rewritten_prompt=rewritten_prompt.strip()
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error rewriting moderation-blocked video prompt: {str(e)}",
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 

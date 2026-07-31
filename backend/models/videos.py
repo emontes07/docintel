@@ -16,6 +16,18 @@ class VideoPromptEnhancementResponse(BaseModel):
                                  description="Enhanced prompt for video generation")
 
 
+class VideoPromptModerationSafeRewriteRequest(BaseModel):
+    """Request model for rewriting a moderation-blocked prompt into a safe one."""
+    original_prompt: str = Field(...,
+                                 description="The original prompt that was blocked by content moderation.")
+
+
+class VideoPromptModerationSafeRewriteResponse(BaseModel):
+    """Response model for a moderation-safe rewritten prompt."""
+    rewritten_prompt: str = Field(...,
+                                  description="A rewritten prompt with copyrighted/branded content removed.")
+
+
 class AudioGenerationSettings(BaseModel):
     """Audio generation settings for Sora 2"""
     enabled: bool = Field(True, description="Enable audio generation")

@@ -1023,6 +1023,39 @@ export interface EnhancePromptResponse {
   enhanced_prompt: string;
 }
 
+export interface ModerationSafeRewriteResponse {
+  rewritten_prompt: string;
+}
+
+/**
+ * Rewrite a moderation-blocked video prompt into a moderation-safe visual
+ * description. The backend uses the LLM to strip named copyrighted / branded
+ * entities and replace them with concrete visual descriptors.
+ */
+export async function moderationSafeRewrite(prompt: string): Promise<string> {
+  const url = `${API_BASE_URL}/videos/prompt/moderation-safe-rewrite`;
+
+  if (API_DEBUG) {
+    console.log(`Requesting moderation-safe rewrite for: ${prompt}`);
+    console.log(`POST ${url}`);
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ original_prompt: prompt }),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to rewrite prompt: ${response.status} ${response.statusText}`
+    );
+  }
+
+  const data: ModerationSafeRewriteResponse = await response.json();
+  return data.rewritten_prompt;
+}
+
 /**
  * Enhance a prompt using the backend API (for videos)
  */

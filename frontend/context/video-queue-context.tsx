@@ -13,6 +13,7 @@ import {
   VideoGenerationWithAnalysisRequest,
   streamVideoGenerationWithAnalysis,
   VideoStreamEvent,
+  moderationSafeRewrite,
 } from "@/services/api";
 import { toast } from "sonner";
 
@@ -41,6 +42,69 @@ function formatDuration(seconds?: number): string {
     return "unknown";
   }
   return `${seconds}s`;
+}
+
+// Parse the backend's `failure_reason` (a Python-dict-like string such as
+// "{'code': 'moderation_blocked', 'message': 'Your request was blocked...'}")
+// into a user-friendly title + description. For moderation_blocked we include a
+// concrete rewrite example so users know how to fix the prompt without leaving
+// the app.
+function formatFailureMessage(reason?: string | null): { title: string; description: string; code?: string } {
+  const raw = (reason || "").trim();
+  const codeMatch = raw.match(/'code'\s*:\s*'([^']+)'/) || raw.match(/"code"\s*:\s*"([^"]+)"/);
+  const msgMatch  = raw.match(/'message'\s*:\s*'([^']+)'/) || raw.match(/"message"\s*:\s*"([^"]+)"/);
+  const code = codeMatch?.[1];
+  const message = msgMatch?.[1] || raw;
+
+  if (code === "moderation_blocked") {
+    return {
+      code,
+      title: "Prompt blocked by content moderation",
+      description:
+        "Sora blocks copyrighted or branded content (movies, characters, celebrities, logos). " +
+        "Try describing what you want visually \u2014 colors, hair, clothing, setting \u2014 without naming the source. " +
+        "Example: instead of \u201CElsa from Frozen\u201D, write \u201Ca princess with long platinum-blonde braided hair in a light blue dress\u201D.",
+    };
+  }
+  return {
+    code,
+    title: "Video generation failed",
+    description: message || "The video could not be generated. Please try again with a different prompt.",
+  };
+}
+
+// Ask the backend LLM to rewrite a moderation-blocked prompt, then show a
+// second toast with the rewritten prompt and a Copy action. Isolated from the
+// polling loop so an LLM failure doesn't affect queue state.
+async function suggestSaferPrompt(originalPrompt: string) {
+  const workingToast = toast.loading("Rewriting your prompt to avoid moderation…");
+  try {
+    const rewritten = await moderationSafeRewrite(originalPrompt);
+    toast.success("Suggested prompt (safer version)", {
+      id: workingToast,
+      description: rewritten,
+      duration: 30000,
+      action: {
+        label: "Copy prompt",
+        onClick: () => {
+          if (typeof navigator !== "undefined" && navigator.clipboard) {
+            navigator.clipboard.writeText(rewritten).then(
+              () => toast.success("Copied to clipboard", { duration: 3000 }),
+              () => toast.error("Could not copy to clipboard", { duration: 4000 }),
+            );
+          }
+        },
+      },
+    });
+  } catch (err) {
+    console.error("moderationSafeRewrite failed:", err);
+    toast.error("Could not generate a safer prompt", {
+      id: workingToast,
+      description:
+        err instanceof Error ? err.message : "Please rephrase manually and try again.",
+      duration: 6000,
+    });
+  }
 }
 
 // Register a callback to be called when uploads complete
@@ -284,6 +348,23 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
           } else if (updatedJob.status === "failed") {
             updatedItems[i].status = "failed";
             hasUpdates = true;
+            const { title, description, code } = formatFailureMessage(updatedJob.failure_reason);
+            const originalPrompt =
+              (updatedJob.prompt && updatedJob.prompt.trim()) ||
+              (item.prompt && item.prompt.trim()) ||
+              "";
+            toast.error(title, {
+              description,
+              duration: 15000,
+              ...(code === "moderation_blocked" && originalPrompt
+                ? {
+                    action: {
+                      label: "Suggest safer version",
+                      onClick: () => suggestSaferPrompt(originalPrompt),
+                    },
+                  }
+                : {}),
+            });
           } else if (updatedJob.status === "processing" || updatedJob.status === "queued") {
             if (item.status !== "processing") {
               updatedItems[i].status = "processing";
