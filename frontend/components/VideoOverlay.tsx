@@ -109,7 +109,7 @@ export function VideoOverlay({
   const [aspectRatio, setAspectRatio] = useState("16:9");
   const [resolution, setResolution] = useState("720p");
   const [duration, setDuration] = useState("8s");
-  const [analyzeVideo, setAnalyzeVideo] = useState(true);
+  const [analyzeVideo, setAnalyzeVideo] = useState(false);
   const [isWizardEnhancing, setIsWizardEnhancing] = useState(false);
   const [moderationThresholds] = useState({
     hate: "medium",
@@ -900,7 +900,7 @@ export function VideoOverlay({
                             </ToggleGroup>
                           </TooltipTrigger>
                           <TooltipContent>
-                            <p>Analyze video with GPT-4o for insights</p>
+                            <p>Analyze after generation with GPT-5 (adds ~15–60s). You can also run Analyze later from the video&rsquo;s details.</p>
                           </TooltipContent>
                         </Tooltip>
                       </>
