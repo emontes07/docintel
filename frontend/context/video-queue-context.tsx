@@ -74,23 +74,65 @@ function formatFailureMessage(reason?: string | null): { title: string; descript
 }
 
 // Ask the backend LLM to rewrite a moderation-blocked prompt, then show a
-// second toast with the rewritten prompt and a Copy action. Isolated from the
-// polling loop so an LLM failure doesn't affect queue state.
-async function suggestSaferPrompt(originalPrompt: string) {
-  const workingToast = toast.loading("Rewriting your prompt to avoid moderation…");
+// single toast with the rewritten prompt and "Use this prompt" + "Copy" actions.
+// Isolated so an LLM failure doesn't affect queue state.
+// Custom event so any Video prompt input (e.g., VideoOverlay) can auto-populate.
+export const PROMPT_SUGGESTION_EVENT = "visionary-lab:set-video-prompt";
+
+function dispatchPromptSuggestion(prompt: string) {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(
+      new CustomEvent(PROMPT_SUGGESTION_EVENT, { detail: { prompt } })
+    );
+  }
+}
+
+// Marker error used when the queue context has already surfaced a toast for the
+// underlying failure. Outer catches (e.g. in the page-level generate handler)
+// can inspect `.handled` to avoid firing a duplicate generic toast.
+export class HandledQueueError extends Error {
+  handled = true as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "HandledQueueError";
+  }
+}
+
+// Runs on moderation-blocked failures. Auto-calls the rewrite endpoint and
+// shows a single toast with the safer prompt + "Use this prompt" / "Copy"
+// actions. Best-effort: if the rewrite fails, fall back to a static tip.
+async function handleModerationFailure(originalPrompt: string) {
+  const workingToast = toast.loading(
+    "Prompt was blocked. Suggesting a safer version…",
+    {
+      description:
+        "Rewriting your prompt to avoid copyrighted or branded content.",
+    }
+  );
   try {
-    const rewritten = await moderationSafeRewrite(originalPrompt);
-    toast.success("Suggested prompt (safer version)", {
+    const rewritten = (await moderationSafeRewrite(originalPrompt)).trim();
+    if (!rewritten) throw new Error("empty rewrite");
+    toast.success("Try this safer prompt instead", {
       id: workingToast,
       description: rewritten,
       duration: 30000,
       action: {
-        label: "Copy prompt",
+        label: "Use this prompt",
+        onClick: () => {
+          dispatchPromptSuggestion(rewritten);
+          toast.success("Prompt updated \u2014 review and hit Generate", {
+            duration: 4000,
+          });
+        },
+      },
+      cancel: {
+        label: "Copy",
         onClick: () => {
           if (typeof navigator !== "undefined" && navigator.clipboard) {
             navigator.clipboard.writeText(rewritten).then(
               () => toast.success("Copied to clipboard", { duration: 3000 }),
-              () => toast.error("Could not copy to clipboard", { duration: 4000 }),
+              () =>
+                toast.error("Could not copy to clipboard", { duration: 4000 })
             );
           }
         },
@@ -98,13 +140,29 @@ async function suggestSaferPrompt(originalPrompt: string) {
     });
   } catch (err) {
     console.error("moderationSafeRewrite failed:", err);
-    toast.error("Could not generate a safer prompt", {
+    toast.error("Prompt blocked by content moderation", {
       id: workingToast,
       description:
-        err instanceof Error ? err.message : "Please rephrase manually and try again.",
-      duration: 6000,
+        "Sora blocks copyrighted or branded content. Try describing the scene visually (colors, hair, clothing, setting) without naming the source.",
+      duration: 15000,
     });
   }
+}
+
+// Central failure handler used by BOTH the polling path and the SSE stream
+// error branch. Guarantees a single, well-formatted toast per failure and
+// triggers the auto-rewrite for moderation blocks.
+function handleGenerationFailure(
+  failureReason: string | null | undefined,
+  originalPrompt: string
+) {
+  const { title, description, code } = formatFailureMessage(failureReason);
+  if (code === "moderation_blocked" && originalPrompt) {
+    // Auto-rewrite path replaces the generic error toast entirely.
+    handleModerationFailure(originalPrompt);
+    return;
+  }
+  toast.error(title, { description, duration: 15000 });
 }
 
 // Register a callback to be called when uploads complete
@@ -348,23 +406,11 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
           } else if (updatedJob.status === "failed") {
             updatedItems[i].status = "failed";
             hasUpdates = true;
-            const { title, description, code } = formatFailureMessage(updatedJob.failure_reason);
             const originalPrompt =
               (updatedJob.prompt && updatedJob.prompt.trim()) ||
               (item.prompt && item.prompt.trim()) ||
               "";
-            toast.error(title, {
-              description,
-              duration: 15000,
-              ...(code === "moderation_blocked" && originalPrompt
-                ? {
-                    action: {
-                      label: "Suggest safer version",
-                      onClick: () => suggestSaferPrompt(originalPrompt),
-                    },
-                  }
-                : {}),
-            });
+            handleGenerationFailure(updatedJob.failure_reason, originalPrompt);
           } else if (updatedJob.status === "processing" || updatedJob.status === "queued") {
             if (item.status !== "processing") {
               updatedItems[i].status = "processing";
@@ -610,10 +656,11 @@ export function VideoQueueProvider({ children }: { children: React.ReactNode }) 
                   // Abort stream and cleanup
                   (streamCleanupRef.current[jobId || tempId] || cleanup)();
                   delete streamCleanupRef.current[jobId || tempId];
-                  toast.error('Video generation failed', {
-                    description: event.error,
-                  });
-                  reject(new Error(event.error));
+                  // Show ONE well-formatted toast (auto-rewrite on moderation)
+                  handleGenerationFailure(event.error, prompt);
+                  // Reject with a marker so the outer catch in the page-level
+                  // generate handler doesn't fire a duplicate generic toast.
+                  reject(new HandledQueueError(event.error || "Video generation failed"));
                   break;
           }
             });

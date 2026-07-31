@@ -525,10 +525,21 @@ function NewVideoPageContent() {
           setIsGenerating(false);
         } catch (error) {
           console.error("Error starting video generation:", error);
-          toast.error("Could not connect to the backend API", {
-            id: toastId,
-            description: "Please try again later"
-          });
+          // The queue context already surfaced a well-formatted toast for
+          // handled failures (moderation, rate limit, etc.); skip the generic
+          // "backend API" message to avoid a confusing double-toast.
+          const handled =
+            error !== null &&
+            typeof error === "object" &&
+            ("handled" in error || (error as { name?: string }).name === "HandledQueueError");
+          if (!handled) {
+            toast.error("Could not connect to the backend API", {
+              id: toastId,
+              description: "Please try again later"
+            });
+          } else {
+            toast.dismiss(toastId);
+          }
           setIsGenerating(false);
         }
       }

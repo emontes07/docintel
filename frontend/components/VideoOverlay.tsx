@@ -151,6 +151,23 @@ export function VideoOverlay({
     setIsClient(true);
   }, []);
 
+  // Listen for prompt-suggestion events fired by the video queue when the
+  // backend has produced a moderation-safe rewrite. Populates the textbox so
+  // the user can review and hit Generate without leaving the page.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ prompt?: string }>).detail;
+      if (detail && typeof detail.prompt === "string" && detail.prompt.trim()) {
+        setPrompt(detail.prompt);
+        if (textareaRef.current) textareaRef.current.focus();
+      }
+    };
+    window.addEventListener("visionary-lab:set-video-prompt", handler);
+    return () =>
+      window.removeEventListener("visionary-lab:set-video-prompt", handler);
+  }, []);
+
   // Update folder when selectedFolder prop changes
   useEffect(() => {
     setFolder(selectedFolder || "root");
