@@ -545,30 +545,77 @@ async def delete_asset(
             else "video"
         )
 
-        # Delete from Cosmos DB first (if available)
+        # Delete from Cosmos DB first (if available).
+        # Some records were created with an auto-generated UUID `id` rather than
+        # the deterministic id derived from the blob name. To handle both, we
+        # (a) try the fast direct-id delete, then (b) query by blob_name/name
+        # as a fallback and delete anything else that matches. This makes the
+        # endpoint robust against legacy or otherwise-orphaned metadata rows.
+        cosmos_deleted_count = 0
         if cosmos_service:
             try:
-                await asyncio.to_thread(
+                direct = await asyncio.to_thread(
                     cosmos_service.delete_asset_metadata, asset_id, media_type_str
                 )
+                if direct:
+                    cosmos_deleted_count += 1
             except Exception as cosmos_error:
-                import logging
-
-                logger = logging.getLogger(__name__)
                 logger.warning(
-                    f"Failed to delete Cosmos DB metadata: {cosmos_error}")
+                    f"Failed to delete Cosmos DB metadata by id: {cosmos_error}"
+                )
 
-        # Delete from Azure Blob Storage
-        success = await asyncio.to_thread(
+            try:
+                fallback_rows = await asyncio.to_thread(
+                    lambda: list(
+                        cosmos_service.container.query_items(
+                            query=(
+                                "SELECT c.id, c.media_type FROM c "
+                                "WHERE c.doc_type = 'asset_metadata' "
+                                "AND c.media_type = @mt "
+                                "AND (c.blob_name = @n OR c.filename = @n OR c.name = @n)"
+                            ),
+                            parameters=[
+                                {"name": "@mt", "value": media_type_str},
+                                {"name": "@n", "value": blob_name},
+                            ],
+                            enable_cross_partition_query=True,
+                        )
+                    )
+                )
+                for row in fallback_rows:
+                    try:
+                        await asyncio.to_thread(
+                            cosmos_service.delete_asset_metadata,
+                            row["id"],
+                            row.get("media_type", media_type_str),
+                        )
+                        cosmos_deleted_count += 1
+                    except Exception as row_err:
+                        logger.warning(
+                            f"Failed to delete Cosmos metadata id={row.get('id')}: {row_err}"
+                        )
+            except Exception as fb_err:
+                logger.warning(
+                    f"Fallback Cosmos delete query failed: {fb_err}"
+                )
+
+        # Delete from Azure Blob Storage. This may legitimately return False if
+        # the blob was already removed (e.g., we're cleaning up an orphan row);
+        # only treat that as 404 if we ALSO didn't delete anything from Cosmos.
+        blob_deleted = await asyncio.to_thread(
             azure_storage_service.delete_asset, blob_name, container_name
         )
 
-        if not success:
+        if not blob_deleted and cosmos_deleted_count == 0:
             raise HTTPException(status_code=404, detail="Asset not found")
 
         return AssetDeleteResponse(
             success=True,
-            message="Asset deleted successfully",
+            message=(
+                "Asset deleted successfully"
+                if blob_deleted
+                else f"Asset metadata cleaned up ({cosmos_deleted_count} row(s)); blob was already removed"
+            ),
             blob_name=blob_name,
             container=container_name,
         )
