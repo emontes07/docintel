@@ -609,7 +609,7 @@ function NewVideoPageContent() {
     if (folderParam) {
       // Remove the moved video from the current state
       setVideos(prevVideos => prevVideos.filter(video => video.id !== videoId));
-      
+
       // If we've moved a video, we might want to load another one to replace it
       if (hasMore && videos.length < limit * 2) {
         loadMoreVideos();
@@ -618,13 +618,10 @@ function NewVideoPageContent() {
       // When in "All Videos" view, refresh the gallery to update
       loadVideos(true);
     }
-    
+
     // Close the detail view
     setFullscreenVideo(null);
-    
-    toast.success("Video moved", {
-      description: "The video was moved to another folder"
-    });
+    // Note: the child VideoDetailView already shows the success toast.
   };
 
 

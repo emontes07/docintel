@@ -529,7 +529,7 @@ function NewImagePageContent() {
                       if (folderPath) {
                         // Remove the moved image from the current state
                         setImages(prevImages => prevImages.filter(img => img.id !== movedImageId));
-                        
+
                         // If we've moved an image, we might want to load another one to replace it
                         if (hasMore && images.length < limit * 2) {
                           loadMoreImages();
@@ -538,10 +538,7 @@ function NewImagePageContent() {
                         // When in "All Images" view, refresh the gallery to update
                         loadImages(true);
                       }
-                      
-                      toast.success("Image moved", {
-                        description: "The image was moved to another folder"
-                      });
+                      // Note: the child ImageGalleryCard already shows the success toast.
                     }}
                   />
                 ))}

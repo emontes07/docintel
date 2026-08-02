@@ -670,10 +670,59 @@ async def move_asset(
                 "target_folder": normalized_folder,
             }
 
-        # Server-side copy: download source bytes and upload to destination.
-        # (Flat-namespace accounts don't support atomic rename; a same-account
-        # start_copy_from_url would also work but requires an accessible source
-        # URL which is problematic with our private-endpoint storage.)
+        logger.info(
+            f"move_asset: media_type={media_type_str} source='{source_blob}' "
+            f"dest='{dest_blob}' target_folder='{normalized_folder}'"
+        )
+
+        # STEP 1 — Find Cosmos metadata rows for this asset FIRST.
+        # If the metadata is missing we abort before touching the blob so we
+        # can never leave storage in an inconsistent state (moved blob but
+        # stale metadata pointing at the old path).
+        if not cosmos_service:
+            raise HTTPException(
+                status_code=503,
+                detail="Cosmos DB service is not available; cannot move asset.",
+            )
+
+        try:
+            rows = await asyncio.to_thread(
+                lambda: list(
+                    cosmos_service.container.query_items(
+                        query=(
+                            "SELECT * FROM c "
+                            "WHERE c.doc_type = 'asset_metadata' "
+                            "AND c.media_type = @mt "
+                            "AND (c.blob_name = @src OR c.filename = @src OR c.name = @src)"
+                        ),
+                        parameters=[
+                            {"name": "@mt", "value": media_type_str},
+                            {"name": "@src", "value": source_blob},
+                        ],
+                        enable_cross_partition_query=True,
+                    )
+                )
+            )
+        except Exception as query_err:
+            logger.error(f"move_asset: Cosmos query failed: {query_err}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to look up asset metadata: {query_err}",
+            )
+
+        logger.info(
+            f"move_asset: found {len(rows)} Cosmos metadata row(s) for '{source_blob}'"
+        )
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No metadata record found for '{source_blob}'. "
+                    "The asset may have been deleted or its metadata is out of sync."
+                ),
+            )
+
+        # STEP 2 — Copy blob to destination.
         container_client = azure_storage_service.blob_service_client.get_container_client(
             container_name
         )
@@ -693,74 +742,76 @@ async def move_asset(
         try:
             await asyncio.to_thread(_copy_blob)
         except Exception as copy_err:
-            # Most likely BlobNotFound for the source
-            logger.error(f"move_asset: failed to copy {source_blob} -> {dest_blob}: {copy_err}")
+            logger.error(
+                f"move_asset: failed to copy {source_blob} -> {dest_blob}: {copy_err}"
+            )
             raise HTTPException(
                 status_code=404,
                 detail=f"Source blob not found or unreadable: {source_blob}",
             )
 
-        # Delete source blob (best-effort; a stale copy is better than data loss)
+        # STEP 3 — Update the Cosmos metadata rows to point at the new location.
+        dest_url = container_client.get_blob_client(dest_blob).url
+        updated_count = 0
+        failed_rows: list[str] = []
+        for row in rows:
+            row_id = row.get("id")
+            try:
+                row["blob_name"] = dest_blob
+                row["url"] = dest_url
+                row["folder_path"] = normalized_folder
+                row["updated_at"] = datetime.utcnow().isoformat()
+                await asyncio.to_thread(
+                    cosmos_service.container.replace_item,
+                    item=row_id,
+                    body=row,
+                )
+                updated_count += 1
+                logger.info(f"move_asset: updated Cosmos row id={row_id}")
+            except Exception as row_err:
+                logger.error(
+                    f"move_asset: failed to update Cosmos row id={row_id}: {row_err}",
+                    exc_info=True,
+                )
+                failed_rows.append(str(row_id))
+
+        # If not a single row could be updated the move is effectively a no-op
+        # from the user's perspective — the gallery reads from Cosmos and will
+        # still show the asset at the source path. Surface this as a failure
+        # and DO NOT delete the source blob (data preservation).
+        if updated_count == 0:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Copied blob to '{dest_blob}' but failed to update any of "
+                    f"{len(rows)} metadata row(s): {failed_rows}. "
+                    "Source blob left in place; please retry."
+                ),
+            )
+
+        # STEP 4 — Delete source blob (best-effort — a stale copy is better
+        # than data loss, and the metadata now points at the destination).
         try:
             await asyncio.to_thread(
                 azure_storage_service.delete_asset, source_blob, container_name
             )
         except Exception as del_err:
             logger.warning(
-                f"move_asset: destination copy succeeded but source delete failed: {del_err}"
+                f"move_asset: destination copy + metadata update succeeded but "
+                f"source delete failed: {del_err}"
             )
-
-        # Update Cosmos DB metadata: patch blob_name / url / folder_path on any
-        # matching record. Handles both deterministic-id and UUID-id records.
-        dest_url = container_client.get_blob_client(dest_blob).url
-        updated_count = 0
-        if cosmos_service:
-            try:
-                rows = await asyncio.to_thread(
-                    lambda: list(
-                        cosmos_service.container.query_items(
-                            query=(
-                                "SELECT * FROM c "
-                                "WHERE c.doc_type = 'asset_metadata' "
-                                "AND c.media_type = @mt "
-                                "AND (c.blob_name = @src OR c.filename = @src OR c.name = @src)"
-                            ),
-                            parameters=[
-                                {"name": "@mt", "value": media_type_str},
-                                {"name": "@src", "value": source_blob},
-                            ],
-                            enable_cross_partition_query=True,
-                        )
-                    )
-                )
-                for row in rows:
-                    try:
-                        row["blob_name"] = dest_blob
-                        row["url"] = dest_url
-                        row["folder_path"] = normalized_folder
-                        row["updated_at"] = datetime.utcnow().isoformat()
-                        await asyncio.to_thread(
-                            cosmos_service.container.replace_item,
-                            item=row["id"],
-                            body=row,
-                        )
-                        updated_count += 1
-                    except Exception as row_err:
-                        logger.warning(
-                            f"move_asset: failed to update Cosmos row {row.get('id')}: {row_err}"
-                        )
-            except Exception as query_err:
-                logger.warning(
-                    f"move_asset: Cosmos update query failed: {query_err}"
-                )
 
         return {
             "success": True,
-            "message": f"Moved asset to '{normalized_folder or 'root'}' (updated {updated_count} metadata row(s))",
+            "message": (
+                f"Moved asset to '{normalized_folder or 'root'}' "
+                f"(updated {updated_count} of {len(rows)} metadata row(s))"
+            ),
             "blob_name": dest_blob,
             "source_blob": source_blob,
             "target_folder": normalized_folder,
             "url": dest_url,
+            "updated_count": updated_count,
         }
     except HTTPException:
         raise
