@@ -43,6 +43,14 @@ export interface Brand {
   theme: BrandTheme;
   /** Swatches shown in the brand picker (hex — for a visual preview only). */
   swatches: string[];
+  /**
+   * Optional per-item accent colors for sidebar navigation. When present,
+   * each nav item cycles through this palette: the icon is tinted with its
+   * color at rest, and the active item renders as a soft pill of the same
+   * hue. This is what makes a brand feel multi-color rather than
+   * single-hue-tinted. Omit to keep the neutral shadcn treatment.
+   */
+  navPalette?: string[];
   /** Optional decorative top stripe (e.g., Crayola's rainbow bar). */
   topStripe?: string;
 }
@@ -80,48 +88,51 @@ const CRAYOLA_BRAND: Brand = {
     light: "/logo/crayola/logo-light.svg",
     dark: "/logo/crayola/logo-dark.svg",
   },
-  swatches: ["#ED0A3F", "#FFD800", "#00B4E0", "#00A651"],
+  swatches: ["#ED0A3F", "#FF7F00", "#00A651", "#0093D1"],
+  // Every nav item gets its own crayon. Colors are chosen to stay legible
+  // as text on a white surface (yellow is darkened to amber for contrast).
+  navPalette: [
+    "#ED0A3F", // scarlet
+    "#0093D1", // cerulean
+    "#00A651", // green
+    "#8B3FA8", // violet
+    "#F2670B", // orange
+    "#0F9B9B", // teal
+    "#C2185B", // magenta
+    "#B8860B", // goldenrod
+  ],
   topStripe:
     "linear-gradient(90deg, #ED0A3F 0%, #FF7F00 20%, #FFD800 40%, #00A651 60%, #00B4E0 80%, #6B3FA0 100%)",
   theme: {
     light: {
-      // Softer, more toy-like corners across every shadcn component.
+      // Soft, toy-like corners.
       "--radius": "1rem",
 
-      // ---- Body & surfaces ----
-      // Warm cream body so the palette reads friendly, not neutral.
-      "--background": "oklch(0.985 0.02 85)",
-      "--foreground": "oklch(0.2 0.03 275)",
-      // Cards get a subtle warm tint too so they don't disappear on cream bg.
-      "--card": "oklch(1 0.005 85)",
-      "--card-foreground": "oklch(0.2 0.03 275)",
-      "--popover": "oklch(1 0.005 85)",
-      "--popover-foreground": "oklch(0.2 0.03 275)",
+      // ---- Surfaces: clean white. The color comes from content and nav
+      //      accents, not from a background wash. ----
+      "--background": "oklch(1 0 0)",
+      "--foreground": "oklch(0.2 0.02 275)",
+      "--card": "oklch(1 0 0)",
+      "--card-foreground": "oklch(0.2 0.02 275)",
+      "--popover": "oklch(1 0 0)",
+      "--popover-foreground": "oklch(0.2 0.02 275)",
 
       // ---- Primary: Crayola Red for CTAs and focus ring ----
       "--primary": "oklch(0.605 0.234 25)",
       "--primary-foreground": "oklch(0.985 0 0)",
       "--ring": "oklch(0.605 0.234 25)",
 
-      // ---- Secondary: warm butter yellow so secondary buttons pop ----
-      "--secondary": "oklch(0.93 0.09 92)",
-      "--secondary-foreground": "oklch(0.28 0.08 60)",
+      // ---- Neutral supporting tones so the rainbow accents stay the star ----
+      "--secondary": "oklch(0.965 0.004 250)",
+      "--secondary-foreground": "oklch(0.25 0.02 275)",
+      "--muted": "oklch(0.965 0.004 250)",
+      "--muted-foreground": "oklch(0.53 0.015 265)",
+      "--accent": "oklch(0.955 0.006 250)",
+      "--accent-foreground": "oklch(0.22 0.02 275)",
 
-      // ---- Muted: warm sand ----
-      "--muted": "oklch(0.95 0.03 80)",
-      "--muted-foreground": "oklch(0.5 0.03 60)",
-
-      // ---- Accent: soft blush pink — used for hover states everywhere.
-      //      Keeps the palette warm and coordinated with primary red. ----
-      "--accent": "oklch(0.94 0.06 20)",
-      "--accent-foreground": "oklch(0.42 0.2 25)",
-
-      // ---- Destructive: deeper crimson so it reads distinct from primary ----
-      "--destructive": "oklch(0.55 0.22 15)",
-
-      // ---- Borders / inputs: soft warm gray ----
-      "--border": "oklch(0.9 0.02 65)",
-      "--input": "oklch(0.9 0.02 65)",
+      "--destructive": "oklch(0.577 0.245 27.325)",
+      "--border": "oklch(0.925 0.004 250)",
+      "--input": "oklch(0.925 0.004 250)",
 
       // ---- Chart palette: the full Crayola rainbow ----
       "--chart-1": "oklch(0.605 0.234 25)",   // red
@@ -130,44 +141,38 @@ const CRAYOLA_BRAND: Brand = {
       "--chart-4": "oklch(0.66 0.18 145)",    // green
       "--chart-5": "oklch(0.63 0.17 240)",    // blue
 
-      // ---- Sidebar: warm cream panel; ACTIVE nav items get a red-tinted
-      //      blush pill so the selected surface always reads Crayola. ----
-      "--sidebar": "oklch(0.975 0.025 85)",
-      "--sidebar-foreground": "oklch(0.22 0.02 275)",
+      // ---- Sidebar: near-white panel; per-item colors supply the character ----
+      "--sidebar": "oklch(0.99 0.002 250)",
+      "--sidebar-foreground": "oklch(0.24 0.02 275)",
       "--sidebar-primary": "oklch(0.605 0.234 25)",
       "--sidebar-primary-foreground": "oklch(0.985 0 0)",
-      "--sidebar-accent": "oklch(0.93 0.08 20)",
-      "--sidebar-accent-foreground": "oklch(0.5 0.22 25)",
-      "--sidebar-border": "oklch(0.88 0.03 65)",
+      "--sidebar-accent": "oklch(0.955 0.006 250)",
+      "--sidebar-accent-foreground": "oklch(0.22 0.02 275)",
+      "--sidebar-border": "oklch(0.925 0.004 250)",
       "--sidebar-ring": "oklch(0.605 0.234 25)",
     },
     dark: {
       "--radius": "1rem",
 
-      // Warmer near-black so the palette doesn't feel cold.
-      "--background": "oklch(0.16 0.02 30)",
-      "--foreground": "oklch(0.98 0.005 80)",
-      "--card": "oklch(0.22 0.02 30)",
-      "--card-foreground": "oklch(0.98 0.005 80)",
-      "--popover": "oklch(0.22 0.02 30)",
-      "--popover-foreground": "oklch(0.98 0.005 80)",
+      "--background": "oklch(0.15 0.01 275)",
+      "--foreground": "oklch(0.98 0.002 250)",
+      "--card": "oklch(0.21 0.012 275)",
+      "--card-foreground": "oklch(0.98 0.002 250)",
+      "--popover": "oklch(0.21 0.012 275)",
+      "--popover-foreground": "oklch(0.98 0.002 250)",
 
-      // Brighter red for dark bg legibility.
       "--primary": "oklch(0.68 0.23 25)",
       "--primary-foreground": "oklch(0.985 0 0)",
       "--ring": "oklch(0.68 0.23 25)",
 
-      "--secondary": "oklch(0.35 0.09 60)",
-      "--secondary-foreground": "oklch(0.98 0.005 80)",
+      "--secondary": "oklch(0.27 0.012 275)",
+      "--secondary-foreground": "oklch(0.98 0.002 250)",
+      "--muted": "oklch(0.27 0.012 275)",
+      "--muted-foreground": "oklch(0.72 0.015 265)",
+      "--accent": "oklch(0.29 0.014 275)",
+      "--accent-foreground": "oklch(0.98 0.002 250)",
 
-      "--muted": "oklch(0.28 0.02 40)",
-      "--muted-foreground": "oklch(0.72 0.02 60)",
-
-      "--accent": "oklch(0.35 0.14 25)",
-      "--accent-foreground": "oklch(0.98 0.005 80)",
-
-      "--destructive": "oklch(0.7 0.2 15)",
-
+      "--destructive": "oklch(0.704 0.191 22.216)",
       "--border": "oklch(1 0 0 / 12%)",
       "--input": "oklch(1 0 0 / 15%)",
 
@@ -177,12 +182,12 @@ const CRAYOLA_BRAND: Brand = {
       "--chart-4": "oklch(0.72 0.18 145)",
       "--chart-5": "oklch(0.7 0.17 240)",
 
-      "--sidebar": "oklch(0.2 0.025 30)",
-      "--sidebar-foreground": "oklch(0.98 0.005 80)",
+      "--sidebar": "oklch(0.19 0.012 275)",
+      "--sidebar-foreground": "oklch(0.98 0.002 250)",
       "--sidebar-primary": "oklch(0.68 0.23 25)",
       "--sidebar-primary-foreground": "oklch(0.985 0 0)",
-      "--sidebar-accent": "oklch(0.35 0.14 25)",
-      "--sidebar-accent-foreground": "oklch(0.98 0.005 80)",
+      "--sidebar-accent": "oklch(0.29 0.014 275)",
+      "--sidebar-accent-foreground": "oklch(0.98 0.002 250)",
       "--sidebar-border": "oklch(1 0 0 / 10%)",
       "--sidebar-ring": "oklch(0.68 0.23 25)",
     },

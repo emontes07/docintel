@@ -4,7 +4,7 @@ import { FileVideo, List, ImageIcon, FolderIcon, ImagePlus, Settings, ChevronDow
 import Link from 'next/link';
 import Image from 'next/image';
 import { useTheme } from "next-themes";
-import { ThemeToggle } from "@/components/theme-toggle";import { useBrand } from "@/context/brand-context";import { useEffect, useState } from "react";
+import { ThemeToggle } from "@/components/theme-toggle";import { useBrand } from "@/context/brand-context";import { useEffect, useState, type CSSProperties } from "react";
 import { fetchFolders, MediaType } from "@/services/api";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { useFolderContext } from "@/context/folder-context";
@@ -175,9 +175,43 @@ export function AppSidebar() {
     return isVideoPage && currentFolderParam === folderPath;
   };
 
+  // Per-item accent color from the active brand's nav palette (if any).
+  // Returns undefined for brands that don't define one, so those keep the
+  // stock neutral shadcn treatment.
+  const navColor = (index: number): string | undefined => {
+    const palette = brand.navPalette;
+    if (!palette || palette.length === 0) return undefined;
+    return palette[index % palette.length];
+  };
+
+  // Active nav items render as a soft pill in their own color. Falls back to
+  // the sidebar accent token when the brand has no nav palette.
+  const activePillStyle = (
+    active: boolean,
+    color?: string,
+  ): CSSProperties | undefined => {
+    if (!active || !color) return undefined;
+    return {
+      backgroundColor: `color-mix(in srgb, ${color} 14%, transparent)`,
+      color,
+    };
+  };
+
+  const navButtonClass = (color?: string) =>
+    [
+      "data-[active=true]:font-medium",
+      "group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2",
+      // Only apply token-based active colors when the brand has no palette;
+      // otherwise the inline pill style supplies them.
+      color
+        ? ""
+        : "data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground",
+    ]
+      .filter(Boolean)
+      .join(" ");
+
   // Render folder skeletons during loading
-  const renderFolderSkeletons = (count: number = 3) => {
-    return Array.from({ length: count }).map((_, index) => (
+  const renderFolderSkeletons = (count: number = 3) => {    return Array.from({ length: count }).map((_, index) => (
       <SidebarMenuItem key={`folder-skeleton-${index}`}>
         <div className="px-3 py-2 flex items-center w-full">
           <Skeleton className="h-4 w-4 mr-2 rounded-sm" />
@@ -236,18 +270,23 @@ export function AppSidebar() {
           <SidebarGroupLabel className="group-data-[collapsible=icon]:hidden">Create</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {createItems.map((item) => {
+              {createItems.map((item, i) => {
                 const active = pathname === item.url;
+                const color = navColor(i);
                 return (
                   <SidebarMenuItem key={item.title}>
                     <Link href={item.url} passHref legacyBehavior>
                       <SidebarMenuButton
                         asChild
                         data-active={active}
-                        className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2"
+                        className={navButtonClass(color)}
+                        style={activePillStyle(active, color)}
                       >
                         <a title={item.description}>
-                          <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
+                          <item.icon
+                            className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5"
+                            style={color ? { color } : undefined}
+                          />
                           <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
                         </a>
                       </SidebarMenuButton>
@@ -294,7 +333,10 @@ export function AppSidebar() {
                           className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium"
                         >
                           <a>
-                            <FileVideo className="h-4 w-4 mr-2" />
+                            <FileVideo
+                              className="h-4 w-4 mr-2"
+                              style={navColor(0) ? { color: navColor(0) } : undefined}
+                            />
                             <span>All Videos</span>
                           </a>
                         </SidebarMenuButton>
@@ -371,7 +413,10 @@ export function AppSidebar() {
                           className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium"
                         >
                           <a>
-                            <ImageIcon className="h-4 w-4 mr-2" />
+                            <ImageIcon
+                              className="h-4 w-4 mr-2"
+                              style={navColor(1) ? { color: navColor(1) } : undefined}
+                            />
                             <span>All Images</span>
                           </a>
                         </SidebarMenuButton>
@@ -398,7 +443,14 @@ export function AppSidebar() {
                               onClick={() => handleImageFolderClick(folder)}
                             >
                               <a>
-                                <FolderIcon className="h-4 w-4 mr-2" />
+                                <FolderIcon
+                                  className="h-4 w-4 mr-2"
+                                  style={
+                                    navColor(index + 2)
+                                      ? { color: navColor(index + 2) }
+                                      : undefined
+                                  }
+                                />
                                 <span>{folder.split('/').pop() || folder}</span>
                               </a>
                             </SidebarMenuButton>
@@ -418,18 +470,25 @@ export function AppSidebar() {
           <SidebarGroupLabel className="group-data-[collapsible=icon]:hidden">Manage</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {manageItems.map((item) => {
+              {manageItems.map((item, i) => {
                 const active = pathname === item.url;
+                // Continue the palette after the Create section so Manage
+                // items don't repeat the same colors.
+                const color = navColor(createItems.length + i);
                 return (
                   <SidebarMenuItem key={item.title}>
                     <Link href={item.url} passHref legacyBehavior>
                       <SidebarMenuButton
                         asChild
                         data-active={active}
-                        className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2"
+                        className={navButtonClass(color)}
+                        style={activePillStyle(active, color)}
                       >
                         <a title={item.description}>
-                          <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
+                          <item.icon
+                            className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5"
+                            style={color ? { color } : undefined}
+                          />
                           <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
                         </a>
                       </SidebarMenuButton>
