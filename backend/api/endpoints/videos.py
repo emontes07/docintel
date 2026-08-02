@@ -86,6 +86,54 @@ def sse_event(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def conform_reference_image(image_bytes: bytes, width: int, height: int) -> bytes:
+    """
+    Resize a reference image to exactly ``width`` x ``height``.
+
+    Sora rejects image-to-video requests whose reference image doesn't match
+    the requested output dimensions ("Inpaint image must match the requested
+    width and height"). Gallery images are typically square or 3:2, so a
+    reference almost never matches a 16:9 video out of the box.
+
+    Scales to cover the target box and center-crops the overflow, which
+    preserves the subject and avoids letterbox bars. Returns the original
+    bytes unchanged if the image already matches or can't be decoded, so a
+    conversion problem degrades to the previous behaviour rather than
+    breaking generation outright.
+    """
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        with Image.open(BytesIO(image_bytes)) as img:
+            if img.size == (width, height):
+                return image_bytes
+
+            original_size = img.size
+            img = img.convert("RGB")
+
+            # Scale to cover, then center-crop to the exact target.
+            scale = max(width / img.width, height / img.height)
+            new_size = (max(1, round(img.width * scale)),
+                        max(1, round(img.height * scale)))
+            img = img.resize(new_size, Image.LANCZOS)
+
+            left = (img.width - width) // 2
+            top = (img.height - height) // 2
+            img = img.crop((left, top, left + width, top + height))
+
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            logger.info(
+                f"Conformed reference image {original_size} -> {width}x{height}")
+            return buf.getvalue()
+    except Exception as e:
+        logger.warning(
+            f"Could not conform reference image to {width}x{height}: {e}")
+        return image_bytes
+
+
 # --- /videos API Endpoints ---
 
 
@@ -140,6 +188,11 @@ async def create_video_generation_job(
                 if not image_file.content_type or not image_file.content_type.startswith('image/'):
                     raise HTTPException(
                         400, f"File {idx+1} is not a valid image")
+
+                # Sora requires the reference image to match the requested
+                # output size exactly, so conform it rather than 400-ing.
+                image_content = conform_reference_image(
+                    image_content, width, height)
 
                 processed_images.append(image_content)
                 image_filenames.append(
