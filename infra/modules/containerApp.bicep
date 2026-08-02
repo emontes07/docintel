@@ -36,6 +36,9 @@ param API_PROTOCOL string = 'http'
 param API_HOSTNAME string = 'localhost'
 param API_PORT string = '80'
 
+@description('Brand/skin the frontend ships with. Must match a brand id in frontend/utils/brands.ts (e.g. "default", "crayola").')
+param DEFAULT_BRAND string = 'default'
+
 // Cosmos DB (managed identity — no keys)
 param COSMOS_ENDPOINT string = ''
 param COSMOS_DATABASE_NAME string = ''
@@ -185,6 +188,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = if(deployNew) {
             {
               name: 'NEXT_PUBLIC_API_PORT'
               value: API_PORT
+            }
+            {
+              name: 'NEXT_PUBLIC_DEFAULT_BRAND'
+              value: DEFAULT_BRAND
             }
             {
               name: 'AZURE_COSMOS_DB_ENDPOINT'

@@ -77,6 +77,9 @@ param API_PROTOCOL string = ''
 param API_HOSTNAME string = ''
 param API_PORT string = ''
 
+@description('Brand/skin the frontend ships with. Must match a brand id in frontend/utils/brands.ts.')
+param DEFAULT_BRAND string = 'default'
+
 // Easy Auth for frontend (Microsoft tenant restriction)
 @secure()
 param AUTH_CLIENT_ID string = ''
@@ -381,6 +384,7 @@ module containerAppFrontend './modules/containerApp.bicep' = {
     API_PROTOCOL: API_PROTOCOL == '' ? 'https' : API_PROTOCOL
     API_PORT: API_PORT == '' ? '443' : API_PORT
     API_HOSTNAME: API_HOSTNAME == '' ? '${containerAppNameBackend}.${containerAppEnvMod.outputs.containerAppDefaultDomain}' : API_HOSTNAME
+    DEFAULT_BRAND: DEFAULT_BRAND
     enableAuth: AUTH_CLIENT_ID != ''
     authClientId: AUTH_CLIENT_ID
     authClientSecret: AUTH_CLIENT_SECRET

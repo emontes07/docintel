@@ -14,6 +14,9 @@
     "DOCKER_IMAGE_FRONTEND": {
       "value": "${SERVICE_FRONTEND_IMAGE_NAME}"
     },
+    "DEFAULT_BRAND": {
+      "value": "${DEFAULT_BRAND=default}"
+    },
     "aiFoundryName": {
       "value": "${AI_FOUNDRY_NAME}"
     },

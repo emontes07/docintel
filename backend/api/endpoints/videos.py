@@ -6,6 +6,8 @@ import re
 from datetime import datetime
 from typing import List, Optional
 
+import httpx
+
 from fastapi import (
     APIRouter,
     File,
@@ -181,6 +183,21 @@ async def create_video_generation_job(
         
         return VideoGenerationJobResponse(**response_data)
         
+    except HTTPException:
+        # Already a well-formed API error — don't mask it as a 500.
+        raise
+    except httpx.HTTPStatusError as e:
+        # Surface Sora's own validation message (e.g. "Inpaint image must match
+        # the requested width and height") instead of an opaque 500, so the UI
+        # can tell the user what to actually fix.
+        detail = str(e)
+        try:
+            payload = e.response.json()
+            detail = payload.get("error", {}).get("message") or detail
+        except Exception:
+            pass
+        logger.error(f"Error creating video job: {detail}")
+        raise HTTPException(status_code=e.response.status_code, detail=detail)
     except Exception as e:
         logger.error(f"Error creating video job: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

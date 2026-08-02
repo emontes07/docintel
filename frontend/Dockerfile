@@ -32,6 +32,7 @@ ENV NEXT_PUBLIC_API_PROTOCOL=__NEXT_PUBLIC_API_PROTOCOL__
 ENV NEXT_PUBLIC_API_HOSTNAME=__NEXT_PUBLIC_API_HOSTNAME__
 ENV NEXT_PUBLIC_API_PORT=__NEXT_PUBLIC_API_PORT__
 ENV NEXT_PUBLIC_STORAGE_ACCOUNT_NAME=__NEXT_PUBLIC_STORAGE_ACCOUNT_NAME__
+ENV NEXT_PUBLIC_DEFAULT_BRAND=__NEXT_PUBLIC_DEFAULT_BRAND__
 
 # Build the application
 RUN npm run build
@@ -62,6 +63,7 @@ RUN echo '#!/bin/sh' > /app/entrypoint.sh && \
     echo 'find .next -type f -name "*.js" | xargs sed -i "s|__NEXT_PUBLIC_API_HOSTNAME__|$NEXT_PUBLIC_API_HOSTNAME|g"' >> /app/entrypoint.sh && \
     echo 'find .next -type f -name "*.js" | xargs sed -i "s|__NEXT_PUBLIC_API_PORT__|$NEXT_PUBLIC_API_PORT|g"' >> /app/entrypoint.sh && \
     echo 'find .next -type f -name "*.js" | xargs sed -i "s|__NEXT_PUBLIC_STORAGE_ACCOUNT_NAME__|$NEXT_PUBLIC_STORAGE_ACCOUNT_NAME|g"' >> /app/entrypoint.sh && \
+    echo 'find .next -type f -name "*.js" | xargs sed -i "s|__NEXT_PUBLIC_DEFAULT_BRAND__|$NEXT_PUBLIC_DEFAULT_BRAND|g"' >> /app/entrypoint.sh && \
     echo 'echo "Environment variables replaced."' >> /app/entrypoint.sh && \
     echo 'exec "$@"' >> /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh

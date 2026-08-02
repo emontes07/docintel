@@ -206,6 +206,29 @@ export const DEFAULT_BRAND_ID: BrandId = "default";
 /** localStorage key used by BrandProvider to persist the active brand. */
 export const BRAND_STORAGE_KEY = "visionary-lab:brand";
 
+/** Query-string parameter that forces a brand, e.g. `?brand=crayola`. */
+export const BRAND_QUERY_PARAM = "brand";
+
+/** Narrow an arbitrary string to a known BrandId. */
+export function isBrandId(value: string | null | undefined): value is BrandId {
+  return typeof value === "string" && value in BRANDS;
+}
+
+/**
+ * The brand this deployment ships with, from NEXT_PUBLIC_DEFAULT_BRAND.
+ *
+ * The value is inlined at build time, but the Dockerfile writes a
+ * `__NEXT_PUBLIC_DEFAULT_BRAND__` placeholder that the container entrypoint
+ * rewrites at startup — so the brand can be changed by updating the
+ * container app env var alone, with no image rebuild. If the placeholder was
+ * never substituted (local dev, or the env var is unset) it won't match a
+ * known brand id and we fall back to the stock default.
+ */
+export function getConfiguredDefaultBrandId(): BrandId {
+  const configured = process.env.NEXT_PUBLIC_DEFAULT_BRAND;
+  return isBrandId(configured) ? configured : DEFAULT_BRAND_ID;
+}
+
 /**
  * Serialize a brand's theme overrides into a CSS string that can be
  * injected via a <style> element and scoped by [data-brand].

@@ -5,8 +5,11 @@ import * as React from "react";
 import {
   BRANDS,
   BRAND_LIST,
+  BRAND_QUERY_PARAM,
   BRAND_STORAGE_KEY,
   DEFAULT_BRAND_ID,
+  getConfiguredDefaultBrandId,
+  isBrandId,
   serializeBrandCss,
   type Brand,
   type BrandId,
@@ -25,24 +28,69 @@ const BrandContext = React.createContext<BrandContextValue | undefined>(
 
 const STYLE_ELEMENT_ID = "__brand_theme__";
 
-function readInitialBrandId(): BrandId {
-  if (typeof window === "undefined") return DEFAULT_BRAND_ID;
+/**
+ * Resolve the brand to show, in precedence order:
+ *   1. `?brand=` query parameter  — shareable demo links win over everything
+ *   2. localStorage              — this browser's explicit prior choice
+ *   3. NEXT_PUBLIC_DEFAULT_BRAND — what this deployment ships with
+ *   4. the stock default brand
+ *
+ * `fromUrl` is reported back so the caller can persist the choice and clean
+ * the parameter out of the address bar.
+ */
+function resolveInitialBrand(): { id: BrandId; fromUrl: boolean } {
+  if (typeof window === "undefined") {
+    return { id: getConfiguredDefaultBrandId(), fromUrl: false };
+  }
+
+  try {
+    const fromUrl = new URLSearchParams(window.location.search).get(
+      BRAND_QUERY_PARAM,
+    );
+    if (isBrandId(fromUrl)) return { id: fromUrl, fromUrl: true };
+  } catch {
+    /* malformed URL; fall through */
+  }
+
   try {
     const stored = window.localStorage.getItem(BRAND_STORAGE_KEY);
-    if (stored && stored in BRANDS) return stored as BrandId;
+    if (isBrandId(stored)) return { id: stored, fromUrl: false };
   } catch {
     /* localStorage may be blocked; fall through */
   }
-  return DEFAULT_BRAND_ID;
+
+  return { id: getConfiguredDefaultBrandId(), fromUrl: false };
 }
 
 export function BrandProvider({ children }: { children: React.ReactNode }) {
-  // Start with default on the server + first client render to keep hydration
-  // stable; hydrate the persisted brand right after mount.
-  const [brandId, setBrandIdState] = React.useState<BrandId>(DEFAULT_BRAND_ID);
+  // Seed with the deploy-time brand. It's a build-time constant, so the
+  // server and the first client render agree and hydration stays stable —
+  // and the configured brand paints immediately instead of flashing the
+  // stock one. Per-browser and per-link overrides are applied on mount.
+  const [brandId, setBrandIdState] = React.useState<BrandId>(
+    getConfiguredDefaultBrandId,
+  );
 
   React.useEffect(() => {
-    setBrandIdState(readInitialBrandId());
+    const { id, fromUrl } = resolveInitialBrand();
+    setBrandIdState(id);
+
+    if (!fromUrl) return;
+
+    // A link-driven brand becomes this browser's choice, then the parameter
+    // is stripped so it doesn't keep overriding the picker on later reloads.
+    try {
+      window.localStorage.setItem(BRAND_STORAGE_KEY, id);
+    } catch {
+      /* ignore */
+    }
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete(BRAND_QUERY_PARAM);
+      window.history.replaceState(null, "", url.toString());
+    } catch {
+      /* ignore */
+    }
   }, []);
 
   // Apply the active brand: set data attribute on <html> and inject the
