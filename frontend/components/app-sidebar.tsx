@@ -236,18 +236,25 @@ export function AppSidebar() {
           <SidebarGroupLabel className="group-data-[collapsible=icon]:hidden">Create</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {createItems.map((item) => (
-                <SidebarMenuItem key={item.title}>
-                  <Link href={item.url} passHref legacyBehavior>
-                    <SidebarMenuButton asChild className="group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2">
-                      <a title={item.description}>
-                        <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
-                        <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </Link>
-                </SidebarMenuItem>
-              ))}
+              {createItems.map((item) => {
+                const active = pathname === item.url;
+                return (
+                  <SidebarMenuItem key={item.title}>
+                    <Link href={item.url} passHref legacyBehavior>
+                      <SidebarMenuButton
+                        asChild
+                        data-active={active}
+                        className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2"
+                      >
+                        <a title={item.description}>
+                          <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
+                          <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
+                        </a>
+                      </SidebarMenuButton>
+                    </Link>
+                  </SidebarMenuItem>
+                );
+              })}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
@@ -284,7 +291,7 @@ export function AppSidebar() {
                         <SidebarMenuButton 
                           asChild
                           data-active={isVideoFolderActive(null)}
-                          className="data-[active=true]:bg-accent"
+                          className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium"
                         >
                           <a>
                             <FileVideo className="h-4 w-4 mr-2" />
@@ -310,7 +317,7 @@ export function AppSidebar() {
                             <SidebarMenuButton 
                               asChild
                               data-active={isVideoFolderActive(folder)}
-                              className="data-[active=true]:bg-accent"
+                              className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium"
                               onClick={() => handleVideoFolderClick(folder)}
                             >
                               <a>
@@ -361,7 +368,7 @@ export function AppSidebar() {
                         <SidebarMenuButton 
                           asChild
                           data-active={isImageFolderActive(null)}
-                          className="data-[active=true]:bg-accent"
+                          className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium"
                         >
                           <a>
                             <ImageIcon className="h-4 w-4 mr-2" />
@@ -387,7 +394,7 @@ export function AppSidebar() {
                             <SidebarMenuButton 
                               asChild
                               data-active={isImageFolderActive(folder)}
-                              className="data-[active=true]:bg-accent"
+                              className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium"
                               onClick={() => handleImageFolderClick(folder)}
                             >
                               <a>
@@ -411,18 +418,25 @@ export function AppSidebar() {
           <SidebarGroupLabel className="group-data-[collapsible=icon]:hidden">Manage</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {manageItems.map((item) => (
-                <SidebarMenuItem key={item.title}>
-                  <Link href={item.url} passHref legacyBehavior>
-                    <SidebarMenuButton asChild className="group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2">
-                      <a title={item.description}>
-                        <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
-                        <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
-                      </a>
-                    </SidebarMenuButton>
-                  </Link>
-                </SidebarMenuItem>
-              ))}
+              {manageItems.map((item) => {
+                const active = pathname === item.url;
+                return (
+                  <SidebarMenuItem key={item.title}>
+                    <Link href={item.url} passHref legacyBehavior>
+                      <SidebarMenuButton
+                        asChild
+                        data-active={active}
+                        className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2"
+                      >
+                        <a title={item.description}>
+                          <item.icon className="h-4 w-4 group-data-[collapsible=icon]:h-5 group-data-[collapsible=icon]:w-5" />
+                          <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
+                        </a>
+                      </SidebarMenuButton>
+                    </Link>
+                  </SidebarMenuItem>
+                );
+              })}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
