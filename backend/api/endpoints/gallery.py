@@ -159,11 +159,15 @@ async def get_gallery_images(
         # Parse tags if provided
         tag_list = _parse_tags(tags)
 
+        # When no folder is selected, restrict to ROOT-only so that
+        # "All Images" doesn't leak items from Archive / other subfolders.
+        effective_folder = folder_path if folder_path is not None else ""
+
         # Query Cosmos DB for images only
         result = await asyncio.to_thread(
             cosmos_service.query_assets,
             media_type="image",  # Images only
-            folder_path=folder_path,
+            folder_path=effective_folder,
             tags=tag_list,
             limit=limit,
             offset=offset,
@@ -236,11 +240,15 @@ async def get_gallery_videos(
         # Parse tags if provided
         tag_list = _parse_tags(tags)
 
+        # When no folder is selected, restrict to ROOT-only so that
+        # "All Videos" doesn't leak items from Archive / other subfolders.
+        effective_folder = folder_path if folder_path is not None else ""
+
         # Query Cosmos DB for videos only
         result = await asyncio.to_thread(
             cosmos_service.query_assets,
             media_type="video",  # Videos only
-            folder_path=folder_path,
+            folder_path=effective_folder,
             tags=tag_list,
             limit=limit,
             offset=offset,
@@ -338,9 +346,13 @@ async def _get_gallery_items_from_cosmos(
 ) -> GalleryResponse:
     """Get gallery items from CosmosDB metadata with standardized analysis structure"""
     try:
+        # When no folder is selected, restrict to ROOT-only so the combined
+        # gallery view doesn't leak items from Archive / other subfolders.
+        effective_folder = folder_path if folder_path is not None else ""
+
         result = await asyncio.to_thread(
             cosmos_service.query_assets,
-            folder_path=folder_path,
+            folder_path=effective_folder,
             limit=limit,
             offset=offset,
             order_by="created_at",

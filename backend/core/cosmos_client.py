@@ -248,13 +248,23 @@ class CosmosDBService:
             if media_type:
                 where_conditions.append(f"c.media_type = '{media_type}'")
 
-            if folder_path:
-                # Normalize folder path to match storage format (with trailing slash)
+            # folder_path semantics:
+            #   None            -> no folder filter (return items from every folder)
+            #   "" (empty str)  -> ROOT only (items with no/empty folder_path)
+            #   "Archive" etc.  -> that specific folder
+            if folder_path is not None:
                 normalized_folder = folder_path.strip()
-                if normalized_folder and not normalized_folder.endswith("/"):
-                    normalized_folder = f"{normalized_folder}/"
-                where_conditions.append(
-                    f"c.folder_path = '{normalized_folder}'")
+                if normalized_folder == "":
+                    where_conditions.append(
+                        "(NOT IS_DEFINED(c.folder_path) "
+                        "OR c.folder_path = '' "
+                        "OR c.folder_path = null)"
+                    )
+                else:
+                    if not normalized_folder.endswith("/"):
+                        normalized_folder = f"{normalized_folder}/"
+                    where_conditions.append(
+                        f"c.folder_path = '{normalized_folder}'")
 
             if tags:
                 # Check if any of the provided tags exist in the asset's tags array
