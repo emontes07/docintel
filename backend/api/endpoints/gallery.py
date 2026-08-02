@@ -625,6 +625,150 @@ async def delete_asset(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.put("/move")
+async def move_asset(
+    blob_name: str = Body(..., embed=True),
+    media_type: MediaType = Body(..., embed=True),
+    target_folder: str = Body(..., embed=True),
+    azure_storage_service: AzureBlobStorageService = Depends(
+        lambda: AzureBlobStorageService()
+    ),
+    cosmos_service: Optional[CosmosDBService] = Depends(get_cosmos_service),
+):
+    """
+    Move an asset to a different folder within its container.
+
+    Since Azure Blob Storage has no native move for flat namespaces, this
+    performs a server-side copy (download + upload) to the new folder path,
+    deletes the source blob, and updates the Cosmos metadata record's
+    `blob_name`, `url`, and `folder_path` to reflect the new location.
+    Idempotent behaviour: moving to the same folder is a no-op.
+    """
+    try:
+        container_name = (
+            settings.AZURE_BLOB_IMAGE_CONTAINER
+            if media_type == MediaType.IMAGE
+            else settings.AZURE_BLOB_VIDEO_CONTAINER
+        )
+        media_type_str = media_type.value
+
+        # Normalize folder path ("root" and "" both mean the container root)
+        normalized_folder = ""
+        if target_folder and target_folder.strip().lower() not in ("", "root"):
+            normalized_folder = azure_storage_service.normalize_folder_path(target_folder)
+
+        # Compute source + destination blob names
+        source_blob = blob_name
+        just_filename = source_blob.rsplit("/", 1)[-1]
+        dest_blob = f"{normalized_folder}{just_filename}"
+
+        if source_blob == dest_blob:
+            return {
+                "success": True,
+                "message": "Asset is already in the target folder",
+                "blob_name": source_blob,
+                "target_folder": normalized_folder,
+            }
+
+        # Server-side copy: download source bytes and upload to destination.
+        # (Flat-namespace accounts don't support atomic rename; a same-account
+        # start_copy_from_url would also work but requires an accessible source
+        # URL which is problematic with our private-endpoint storage.)
+        container_client = azure_storage_service.blob_service_client.get_container_client(
+            container_name
+        )
+        src_client = container_client.get_blob_client(source_blob)
+
+        def _copy_blob() -> None:
+            data = src_client.download_blob().readall()
+            props = src_client.get_blob_properties()
+            content_settings = props.content_settings
+            dest_client = container_client.get_blob_client(dest_blob)
+            dest_client.upload_blob(
+                data=data,
+                content_settings=content_settings,
+                overwrite=True,
+            )
+
+        try:
+            await asyncio.to_thread(_copy_blob)
+        except Exception as copy_err:
+            # Most likely BlobNotFound for the source
+            logger.error(f"move_asset: failed to copy {source_blob} -> {dest_blob}: {copy_err}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Source blob not found or unreadable: {source_blob}",
+            )
+
+        # Delete source blob (best-effort; a stale copy is better than data loss)
+        try:
+            await asyncio.to_thread(
+                azure_storage_service.delete_asset, source_blob, container_name
+            )
+        except Exception as del_err:
+            logger.warning(
+                f"move_asset: destination copy succeeded but source delete failed: {del_err}"
+            )
+
+        # Update Cosmos DB metadata: patch blob_name / url / folder_path on any
+        # matching record. Handles both deterministic-id and UUID-id records.
+        dest_url = container_client.get_blob_client(dest_blob).url
+        updated_count = 0
+        if cosmos_service:
+            try:
+                rows = await asyncio.to_thread(
+                    lambda: list(
+                        cosmos_service.container.query_items(
+                            query=(
+                                "SELECT * FROM c "
+                                "WHERE c.doc_type = 'asset_metadata' "
+                                "AND c.media_type = @mt "
+                                "AND (c.blob_name = @src OR c.filename = @src OR c.name = @src)"
+                            ),
+                            parameters=[
+                                {"name": "@mt", "value": media_type_str},
+                                {"name": "@src", "value": source_blob},
+                            ],
+                            enable_cross_partition_query=True,
+                        )
+                    )
+                )
+                for row in rows:
+                    try:
+                        row["blob_name"] = dest_blob
+                        row["url"] = dest_url
+                        row["folder_path"] = normalized_folder
+                        row["updated_at"] = datetime.utcnow().isoformat()
+                        await asyncio.to_thread(
+                            cosmos_service.container.replace_item,
+                            item=row["id"],
+                            body=row,
+                        )
+                        updated_count += 1
+                    except Exception as row_err:
+                        logger.warning(
+                            f"move_asset: failed to update Cosmos row {row.get('id')}: {row_err}"
+                        )
+            except Exception as query_err:
+                logger.warning(
+                    f"move_asset: Cosmos update query failed: {query_err}"
+                )
+
+        return {
+            "success": True,
+            "message": f"Moved asset to '{normalized_folder or 'root'}' (updated {updated_count} metadata row(s))",
+            "blob_name": dest_blob,
+            "source_blob": source_blob,
+            "target_folder": normalized_folder,
+            "url": dest_url,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"move_asset: unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Include all other existing endpoints with similar Cosmos DB integration...
 # For brevity, I'm showing the pattern for the main endpoints.
 # The remaining endpoints would follow the same pattern of:
