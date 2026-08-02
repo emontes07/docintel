@@ -1,8 +1,12 @@
+"use client";
+
 import { GalleryVerticalEnd } from "lucide-react"
 
 import { LoginForm } from "@/components/login-form"
+import { useBrand } from "@/context/brand-context"
 
 export default function LoginPage() {
+  const { brand } = useBrand();
   return (
     // The centering and full-height styling is now handled by app/login/layout.tsx
     <div className="flex w-full max-w-sm flex-col gap-6">
@@ -10,7 +14,7 @@ export default function LoginPage() {
         <div className="bg-primary text-primary-foreground flex size-6 items-center justify-center rounded-md">
           <GalleryVerticalEnd className="size-4" />
         </div>
-        Visionary Lab
+        {brand.productName}
       </a>
       <LoginForm />
     </div>

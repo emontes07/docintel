@@ -4,8 +4,7 @@ import { FileVideo, List, ImageIcon, FolderIcon, ImagePlus, Settings, ChevronDow
 import Link from 'next/link';
 import Image from 'next/image';
 import { useTheme } from "next-themes";
-import { ThemeToggle } from "@/components/theme-toggle";
-import { useEffect, useState } from "react";
+import { ThemeToggle } from "@/components/theme-toggle";import { useBrand } from "@/context/brand-context";import { useEffect, useState } from "react";
 import { fetchFolders, MediaType } from "@/services/api";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { useFolderContext } from "@/context/folder-context";
@@ -85,6 +84,7 @@ const folderItemVariants = {
 
 export function AppSidebar() {
   const { theme } = useTheme();
+  const { brand } = useBrand();
   const [mounted, setMounted] = useState(false);
   const [imageFolders, setImageFolders] = useState<string[]>([]);
   const [videoFolders, setVideoFolders] = useState<string[]>([]);
@@ -133,10 +133,12 @@ export function AppSidebar() {
     loadVideoFolders();
   }, [folderRefreshTrigger]); // Re-run when folders are created/updated
 
-  // Determine logo based on theme
-  const logoSrc = mounted && theme === "dark" 
-    ? "/logo/logo-light.png"  // Light logo for dark theme (white/bright logo)
-    : "/logo/logo-dark.png";  // Dark logo for light theme (black/dark logo)
+  // Determine logo based on active brand + page theme.
+  // Each brand exposes light/dark variants where the name refers to which
+  // page background the asset is designed to sit on top of.
+  const logoSrc = mounted && theme === "dark"
+    ? brand.logo.dark
+    : brand.logo.light;
     
   // Navigate to images page with folder filter
   const handleImageFolderClick = (folderPath: string) => {
@@ -191,11 +193,11 @@ export function AppSidebar() {
         {mounted ? (
           <>
             <div className="flex items-center group-data-[collapsible=icon]:hidden">
-              <Image 
-                src={logoSrc} 
-                alt="Visionary Lab" 
-                width={30} 
-                height={30} 
+              <Image
+                src={logoSrc}
+                alt={brand.productName}
+                width={30}
+                height={30}
                 className="mr-2"
                 onError={(e) => {
                   // Fallback to SVG if PNG fails to load
@@ -205,13 +207,13 @@ export function AppSidebar() {
                   }
                 }}
               />
-              <h2 className="font-semibold text-lg">Visionary Lab</h2>
+              <h2 className="font-semibold text-lg">{brand.productName}</h2>
             </div>
             <div className="hidden group-data-[collapsible=icon]:flex items-center justify-center">
-              <Image 
-                src={logoSrc} 
-                alt="Visionary Lab" 
-                width={24} 
+              <Image
+                src={logoSrc}
+                alt={brand.productName}
+                width={24}
                 height={24}
                 onError={(e) => {
                   // Fallback to SVG if PNG fails to load

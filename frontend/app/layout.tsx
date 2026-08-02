@@ -3,6 +3,8 @@ import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider"
+import { BrandProvider } from "@/context/brand-context";
+import { BrandTopStripe } from "@/components/brand-top-stripe";
 import { AppSidebar } from "@/components/app-sidebar";
 import { SidebarProvider, SidebarInset, SidebarTrigger } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
@@ -75,6 +77,8 @@ export default async function RootLayout({ children }: RootLayoutProps) {
             enableSystem
             disableTransitionOnChange
           >
+            <BrandProvider>
+            <BrandTopStripe />
             <VideoQueueProvider>
                 <JobsProvider>
                   <ImageSettingsProvider>
@@ -118,6 +122,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                   </ImageSettingsProvider>
                 </JobsProvider>
               </VideoQueueProvider>
+            </BrandProvider>
           </ThemeProvider>
 
         

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
+  <!-- three crayons fanned out — slightly brighter for dark backgrounds -->
+  <g transform="translate(24 26) rotate(-14) translate(-4 -14)">
+    <path d="M0 4h8v18a4 4 0 01-8 0V4z" fill="#FF3B60"/>
+    <path d="M0 4l4-4 4 4H0z" fill="#B0002E"/>
+  </g>
+  <g transform="translate(24 26) translate(-4 -14)">
+    <path d="M0 4h8v18a4 4 0 01-8 0V4z" fill="#FFE24D"/>
+    <path d="M0 4l4-4 4 4H0z" fill="#B39100"/>
+  </g>
+  <g transform="translate(24 26) rotate(14) translate(-4 -14)">
+    <path d="M0 4h8v18a4 4 0 01-8 0V4z" fill="#3CC8ED"/>
+    <path d="M0 4l4-4 4 4H0z" fill="#0083A6"/>
+  </g>
+</svg>
