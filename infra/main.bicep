@@ -105,7 +105,9 @@ param frontendCustomDomain string = ''
 param frontendCertificateId string = ''
 
 // Parameters for Cosmos DB
-param cosmosAccountName string = 'visionary-lab-cosmos'
+@description('Region for the Cosmos DB account. Defaults to the global location; override when the primary region lacks Cosmos capacity.')
+param cosmosLocation string = location
+param cosmosAccountName string = 'cosmos-${environmentName}'
 param cosmosDatabaseName string = 'VisionaryLabDB'
 param cosmosContainerName string = 'visionarylab'
 
@@ -143,11 +145,15 @@ module containerRegistryMod './modules/containerRegistry.bicep' = {
 
 // ─── Azure Cosmos DB ───
 var cosmosPrefix = toLower(substring(uniqueString(resourceGroup().id, environmentName), 0, 5))
-var cosmosAccountNamePrefixed = '${cosmosPrefix}-${cosmosAccountName}'
+// Cosmos account names are lowercase-only, 3-44 chars, and cannot end with a hyphen
+var cosmosAccountNameTruncated = take(toLower('${cosmosPrefix}-${cosmosAccountName}'), 44)
+var cosmosAccountNamePrefixed = endsWith(cosmosAccountNameTruncated, '-')
+  ? take(cosmosAccountNameTruncated, 43)
+  : cosmosAccountNameTruncated
 module cosmosDbMod './modules/cosmosDb.bicep' = {
   name: 'cosmosDbMod'
   params: {
-    location: location
+    location: cosmosLocation
     cosmosAccountName: cosmosAccountNamePrefixed
     databaseName: cosmosDatabaseName
     containerName: cosmosContainerName

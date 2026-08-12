@@ -8,6 +8,9 @@
     "location": {
       "value": "${AZURE_LOCATION}"
     },
+    "cosmosLocation": {
+      "value": "${AZURE_COSMOS_LOCATION=westus3}"
+    },
     "DOCKER_IMAGE_BACKEND": {
       "value": "${SERVICE_BACKEND_IMAGE_NAME}"
     },
