@@ -21,7 +21,6 @@ class Settings(BaseSettings):
     IMAGEGEN_1_MINI_DEPLOYMENT: Optional[str] = None
     IMAGEGEN_2_DEPLOYMENT: Optional[str] = None
     FLUX_KONTEXT_DEPLOYMENT: Optional[str] = None
-    SORA_DEPLOYMENT: Optional[str] = None
     DEFAULT_IMAGE_MODEL: str = "gpt-image-1.5"
 
     # OpenAI API for direct OpenAI usage (non-Azure)
@@ -52,15 +51,10 @@ class Settings(BaseSettings):
 
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"
-    # Azure OpenAI v1 preview API version for Sora 2 video endpoints.
-    # Sora 2 lives on /openai/v1/videos which requires api-version=preview
-    # (or a specific dated preview). Override via env var if needed.
-    SORA_API_VERSION: str = "preview"
 
     # File storage paths
     UPLOAD_DIR: str = "./static/uploads"
     IMAGE_DIR: str = "./static/images"
-    VIDEO_DIR: str = "./static/videos"
 
     # Logging Configuration
     LOG_LEVEL: str = "INFO"

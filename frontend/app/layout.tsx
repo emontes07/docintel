@@ -8,12 +8,8 @@ import { BrandTopStripe } from "@/components/brand-top-stripe";
 import { AppSidebar } from "@/components/app-sidebar";
 import { SidebarProvider, SidebarInset, SidebarTrigger } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
-import { VideoQueueProvider } from "@/context/video-queue-context";
-import { JobsProvider } from "@/context/jobs-context";
 import { ImageSettingsProvider } from "@/context/image-settings-context";
 import { FolderProvider } from "@/context/folder-context";
-import { VideoQueueClient } from "@/components/video-queue-client";
-import { RefreshJobsButton } from "@/components/refresh-jobs-button";
 import { Toaster } from "@/components/ui/sonner";
 import dynamic from "next/dynamic";
 import { AnimatedLayout } from "@/components/animated-layout";
@@ -79,9 +75,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
           >
             <BrandProvider>
             <BrandTopStripe />
-            <VideoQueueProvider>
-                <JobsProvider>
-                  <ImageSettingsProvider>
+            <ImageSettingsProvider>
                     <FolderProvider>
                     {/* Main layout with sidebar */}
                     <div className="relative flex min-h-screen h-screen">              
@@ -104,10 +98,6 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                           <div className="flex h-14 items-center gap-2 border-b shrink-0 px-3">
                             <SidebarTrigger />
                             <Separator orientation="vertical" className="mx-2 h-4" />
-                            <div className="ml-auto flex items-center space-x-2">
-                              <RefreshJobsButton />
-                              <VideoQueueClient />
-                            </div>
                           </div>
                           <main className="flex-1 overflow-auto w-full transition-all duration-200">
                             <AnimatedLayout>
@@ -120,8 +110,6 @@ export default async function RootLayout({ children }: RootLayoutProps) {
                     <Toaster />
                     </FolderProvider>
                   </ImageSettingsProvider>
-                </JobsProvider>
-              </VideoQueueProvider>
             </BrandProvider>
           </ThemeProvider>
 
@@ -161,7 +149,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
               // Prefetch likely navigation targets
               if ('requestIdleCallback' in window) {
                 requestIdleCallback(() => {
-                  const links = ['/gallery', '/new-image', '/new-video'];
+                  const links = ['/new-image'];
                   links.forEach(link => {
                     const linkEl = document.createElement('link');
                     linkEl.rel = 'prefetch';

@@ -1,6 +1,6 @@
 "use client"
 
-import { FileVideo, List, ImageIcon, FolderIcon, ImagePlus, Settings, ChevronDown, Pencil, CirclePlay, Loader2, Search } from "lucide-react"
+import { ImageIcon, FolderIcon, ImagePlus, Settings, ChevronDown, Pencil, Loader2, Search } from "lucide-react"
 import Link from 'next/link';
 import Image from 'next/image';
 import { useTheme } from "next-themes";
@@ -28,12 +28,6 @@ import { Skeleton } from "@/components/ui/skeleton";
 // Create section items
 const createItems = [
   {
-    title: "New Video",
-    url: "/new-video",
-    icon: CirclePlay,
-    description: "Create and browse videos"
-  },
-  {
     title: "New Image",
     url: "/new-image",
     icon: ImagePlus,
@@ -55,12 +49,6 @@ const createItems = [
 
 // Manage section items
 const manageItems = [
-  {
-    title: "Jobs",
-    url: "/jobs",
-    icon: List,
-    description: "View processing jobs"
-  },
   {
     title: "Settings",
     url: "/settings",
@@ -87,11 +75,8 @@ export function AppSidebar() {
   const { brand } = useBrand();
   const [mounted, setMounted] = useState(false);
   const [imageFolders, setImageFolders] = useState<string[]>([]);
-  const [videoFolders, setVideoFolders] = useState<string[]>([]);
   const [isImageFoldersOpen, setIsImageFoldersOpen] = useState(true);
-  const [isVideoFoldersOpen, setIsVideoFoldersOpen] = useState(true);
   const [isImageFoldersLoading, setIsImageFoldersLoading] = useState(true);
-  const [isVideoFoldersLoading, setIsVideoFoldersLoading] = useState(true);
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -117,20 +102,7 @@ export function AppSidebar() {
       }
     };
 
-    const loadVideoFolders = async () => {
-      setIsVideoFoldersLoading(true);
-      try {
-        const response = await fetchFolders(MediaType.VIDEO);
-        setVideoFolders(response.folders);
-      } catch (error) {
-        console.error("Error fetching video folders:", error);
-      } finally {
-        setIsVideoFoldersLoading(false);
-      }
-    };
-
     loadImageFolders();
-    loadVideoFolders();
   }, [folderRefreshTrigger]); // Re-run when folders are created/updated
 
   // Determine logo based on active brand + page theme.
@@ -145,11 +117,6 @@ export function AppSidebar() {
     router.push(`/new-image?folder=${encodeURIComponent(folderPath)}`);
   };
 
-  // Navigate to gallery page with folder filter
-  const handleVideoFolderClick = (folderPath: string) => {
-    router.push(`/new-video?folder=${encodeURIComponent(folderPath)}`);
-  };
-
   // Check if an image folder link is active
   const isImageFolderActive = (folderPath: string | null) => {
     if (!folderPath) {
@@ -159,20 +126,6 @@ export function AppSidebar() {
     
     // Otherwise check if the folder parameter matches the current folder
     return pathname === '/new-image' && currentFolderParam === folderPath;
-  };
-
-  // Check if a video folder link is active
-  const isVideoFolderActive = (folderPath: string | null) => {
-    // Only new-video path should be treated as video page
-    const isVideoPage = pathname === '/new-video';
-    
-    if (!folderPath) {
-      // "All Videos" is active when no folder parameter is present
-      return isVideoPage && !currentFolderParam;
-    }
-    
-    // Otherwise check if the folder parameter matches the current folder
-    return isVideoPage && currentFolderParam === folderPath;
   };
 
   // Per-item accent color from the active brand's nav palette (if any).
@@ -297,86 +250,6 @@ export function AppSidebar() {
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
-
-        {/* Video Folders Section */}
-        <div className="group-data-[collapsible=icon]:hidden">
-          <Collapsible
-            open={isVideoFoldersOpen}
-            onOpenChange={setIsVideoFoldersOpen}
-            className="w-full"
-          >
-            <SidebarGroup>
-              <SidebarGroupLabel asChild>
-                <CollapsibleTrigger className="flex w-full items-center justify-between">
-                  <div className="flex items-center">
-                    <span>Video Albums</span>
-                    {isVideoFoldersLoading && (
-                      <Loader2 className="h-3 w-3 ml-2 animate-spin text-muted-foreground" />
-                    )}
-                  </div>
-                  <ChevronDown className="h-4 w-4 transition-transform duration-200" 
-                    style={{ 
-                      transform: isVideoFoldersOpen ? 'rotate(0deg)' : 'rotate(-90deg)' 
-                    }}
-                  />
-                </CollapsibleTrigger>
-              </SidebarGroupLabel>
-              <CollapsibleContent>
-                <SidebarGroupContent>
-                  <SidebarMenu>
-                    {/* Show All Videos option */}
-                    <SidebarMenuItem>
-                      <Link href="/new-video" passHref legacyBehavior>
-                        <SidebarMenuButton 
-                          asChild
-                          data-active={isVideoFolderActive(null)}
-                          className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium"
-                        >
-                          <a>
-                            <FileVideo
-                              className="h-4 w-4 mr-2"
-                              style={navColor(0) ? { color: navColor(0) } : undefined}
-                            />
-                            <span>All Videos</span>
-                          </a>
-                        </SidebarMenuButton>
-                      </Link>
-                    </SidebarMenuItem>
-                    
-                    {/* Video Folder List */}
-                    {isVideoFoldersLoading ? (
-                      renderFolderSkeletons()
-                    ) : (
-                      videoFolders.map((folder, index) => (
-                        <motion.div
-                          key={folder}
-                          custom={index}
-                          initial="hidden"
-                          animate="visible"
-                          variants={folderItemVariants}
-                        >
-                          <SidebarMenuItem>
-                            <SidebarMenuButton 
-                              asChild
-                              data-active={isVideoFolderActive(folder)}
-                              className="data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground data-[active=true]:font-medium"
-                              onClick={() => handleVideoFolderClick(folder)}
-                            >
-                              <a>
-                                <FolderIcon className="h-4 w-4 mr-2" />
-                                <span>{folder.split('/').pop() || folder}</span>
-                              </a>
-                            </SidebarMenuButton>
-                          </SidebarMenuItem>
-                        </motion.div>
-                      ))
-                    )}
-                  </SidebarMenu>
-                </SidebarGroupContent>
-              </CollapsibleContent>
-            </SidebarGroup>
-          </Collapsible>
-        </div>
 
         {/* Image Folders Section */}
         <div className="group-data-[collapsible=icon]:hidden">

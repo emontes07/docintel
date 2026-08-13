@@ -485,3 +485,60 @@ Files that must be **edited rather than deleted** for either removal:
   `/edit-image`, `/analyze`, `/gallery`, and `/jobs` all disappear, leaving only
   `/settings`, `/login`, and auth. `app/page.tsx` re-exports the image page, so
   the site root breaks first.
+
+---
+
+## Step 3 — infra to-do
+
+Video generation was removed from the application in step 2b, but `infra/` and
+`azure.yaml` were deliberately left untouched. The following items are
+outstanding and must be handled in a dedicated infra pass.
+
+### 1. `SORA_DEPLOYMENT` is now a dead env var
+
+It is still declared and plumbed through the whole infra chain:
+
+- `infra/main.bicep` — `param SORA_DEPLOYMENT` and the `deploySoraModel` /
+  `soraModelName` / `soraModelVersion` parameters
+- `infra/main.parameters.json` — `"SORA_DEPLOYMENT": { "value": "${SORA_DEPLOYMENT}" }`
+- `infra/modules/containerApp.bicep` — `param SORA_DEPLOYMENT string = 'sora'`,
+  injected into the backend container as a runtime environment variable
+
+Nothing in the backend reads it any more: `Settings.SORA_DEPLOYMENT` was deleted
+from `backend/core/config.py`, and `backend/api/endpoints/env.py` no longer lists
+it as required. The variable is therefore set on the running container and
+silently ignored.
+
+This is harmless at runtime — `Settings` sets `extra = Extra.allow`, so the
+unknown value is absorbed rather than raising — but it is misleading, and
+`azd env set SORA_DEPLOYMENT` still appears in `DEPLOYMENT.md`. Remove the
+parameter from all three Bicep files and from the azd environment.
+
+### 2. Pending model deployment swap
+
+The AI Foundry deployments provisioned by `infra/main.bicep` no longer match what
+the application uses.
+
+**Drop:**
+
+| Deployment | Reason |
+| --- | --- |
+| `sora-2` | Video generation removed in step 2b. Gated behind `deploySoraModel` (currently `false`), so it may never have been provisioned — confirm before deleting the parameters. |
+| `gpt-image-1.5` | Image generation is removed in the next step. |
+| `gpt-image-1-mini` | Same. |
+| `flux-kontext-pro` | Same. |
+
+**Keep:**
+
+| Deployment | Reason |
+| --- | --- |
+| `gpt-4o` | Backing model for `LLM_DEPLOYMENT`, used by every surviving analysis and prompt call site. Untouched by this migration. |
+
+**Add:** a cheaper deployment for bulk extraction. Not yet selected; size it for
+high-volume document throughput rather than latency.
+
+Sequencing note: do not remove the image deployments until the image generation
+step lands, since `IMAGEGEN_DEPLOYMENT` and `FLUX_KONTEXT_DEPLOYMENT` are still
+read by `backend/core/gpt_image.py` and still listed in
+`backend/api/endpoints/env.py`.
+

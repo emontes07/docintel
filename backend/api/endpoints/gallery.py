@@ -986,11 +986,9 @@ async def health_check(
     # Check AI Services
     try:
         # Test if AI clients are properly initialized
-        from backend.core import sora_client, image_client, llm_client
+        from backend.core import image_client, llm_client
 
         ai_services = {}
-        if sora_client:
-            ai_services["sora"] = "available"
         if image_client:
             ai_services["dalle/gpt_image"] = "available"
         if llm_client:
