@@ -537,6 +537,18 @@ the application uses.
 **Add:** a cheaper deployment for bulk extraction. Not yet selected; size it for
 high-volume document throughput rather than latency.
 
+### 3. Parked on a working `uv sync`
+
+Two changes are blocked by the PyPI network restriction on the current machine
+and must land together once `uv sync` can run:
+
+- **`opencv-python` removal.** Dropped from `pyproject.toml` in step 2b when
+  `VideoExtractor` was deleted, but `uv.lock` still pins it.
+- **`pyproject.toml` `name` rename** (`video-gen` → `docintel`). Deliberately
+  skipped in step 2d: `[project].name` is recorded in `uv.lock`, so renaming it
+  without regenerating the lock would leave the two out of sync. Only
+  `description` was updated.
+
 Sequencing note: do not remove the image deployments until the image generation
 step lands, since `IMAGEGEN_DEPLOYMENT` and `FLUX_KONTEXT_DEPLOYMENT` are still
 read by `backend/core/gpt_image.py` and still listed in

@@ -1,4 +1,4 @@
-"""Shared test fixtures for the Visionary Lab backend.
+"""Shared test fixtures for the DocIntel backend.
 
 All tests run without real Azure credentials by mocking external services.
 """

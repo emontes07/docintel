@@ -21,10 +21,9 @@ The Docker setup is configured to accommodate this structure.
 Create a `.env` file in the root directory with the following variables:
 
 ```env
-# Azure OpenAI for Sora
-SORA_AOAI_RESOURCE=your-resource-name
-SORA_DEPLOYMENT=your-sora-deployment
-SORA_AOAI_API_KEY=your-api-key
+# Azure AI Foundry
+AI_FOUNDRY_ENDPOINT=https://your-foundry-name.cognitiveservices.azure.com/
+LLM_DEPLOYMENT=gpt-4o
 
 # Azure Blob Storage
 AZURE_STORAGE_ACCOUNT_NAME=your-storage-account-name
@@ -74,23 +73,22 @@ docker-compose up -d
 To build and run the backend individually, you need to build from the root directory:
 
 ```bash
-docker build -t ai-content-lab-backend -f backend/Dockerfile .
+docker build -t docintel-backend -f backend/Dockerfile .
 docker run -p 8000:80 \
   -e PYTHONPATH=/app \
   -e PATH=/app/.venv/bin:${PATH} \
-  -e SORA_AOAI_RESOURCE=your-resource-name \
-  -e SORA_DEPLOYMENT=your-sora-deployment \
-  -e SORA_AOAI_API_KEY=your-api-key \
+  -e AI_FOUNDRY_ENDPOINT=https://your-foundry-name.cognitiveservices.azure.com/ \
+  -e LLM_DEPLOYMENT=gpt-4o \
   -e AZURE_STORAGE_ACCOUNT_NAME=your-storage-account-name \
   -e AZURE_STORAGE_ACCOUNT_KEY=your-storage-account-key \
-  ai-content-lab-backend
+  docintel-backend
 ```
 
 #### Frontend
 
 ```bash
 cd frontend
-docker build -t ai-content-lab-frontend .
+docker build -t docintel-frontend .
 docker run -p 3000:3000 \
   -e NEXT_PUBLIC_API_PROTOCOL=http \
   -e NEXT_PUBLIC_API_HOSTNAME=localhost \
@@ -157,7 +155,7 @@ Add the `-f` flag to follow the logs in real-time.
 
 If the backend container fails to start, check:
 1. Environment variables are correctly set
-2. The SORA_AOAI_RESOURCE, SORA_DEPLOYMENT, and SORA_AOAI_API_KEY are valid
+2. The AI_FOUNDRY_ENDPOINT and LLM_DEPLOYMENT values are valid
 3. Logs with `docker-compose logs backend`
 4. Make sure the PYTHONPATH and PATH environment variables are set correctly
 5. Try rebuilding from scratch as mentioned in the "Completely Rebuilding" section

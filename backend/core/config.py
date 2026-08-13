@@ -6,7 +6,7 @@ from pydantic import Extra, Field, validator
 class Settings(BaseSettings):
     # API Settings
     API_V1_STR: str = "/api/v1"
-    PROJECT_NAME: str = "Visionary Lab API"
+    PROJECT_NAME: str = "DocIntel API"
 
     # AI Foundry endpoint (unified for all AI services via managed identity)
     AI_FOUNDRY_ENDPOINT: Optional[str] = None

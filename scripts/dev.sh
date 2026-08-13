@@ -40,16 +40,8 @@ ensure_env() {
   # Check for placeholder values and prompt the user
   local missing=()
   local vars=(
-    "SORA_AOAI_RESOURCE:Azure OpenAI Sora resource name"
-    "SORA_DEPLOYMENT:Sora deployment name"
-    "SORA_AOAI_API_KEY:Sora API key"
-    "IMAGEGEN_AOAI_RESOURCE:Image generation resource name"
-    "IMAGEGEN_DEPLOYMENT:Image generation deployment name (e.g. gpt-image-1)"
-    "IMAGEGEN_15_DEPLOYMENT:Image 1.5 deployment name (e.g. gpt-image-1.5)"
-    "IMAGEGEN_1_MINI_DEPLOYMENT:Image 1 Mini deployment name (e.g. gpt-image-1-mini)"
-    "IMAGEGEN_AOAI_API_KEY:Image generation API key"
     "LLM_AOAI_RESOURCE:LLM resource name"
-    "LLM_DEPLOYMENT:LLM deployment name (e.g. gpt-4.1)"
+    "LLM_DEPLOYMENT:LLM deployment name (e.g. gpt-4o)"
     "LLM_AOAI_API_KEY:LLM API key"
     "AZURE_STORAGE_ACCOUNT_NAME:Azure Storage account name"
     "AZURE_STORAGE_ACCOUNT_KEY:Azure Storage account key"
@@ -167,7 +159,7 @@ case "${1:-all}" in
   --no-azure)
     ensure_env
     echo -e "${CYAN}══════════════════════════════════════${NC}"
-    echo -e "${CYAN}  Visionary Lab — Local Dev Server${NC}"
+    echo -e "${CYAN}  DocIntel — Local Dev Server${NC}"
     echo -e "${YELLOW}  (skipping Azure access setup)${NC}"
     echo -e "${CYAN}══════════════════════════════════════${NC}"
     echo ""
@@ -184,7 +176,7 @@ case "${1:-all}" in
     ensure_env
     ensure_azure_access
     echo -e "${CYAN}══════════════════════════════════════${NC}"
-    echo -e "${CYAN}  Visionary Lab — Local Dev Server${NC}"
+    echo -e "${CYAN}  DocIntel — Local Dev Server${NC}"
     echo -e "${CYAN}══════════════════════════════════════${NC}"
     echo ""
     start_backend

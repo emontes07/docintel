@@ -56,14 +56,14 @@ export interface Brand {
 }
 
 /**
- * Default brand — the original Visionary Lab neutral look.
+ * Default brand — the original DocIntel neutral look.
  * Uses only shadcn defaults; no overrides applied.
  */
 const DEFAULT_BRAND: Brand = {
   id: "default",
   name: "Default",
-  productName: "Visionary Lab",
-  tagline: "AI-powered content generation",
+  productName: "DocIntel",
+  tagline: "Batch document attribute extraction",
   logo: {
     light: "/logo/logo-dark.png", // dark logo on light page bg
     dark: "/logo/logo-light.png", // light logo on dark page bg

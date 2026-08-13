@@ -29,8 +29,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Visionary Lab",
-  description: "AI-powered Content Generation",
+  title: "DocIntel",
+  description: "Batch document attribute extraction",
   manifest: "/manifest.json",
   icons: {
     apple: "/logo/icon-192.png",
@@ -38,7 +38,7 @@ export const metadata: Metadata = {
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
-    title: "Visionary Lab",
+    title: "DocIntel",
   },
   other: {
     "mobile-web-app-capable": "yes",

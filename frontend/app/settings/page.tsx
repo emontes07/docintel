@@ -437,7 +437,7 @@ export default function SettingsPage() {
                                  )}
                               </div>
                                                              <p className="text-xs text-amber-700 mt-2">
-                                 These keys are needed for basic image generation functionality.
+                                 These keys are needed for basic extraction functionality.
                                </p>
                             </div>
                             

@@ -1,7 +1,7 @@
 {
-    "name": "Visionary Lab",
-    "short_name": "VisionaryLab",
-    "description": "AI-powered Content Generation Platform",
+    "name": "DocIntel",
+    "short_name": "DocIntel",
+    "description": "Batch document attribute extraction",
     "start_url": "/",
     "display": "standalone",
     "background_color": "#ffffff",
@@ -23,8 +23,7 @@
     ],
     "categories": [
         "productivity",
-        "utilities",
-        "photo"
+        "utilities"
     ],
     "lang": "en",
     "dir": "ltr",

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'visionary-lab-v1';
+const CACHE_NAME = 'docintel-v1';
 const STATIC_CACHE = 'static-v1';
 const IMAGE_CACHE = 'images-v1';
 const API_CACHE = 'api-v1';

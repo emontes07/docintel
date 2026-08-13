@@ -1,6 +1,10 @@
 # Frontend Documentation
 
-This document provides a factual overview of the frontend system for the AI Content Lab based on code examination.
+This document provides a factual overview of the frontend system for DocIntel based on code examination.
+
+> Status: mid-migration. The content generation routes have been removed and the
+> document-intelligence UI is not built yet. See
+> [MIGRATION-NOTES.md](../MIGRATION-NOTES.md).
 
 ## 1. Project Structure
 
@@ -12,34 +16,26 @@ frontend/
 ├── Dockerfile               # Container configuration
 ├── app/                     # Next.js App Router pages and layouts
 │   ├── api/                 # API routes (Next.js server-side endpoints)
-│   ├── auth/                # Authentication-related routes
-│   ├── edit-image/          # Image editing functionality
-│   ├── gallery/             # Gallery view for content
-│   ├── jobs/                # Job management interface
+│   │   ├── auth/            # NextAuth handler
+│   │   └── environment/     # Environment status route
 │   ├── login/               # Login page
-│   ├── new-image/           # Image creation page
-│   ├── new-video/           # Video creation page
 │   ├── settings/            # Application settings
-│   ├── video/               # Video viewing functionality
+│   ├── test-simple/         # Scratch page
 │   ├── layout.tsx           # Root layout component
-│   └── page.tsx             # Home page component
+│   ├── not-found.tsx        # 404 handler
+│   └── page.tsx             # Landing placeholder for the extraction UI
 ├── components/              # Reusable React components
 │   ├── ui/                  # UI component library
-│   ├── video/               # Video-specific components
-│   ├── ImageCreationContainer.tsx 
-│   ├── VideoCreationContainer.tsx
-│   ├── ImageDetailView.tsx
-│   ├── VideoDetailView.tsx
-│   └── ...                  # Many other component files
+│   ├── app-sidebar.tsx      # Navigation shell
+│   ├── page-header.tsx
+│   ├── brand-*.tsx          # Brand theming components
+│   └── ...                  # Auth, theme, and layout components
 ├── context/                 # React context providers
 ├── hooks/                   # Custom React hooks
-├── lib/                     # Utility libraries
 ├── public/                  # Static assets
 ├── services/                # API service integrations
-│   ├── api.ts               # Backend API client
-│   ├── imageService.ts      # Image-specific API functions
+│   ├── api.ts               # Backend API client (gallery, folders, metadata)
 │   └── sas-token.ts         # Azure storage SAS token management
-├── types/                   # TypeScript type definitions
 └── utils/                   # Utility functions
 ```
 
@@ -53,7 +49,6 @@ The frontend is built with:
 - **NextAuth.js (next-auth v5)**: For authentication
 - **Radix UI**: For accessible UI components
 - **Framer Motion**: For animations
-- **FFMPEG**: For client-side video processing
 
 ## 3. Key Features & Implementation Details
 
@@ -74,14 +69,13 @@ The frontend is built with:
 - `api.ts` contains the core API client functionality with:
   - Configurable API URL via environment variables (`NEXT_PUBLIC_API_PROTOCOL`, `NEXT_PUBLIC_API_HOSTNAME`, `NEXT_PUBLIC_API_PORT`)
   - Default URL: `http://localhost:8000/api/v1`
-  - Includes endpoints for image and video generation, editing, and management
+  - Clients for the gallery, folder, and metadata endpoints
 
-### Content Generation UI
+### Application UI
 
-- **Image Creation**: Implemented in `ImageCreationContainer.tsx` and accessed via `/new-image`
-- **Video Creation**: Implemented in `VideoCreationContainer.tsx` and accessed via `/new-video`
-- **Image Editing**: Available at `/edit-image` route
-- **Content Gallery**: Available at `/gallery` route
+- **Landing page**: Placeholder at `/`, to be replaced by the extraction UI
+- **Settings**: Available at `/settings`, including environment status
+- **Login**: Available at `/login`
 
 ### Azure Storage Integration
 
@@ -128,8 +122,4 @@ The frontend requires the following environment variables:
   - Layout components for shared UI
   - Page components for route-specific content
   - Loading and error states
-- **Container Components**: Complex UI logic encapsulated in container components
-  - `ImageCreationContainer.tsx`
-  - `VideoCreationContainer.tsx`
-  - `ImageDetailView.tsx`
-  - `VideoDetailView.tsx`
+- **Shell Components**: Shared chrome lives in `app-sidebar.tsx`, `page-header.tsx`, and `animated-layout.tsx`
