@@ -1,0 +1,487 @@
+# Migration Notes
+
+Audit of the current repository state, produced ahead of removing the video and
+image generation paths. Everything below was read directly from source; nothing
+is inferred from `project-structure.md` or `BACKEND.MD` (both of which are stale
+— see section 7).
+
+Legend used throughout: **[video]** = video generation only, **[image]** = image
+generation only, **[shared]** = used by both, **[infra]** = neither (storage,
+metadata, config, auth).
+
+---
+
+## 1. Backend file inventory
+
+### Package roots
+
+| File | Responsibility |
+| --- | --- |
+| `backend/__init__.py` | Empty package marker. [infra] |
+| `backend/main.py` | App composition root: calls `setup_logging()`, creates `UPLOAD_DIR`/`IMAGE_DIR`/`VIDEO_DIR`, builds the `FastAPI` instance, adds CORS middleware, mounts `/static`, registers all five routers, and defines `GET /` and `GET /api/v1/health`. [shared] |
+| `backend/Dockerfile` | Backend container image build. [infra] |
+| `backend/.dockerignore` | Docker build context exclusions. [infra] |
+| `backend/BACKEND.MD` | Backend documentation (stale — see section 7). [infra] |
+
+### `backend/api/`
+
+| File | Responsibility |
+| --- | --- |
+| `api/__init__.py` | Empty package marker. [infra] |
+| `api/endpoints/__init__.py` | Empty package marker. [infra] |
+| `api/endpoints/images.py` | Image router: generation, editing, save, pipeline, listing, deletion, analysis, prompt enhancement/brand protection, filename generation. Delegates generation work to `ImagePipelineService`. [image] |
+| `api/endpoints/videos.py` | Video router: Sora job lifecycle, server-side finalization, generate-with-analysis (JSON / upload / SSE stream), content download, analysis, prompt enhancement + moderation-safe rewrite, filename generation, cameo references, remix. Largest module in the backend (~1800 lines). [video] |
+| `api/endpoints/gallery.py` | Gallery router: unified listing of image/video assets from Cosmos or blob storage, upload, delete, move, asset streaming, SAS token issuance, health check, metadata-service status, folder listing/creation. [shared] |
+| `api/endpoints/metadata_router.py` | Asset metadata CRUD over Cosmos DB, search, folder statistics, recent assets, and background blob→Cosmos metadata sync. [infra] |
+| `api/endpoints/env.py` | Reports which configured settings are set vs. missing. Hardcodes `SORA_DEPLOYMENT` and `IMAGEGEN_DEPLOYMENT` in its required list. [shared] |
+
+### `backend/core/`
+
+| File | Responsibility |
+| --- | --- |
+| `core/__init__.py` | **Service singleton construction at import time.** Builds the shared `DefaultAzureCredential` + `token_provider`, then `sora_client`, `image_client`, `llm_client`, `async_llm_client`, and generates `video_sas_token` / `image_sas_token`. Each client is wrapped in `try/except` and set to `None` on failure. [shared] |
+| `core/config.py` | Pydantic `BaseSettings` subclass (`Settings`) plus the module-level `settings` singleton. `extra = Extra.allow`, so unknown env vars are silently accepted. [shared] |
+| `core/logging_config.py` | `setup_logging()` — root logging config from `LOG_LEVEL`, and quiets the Azure HTTP logging policy. [infra] |
+| `core/sora.py` | `Sora` class: async Sora 2 client built on `httpx.AsyncClient`. Rewrites the Foundry endpoint host to `<resource>.openai.azure.com/openai/v1/videos`, validates sizes/durations, and manages job create/get/list/delete. Also `convert_sora2_response_to_job_format()`. [video] |
+| `core/gpt_image.py` | `GPTImageClient`: image generation/editing via the OpenAI or Azure OpenAI SDK, plus `_get_deployment_for_model()` model→deployment mapping. Exports legacy alias `DALLEClient = GPTImageClient` (line 572). [image] |
+| `core/image_pipeline.py` | `ImagePipelineService`: orchestrates generate → analyze → save-to-blob → write-metadata. Constructs its own per-request `GPTImageClient` instances. [image] |
+| `core/analyze.py` | `VideoExtractor` (OpenCV frame sampling) [video], `VideoAnalyzer` (multi-frame multimodal chat) [video], `ImageAnalyzer` (single-image multimodal chat) [image]. All three take an OpenAI client + model name by constructor injection. |
+| `core/azure_storage.py` | `AzureBlobStorageService`: blob upload/download/delete/move/list across the image and video containers, plus blob-service CORS rule configuration. [infra] |
+| `core/cosmos_client.py` | `CosmosDBService` + `DatabaseError`: Cosmos SQL API access for asset metadata (CRUD, query, folder stats). [infra] |
+| `core/instructions.py` | Prompt/system-message templates: `video_prompt_enhancement_system_message` [video], `img_prompt_enhance_msg` [image], `brand_protect_replace_msg` / `brand_protect_neutralize_msg` [shared], `analyze_video_system_message` [video], `analyze_image_system_message` [image], `filename_system_message` [shared], `video_prompt_moderation_safe_rewrite_message` [video]. |
+
+### `backend/models/`
+
+| File | Responsibility |
+| --- | --- |
+| `models/__init__.py` | Comment only — models are imported from their concrete modules. [infra] |
+| `models/common.py` | `BaseResponse` and shared schema primitives. [shared] |
+| `models/images.py` | Request/response schemas for every image endpoint. [image] |
+| `models/videos.py` | Request/response schemas for every video endpoint, including Sora 2 audio/cameo/remix types. [video] |
+| `models/gallery.py` | Gallery schemas and the `MediaType` enum (imported by `image_pipeline.py`). [shared] |
+| `models/metadata_models.py` | Asset-metadata schemas used by the metadata router and gallery upload. [infra] |
+
+### `backend/static/`
+
+| File | Responsibility |
+| --- | --- |
+| `static/images/mask.png` | Sample edit mask asset. [image] |
+| `static/images/no-smile.png` | Sample source image asset. [image] |
+
+---
+
+## 2. Routers registered in `backend/main.py`
+
+`settings.API_V1_STR` is `"/api/v1"`. Registration order as written:
+
+| Module | Prefix | Tag |
+| --- | --- | --- |
+| `images.router` | `/api/v1/images` | `images` |
+| `videos.router` | `/api/v1/videos` | `videos` |
+| `gallery.router` | `/api/v1/gallery` | `gallery` |
+| `metadata_router.router` | `/api/v1/metadata` | `metadata` |
+| `env.router` | `/api/v1` | `env` |
+
+Plus two routes defined directly on the app: `GET /` (returns `{"message": "Welcome to AI Content Lab API"}`) and `GET /api/v1/health`.
+
+### `/api/v1/images` — [image]
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| POST | `/generate` | `generate_image` |
+| POST | `/edit` | `edit_image` |
+| POST | `/edit/upload` | `edit_image_upload` |
+| POST | `/save` | `save_generated_images` |
+| POST | `/pipeline` | `process_image_pipeline` |
+| POST | `/generate-with-analysis` | `generate_image_with_analysis` |
+| POST | `/list` | `list_images` |
+| POST | `/delete` | `delete_image` |
+| POST | `/analyze` | `analyze_image` |
+| POST | `/analyze-custom` | `analyze_image_custom` |
+| POST | `/prompt/enhance` | `enhance_image_prompt` |
+| POST | `/prompt/protect` | `protect_image_prompt` |
+| POST | `/filename/generate` | `generate_image_filename` |
+
+### `/api/v1/videos` — [video]
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| POST | `/jobs` | `create_video_generation_job` |
+| GET | `/jobs/{job_id}` | `get_video_generation_job` |
+| GET | `/jobs` | `list_video_generation_jobs` |
+| DELETE | `/jobs/{job_id}` | `delete_video_generation_job` |
+| DELETE | `/jobs/failed` | `delete_failed_video_generation_jobs` |
+| POST | `/jobs/{job_id}/finalize` | `finalize_video_job` |
+| POST | `/generate-with-analysis/stream` | `stream_video_generation_with_analysis` |
+| POST | `/generate-with-analysis/upload` | `create_video_generation_with_analysis_upload` |
+| POST | `/generate-with-analysis` | `create_video_generation_with_analysis` |
+| GET | `/generations/{generation_id}/content` | `download_generation_content` |
+| POST | `/analyze` | `analyze_video` |
+| POST | `/prompt/enhance` | `enhance_video_prompt` |
+| POST | `/prompt/moderation-safe-rewrite` | `moderation_safe_rewrite_video_prompt` |
+| POST | `/filename/generate` | `generate_video_filename` |
+| POST | `/cameo/upload` | `upload_cameo_reference` |
+| GET | `/cameo/references` | `list_cameo_references` |
+| DELETE | `/cameo/references/{reference_id}` | `delete_cameo_reference` |
+| POST | `/remix` | `create_remix_job` |
+
+> Route-ordering hazard already present: `DELETE /jobs/failed` is declared *after*
+> `DELETE /jobs/{job_id}`, so the path parameter route matches `failed` first.
+
+### `/api/v1/gallery` — [shared]
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/images` | `get_gallery_images` |
+| GET | `/videos` | `get_gallery_videos` |
+| GET | `/` | `get_gallery_items` |
+| POST | `/upload` | `upload_asset` |
+| DELETE | `/delete` | `delete_asset` |
+| PUT | `/move` | `move_asset` |
+| GET | `/asset/{media_type}/{blob_name:path}` | `get_asset_content` |
+| GET | `/sas-tokens` | `get_sas_tokens` |
+| GET | `/health` | `health_check` |
+| GET | `/metadata/status` | `metadata_service_status` |
+| GET | `/folders` | `list_folders` |
+| POST | `/folders` | `create_folder` |
+
+### `/api/v1/metadata` — [infra]
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| POST | `/` | `create_asset_metadata` |
+| GET | `/{asset_id}` | `get_asset_metadata` |
+| PUT | `/{asset_id}` | `update_asset_metadata` |
+| DELETE | `/{asset_id}` | `delete_asset_metadata` |
+| GET | `/` | `list_asset_metadata` |
+| POST | `/search` | `search_asset_metadata` |
+| GET | `/stats/folders` | `get_folder_statistics` |
+| GET | `/recent` | `get_recent_assets` |
+| POST | `/sync` | `sync_metadata` |
+
+> `GET /{asset_id}` is declared before `GET /stats/folders` and `GET /recent`, so
+> those two literal paths are shadowed by the path-parameter route.
+
+### `/api/v1` (env) — [shared]
+
+| Method | Path | Handler |
+| --- | --- | --- |
+| GET | `/env/status` | `env_status` |
+
+---
+
+## 3. Dependency map
+
+### Who depends on `backend/core/sora.py`
+
+Direct imports of the module:
+
+1. `backend/core/__init__.py:9` — `from .sora import Sora`, then constructs the
+   module-level `sora_client` singleton at line 22.
+
+That is the **only** direct import. Everything else consumes the `sora_client`
+singleton:
+
+| Consumer | Reference |
+| --- | --- |
+| `backend/api/endpoints/videos.py:23` | `from backend.core import ... sora_client ...`; null-guarded at line 69 and re-checked at lines 167, 263, 279, 295, 311, 350 |
+| `backend/api/endpoints/gallery.py:989` | Local import inside `health_check` — reports `ai_services["sora"]` |
+| `tests/integration/conftest.py` | `sora_client` fixture |
+| `tests/integration/test_video_generation.py` | Uses that fixture |
+
+Not a dependency: `notebooks/VideoTools.py` contains its own standalone copy of a
+`Sora` class and `convert_sora2_response_to_job_format`. It does not import from
+`backend/` and will not break when `backend/core/sora.py` is deleted.
+
+### Who depends on the image generation code
+
+`backend/core/gpt_image.py` (`GPTImageClient`):
+
+| Consumer | Reference |
+| --- | --- |
+| `backend/core/__init__.py:10` | `from .gpt_image import GPTImageClient` → builds the `image_client` singleton at line 36 |
+| `backend/core/image_pipeline.py:53, 109, ~575` | Function-local imports; constructs a fresh per-request client each time |
+| `tests/integration/conftest.py:36` | `image_client` fixture |
+| `tests/integration/test_image_generation.py` | Uses that fixture |
+
+`backend/core/image_pipeline.py` (`ImagePipelineService`):
+
+| Consumer | Reference |
+| --- | --- |
+| `backend/api/endpoints/images.py:52` | `from backend.core.image_pipeline import ImagePipelineService` |
+| `tests/integration/test_pipeline.py:21, 45` | Local imports |
+
+Consumers of the `image_client` singleton:
+
+| Consumer | Reference |
+| --- | --- |
+| `backend/api/endpoints/gallery.py:989` | Health check only — reports `ai_services["dalle/gpt_image"]` |
+
+> Worth knowing before you cut: the `image_client` singleton built in
+> `core/__init__.py` is referenced **only** by the gallery health check. All real
+> image generation goes through `ImagePipelineService`, which builds its own
+> clients. `images.py` imports `llm_client`, `async_llm_client`, and
+> `image_sas_token` from `backend.core` — but never `image_client`.
+
+### Coupling that survives removal of both paths
+
+`backend/core/__init__.py` is imported for `llm_client`, `async_llm_client`,
+`image_sas_token`, and `video_sas_token`. Deleting `sora.py` and `gpt_image.py`
+requires editing that module regardless, because both imports and both singleton
+constructions live at module scope and run on any `backend.core` import.
+
+`gallery.py`, `metadata_router.py`, `azure_storage.py`, and `cosmos_client.py`
+are media-type-agnostic but reference `AZURE_BLOB_VIDEO_CONTAINER` and
+`AZURE_BLOB_IMAGE_CONTAINER` throughout, and `models/gallery.py::MediaType` has
+both variants.
+
+---
+
+## 4. Foundry / Azure OpenAI client construction sites
+
+| # | Location | Client | Deployment / model used |
+| --- | --- | --- | --- |
+| 1 | `core/__init__.py:22` | `Sora` | `settings.SORA_DEPLOYMENT`, `api_version=settings.SORA_API_VERSION` |
+| 2 | `core/__init__.py:36` | `GPTImageClient` | `model=settings.DEFAULT_IMAGE_MODEL` (`"gpt-image-1.5"`) → resolves to `settings.IMAGEGEN_DEPLOYMENT` |
+| 3 | `core/__init__.py:47` | `AzureOpenAI` (`llm_client`) | No deployment bound at construction; `api_version` hardcoded `"2025-01-01-preview"` |
+| 4 | `core/__init__.py:60` | `AsyncAzureOpenAI` (`async_llm_client`) | Same — hardcoded `"2025-01-01-preview"` |
+| 5 | `core/gpt_image.py:52` | `AzureOpenAI` (inside `GPTImageClient`) | `azure_ad_token_provider`, `api_version=settings.AOAI_API_VERSION`; deployment from `_get_deployment_for_model()` |
+| 6 | `core/gpt_image.py:68` | `OpenAI` (non-Azure branch) | `settings.OPENAI_API_KEY` / `OPENAI_ORG_ID`; `deployment_name = None` |
+| 7 | `core/image_pipeline.py:56` | `GPTImageClient` | `provider=settings.MODEL_PROVIDER`, `model=request.model` (caller-supplied) |
+| 8 | `core/image_pipeline.py:112` | `GPTImageClient` | Same, edit path |
+| 9 | `core/image_pipeline.py:577` | `GPTImageClient` | Same |
+| 10 | `tests/integration/conftest.py:36` | `GPTImageClient` | Real Azure credential, `provider="azure"` |
+
+`core/sora.py` does not use an OpenAI SDK client at all — it builds a raw
+`httpx.AsyncClient` and sends `payload["model"] = self.deployment_name`
+(i.e. `SORA_DEPLOYMENT`) to `<resource>.openai.azure.com/openai/v1/videos`.
+
+### Deployment name per LLM call site
+
+Every LLM call resolves to `settings.LLM_DEPLOYMENT`:
+
+| Location | Form |
+| --- | --- |
+| `images.py:441` | `ImageAnalyzer(llm_client, settings.LLM_DEPLOYMENT, async_llm_client)` |
+| `images.py:601` | `ImageAnalyzer(llm_client, settings.LLM_DEPLOYMENT, async_llm_client)` |
+| `images.py:642` | `chat.completions.create(model=settings.LLM_DEPLOYMENT)` — prompt enhance |
+| `images.py:689` | `chat.completions.create(model=settings.LLM_DEPLOYMENT)` — brand protect |
+| `images.py:734` | `chat.completions.create(model=settings.LLM_DEPLOYMENT)` — filename |
+| `image_pipeline.py:879` | `ImageAnalyzer(llm_client, settings.LLM_DEPLOYMENT)` |
+| `videos.py:669` | `VideoAnalyzer(llm_client, settings.LLM_DEPLOYMENT)` |
+| `videos.py:935` | `VideoAnalyzer(llm_client, settings.LLM_DEPLOYMENT)` |
+| `videos.py:1175` | `VideoAnalyzer(llm_client, settings.LLM_DEPLOYMENT)` |
+| `videos.py:1500` | `VideoAnalyzer(llm_client, settings.LLM_DEPLOYMENT)` |
+| `videos.py:1559` | `chat.completions.create(model=settings.LLM_DEPLOYMENT)` — prompt enhance |
+| `videos.py:1603` | `chat.completions.create(model=settings.LLM_DEPLOYMENT)` — moderation-safe rewrite |
+| `videos.py:1662` | `chat.completions.create(model=settings.LLM_DEPLOYMENT)` — filename |
+
+`_get_deployment_for_model()` in `gpt_image.py:88-98` maps:
+
+```
+gpt-image-1.5    → IMAGEGEN_DEPLOYMENT
+gpt-image-1      → IMAGEGEN_DEPLOYMENT   (legacy alias)
+gpt-image-1-mini → IMAGEGEN_1_MINI_DEPLOYMENT
+gpt-image-2      → IMAGEGEN_2_DEPLOYMENT
+flux-kontext-pro → FLUX_KONTEXT_DEPLOYMENT
+(unmapped)       → falls back to IMAGEGEN_DEPLOYMENT with a warning
+```
+
+---
+
+## 5. Environment variables in `backend/core/config.py`
+
+All fields on `Settings`, in declaration order. "Read at" = where the value is
+actually consumed; fields with no reader are flagged.
+
+| Setting | Default | Class | Read at |
+| --- | --- | --- | --- |
+| `API_V1_STR` | `/api/v1` | [infra] | `main.py` router prefixes, health route |
+| `PROJECT_NAME` | `Visionary Lab API` | [infra] | `main.py:20` |
+| `MODEL_PROVIDER` | `azure` | [image] | `gpt_image.py:38`, `image_pipeline.py:57,113,577` |
+| `AI_FOUNDRY_ENDPOINT` | `None` | [shared] | `core/__init__.py:23,49,61`, `gpt_image.py:51` |
+| `LLM_DEPLOYMENT` | `None` | [shared] | 13 call sites (section 4) |
+| `IMAGEGEN_DEPLOYMENT` | `None` | [image] | `gpt_image.py:88,89,98` |
+| `IMAGEGEN_15_DEPLOYMENT` | `None` | [image] | **Never read.** Declared only; not in the model map, not in `env.py` |
+| `IMAGEGEN_1_MINI_DEPLOYMENT` | `None` | [image] | `gpt_image.py:90`, `env.py:35` |
+| `IMAGEGEN_2_DEPLOYMENT` | `None` | [image] | `gpt_image.py:91`, `env.py:36` |
+| `FLUX_KONTEXT_DEPLOYMENT` | `None` | [image] | `gpt_image.py:92`, `env.py:34` |
+| `SORA_DEPLOYMENT` | `None` | [video] | `core/__init__.py:24,29`, `env.py:25` |
+| `DEFAULT_IMAGE_MODEL` | `gpt-image-1.5` | [image] | `core/__init__.py:39`, `gpt_image.py:39` |
+| `OPENAI_API_KEY` | `None` | [image] | `gpt_image.py:64` |
+| `OPENAI_ORG_ID` | `None` | [image] | `gpt_image.py:70` |
+| `OPENAI_ORG_VERIFIED` | `False` | [image] | `image_pipeline.py:145` (gates n>1) |
+| `GPT_IMAGE_MAX_TOKENS` | `150000` | [image] | **Never read.** |
+| `AZURE_BLOB_SERVICE_URL` | `None` | [infra] | `core/__init__.py:73`, `azure_storage.py:28` |
+| `AZURE_STORAGE_ACCOUNT_NAME` | `None` | [infra] | `core/__init__.py:74,75,92`, `azure_storage.py:29,30`, `gallery.py:882,893,902,909` |
+| `CDN_BLOB_URL` | `None` | [infra] | `gallery.py:909` |
+| `AZURE_BLOB_IMAGE_CONTAINER` | `images` | [image] | `core/__init__.py:107`, `azure_storage.py:25`, `gallery.py` (×7), `metadata_router.py:320,325,331` |
+| `AZURE_BLOB_VIDEO_CONTAINER` | `videos` | [video] | `core/__init__.py:106`, `azure_storage.py:26`, `gallery.py` (×6), `metadata_router.py:322,326` |
+| `CORS_ALLOWED_ORIGINS` | `*` | [infra] | `azure_storage.py:52` **only** — see note below |
+| `AZURE_COSMOS_DB_ENDPOINT` | `None` | [infra] | `cosmos_client.py:26`, `gallery.py:128`, `images.py:65`, `videos.py:57,1080` |
+| `AZURE_COSMOS_DB_ID` | `visionarylab` | [infra] | `cosmos_client.py:27` |
+| `AZURE_COSMOS_CONTAINER_ID` | `metadata` | [infra] | `cosmos_client.py:28` |
+| `AOAI_API_VERSION` | `2025-04-01-preview` | [image] | `gpt_image.py:55,241,454` only |
+| `SORA_API_VERSION` | `preview` | [video] | `core/__init__.py:27` |
+| `UPLOAD_DIR` | `./static/uploads` | [infra] | `main.py:15` (`makedirs` only — never otherwise read) |
+| `IMAGE_DIR` | `./static/images` | [image] | `main.py:16` (`makedirs` only — never otherwise read) |
+| `VIDEO_DIR` | `./static/videos` | [video] | `main.py:17`, `videos.py:66,1395` |
+| `LOG_LEVEL` | `INFO` | [infra] | `logging_config.py:21` |
+| `GPT_IMAGE_DEFAULT_SIZE` | `1024x1024` | [image] | **Never read.** |
+| `GPT_IMAGE_DEFAULT_QUALITY` | `high` | [image] | **Never read.** |
+| `GPT_IMAGE_DEFAULT_FORMAT` | `PNG` | [image] | **Never read.** |
+| `GPT_IMAGE_ALLOW_TRANSPARENT` | `True` | [image] | **Never read.** |
+| `GPT_IMAGE_MAX_FILE_SIZE_MB` | `25` | [image] | `image_pipeline.py:192` |
+
+Notes:
+
+- **`CORS_ALLOWED_ORIGINS` does not control the API's CORS.** `main.py:26`
+  hardcodes `allow_origins=["*"]` with `allow_credentials=True`. The setting and
+  its validator are used only to configure *blob storage* CORS rules in
+  `azure_storage.py`. This is a live security gap, independent of the migration.
+- `Settings.Config` sets `env_file = "../.env"` and `extra = Extra.allow`, so
+  typo'd or removed env vars are silently absorbed rather than raising.
+- Seven settings have no reader at all (`IMAGEGEN_15_DEPLOYMENT`,
+  `GPT_IMAGE_MAX_TOKENS`, and the four `GPT_IMAGE_DEFAULT_*` / `ALLOW_TRANSPARENT`
+  fields, plus `UPLOAD_DIR`/`IMAGE_DIR` beyond `makedirs`). They can be dropped
+  without behavioral change.
+
+---
+
+## 6. Frontend routes under `frontend/app/`
+
+| Route | File | Class | Notes |
+| --- | --- | --- | --- |
+| `/` | `app/page.tsx` | [image] | Re-exports `NewImagePage` — the home page *is* the image page |
+| `/new-image` | `app/new-image/page.tsx` | [image] | Image generation + image gallery browsing (`fetchImages`) |
+| `/new-image/upload` | `app/new-image/upload/page.tsx` | [image] | "Upload Images" view |
+| `/new-video` | `app/new-video/page.tsx` | [video] | Video generation + video browsing; Sora 2 cameo/remix settings |
+| `/edit-image` | `app/edit-image/page.tsx` | [image] | Masked image editing; has its own `layout.tsx` and 5 local components (`EditorContainer`, `GenerateForm`, `ImageCanvas`, `ImageUploader`, `ResultDisplay`, `createDebugMask.ts`) |
+| `/analyze` | `app/analyze/page.tsx` | [image] | Custom image analysis (sidebar: "Custom image analysis with AI") |
+| `/gallery` | `app/gallery/page.tsx` | [video] | **Video-only** despite the generic name — imports `fetchVideos`/`VideoMetadata` and renders `VideoCard` |
+| `/jobs` | `app/jobs/page.tsx` | [video] | Sora job table; `listVideoGenerationJobs`, `finalizeVideoJob`, `VideoJob`. Also `columns.tsx`, `data-table.tsx`, `loading.tsx` |
+| `/settings` | `app/settings/page.tsx` | [shared] | Image settings + brand protection; filters env keys on `SORA`/`REPLICATE`/`RUNWAY` |
+| `/login` | `app/login/page.tsx` | [shared] | Auth entry; has its own `layout.tsx` |
+| `/test-simple` | `app/test-simple/page.tsx` | [shared] | Scratch/test page |
+| `/not-found` | `app/not-found.tsx` | [shared] | 404 handler |
+| `/api/environment` | `app/api/environment/route.ts` | [shared] | Next route handler |
+| `/api/auth/[...nextauth]` | `app/api/auth/[...nextauth]/route.ts` | [shared] | NextAuth handler |
+| (layout) | `app/layout.tsx` | [shared] | Root layout |
+
+Sidebar navigation (`components/app-sidebar.tsx`) exposes only six entries —
+Create: New Video, New Image, Edit Image, Analyze; Manage: Jobs, Settings.
+**`/gallery` is not linked from the sidebar** and is reachable only by direct URL
+or in-app links.
+
+---
+
+## 7. Discrepancies vs. `project-structure.md`
+
+`project-structure.md` is substantially out of date. Every item below is a claim
+in that file that does not match the code.
+
+### Things it describes that do not exist
+
+1. **An entire Streamlit UI.** It documents a "Creator App" at `creator.py`,
+   "Video Generation" in `video-gen.py`, and "Jobs Management" in `jobs.py`.
+   None of these files exist anywhere in the repo, and there is no Streamlit
+   dependency.
+2. **`backend/core/storage.py`.** Listed as the storage service. The real files
+   are `azure_storage.py` (blob) and `cosmos_client.py` (metadata).
+3. **`requirements.txt`.** Claimed for Python dependency management. The repo
+   uses `pyproject.toml` with uv.
+4. **`SORA_AOAI_RESOURCE`, `SORA_AOAI_API_KEY`.** Documented as required env
+   vars. Neither exists in `Settings`. Auth is managed-identity via
+   `AI_FOUNDRY_ENDPOINT` + `DefaultAzureCredential`; there are no API keys for
+   Sora anywhere in the backend. (These stale names *do* still appear in
+   `docker-compose.yml`, `DOCKER.md`, `scripts/dev.sh`, and the notebooks, so the
+   drift is not confined to this one doc.)
+
+### Things that exist but are undocumented
+
+5. **The entire metadata subsystem.** `api/endpoints/metadata_router.py`, the
+   `/api/v1/metadata` router, `models/metadata_models.py`, and
+   `core/cosmos_client.py` are absent from the doc. Cosmos DB is not mentioned at
+   all.
+6. **Six of the eleven `core/` modules**: `gpt_image.py`, `image_pipeline.py`,
+   `analyze.py`, `instructions.py`, `logging_config.py`, `azure_storage.py`.
+7. **`models/gallery.py`** (including the `MediaType` enum).
+
+### Wrong status claims
+
+8. **"Skeleton implementation" is wrong for images and gallery.** The doc calls
+   the Images and Gallery endpoints skeletons. Images has 13 fully implemented
+   endpoints; Gallery has 12, including upload, delete, move, SAS issuance, and
+   folder management.
+9. **"Placeholder" is wrong for `/videos/analyze` and `/videos/filename/generate`.**
+   Both are fully implemented against the LLM.
+
+### Incomplete endpoint lists
+
+10. **Videos:** the doc lists 8 endpoints; there are 18. Missing:
+    `/jobs/{job_id}/finalize`, all three `generate-with-analysis` variants,
+    `/prompt/enhance`, `/prompt/moderation-safe-rewrite`, all three `/cameo/*`
+    routes, and `/remix`.
+11. **Gallery:** the doc lists 3 endpoints; there are 12. Missing: `/upload`,
+    `/delete`, `/move`, `/asset/{media_type}/{blob_name}`, `/sas-tokens`,
+    `/health`, `/metadata/status`, and both `/folders` routes.
+12. **Images:** the doc lists 3 endpoints; there are 13.
+
+### Smaller inaccuracies
+
+13. **Env router prefix.** The doc says the prefix is `/api/v1/env` with a
+    `/status` route. The router is actually mounted at `/api/v1` and declares
+    `/env/status`. The resulting URL is identical, but the description is wrong.
+14. **"Generated videos are stored locally in the static directory."** Videos are
+    uploaded to Azure Blob Storage with metadata in Cosmos. `VIDEO_DIR` is created
+    at startup and used only as a temp/scratch path; `backend/static/` contains
+    just `images/mask.png` and `images/no-smile.png`.
+15. **Frontend page list.** The doc lists "Dashboard, Video Editor, Video UI,
+    Gallery, Settings". The actual routes are in section 6; there is no Dashboard
+    and no Video Editor.
+16. **Product naming is inconsistent across the codebase.** The doc says "AI
+    Content Lab"; `PROJECT_NAME` is `"Visionary Lab API"`; the root endpoint
+    returns "Welcome to AI Content Lab API"; `AZURE_COSMOS_DB_ID` defaults to
+    `visionarylab`.
+
+### Also stale: `backend/BACKEND.MD`
+
+Not part of the request, but flagged since you will likely touch it: it describes
+`gpt_image.py` as "OpenAI GPT-Image-1" and `sora.py` as "OpenAI Sora", omits the
+metadata router and Cosmos entirely, and its directory tree does not match
+section 1.
+
+---
+
+## 8. Deletion-impact summary
+
+Files that are exclusively video and can be deleted outright: `core/sora.py`,
+`api/endpoints/videos.py`, `models/videos.py`, and the `VideoExtractor` /
+`VideoAnalyzer` classes in `core/analyze.py`.
+
+Files exclusively image: `core/gpt_image.py`, `core/image_pipeline.py`,
+`api/endpoints/images.py`, `models/images.py`, `ImageAnalyzer` in
+`core/analyze.py`, `backend/static/images/`.
+
+Files that must be **edited rather than deleted** for either removal:
+
+- `backend/main.py` — router registration, `makedirs` calls.
+- `backend/core/__init__.py` — imports and singleton construction at module scope.
+- `backend/core/config.py` — the deployment/container/dir settings.
+- `backend/core/instructions.py` — mixed video/image/shared prompt templates.
+- `backend/api/endpoints/env.py` — `SORA_DEPLOYMENT` and `IMAGEGEN_DEPLOYMENT`
+  are hardcoded in the required list, so removal without editing this will make
+  `/env/status` permanently report a missing required var.
+- `backend/api/endpoints/gallery.py` — health check imports the singletons;
+  container selection branches on media type.
+- `backend/models/gallery.py` — `MediaType` enum.
+- `backend/api/endpoints/metadata_router.py` — branches on image vs. video
+  containers.
+- `tests/conftest.py`, `tests/integration/*` — fixtures set `SORA_DEPLOYMENT` and
+  build both clients.
+- `infra/` — `SORA_DEPLOYMENT`, `IMAGEGEN_*`, and `FLUX_KONTEXT_DEPLOYMENT` flow
+  through `main.bicep`, `main.parameters.json`, and `modules/containerApp.bicep`.
+- Frontend — with both paths removed, `/`, `/new-image*`, `/new-video`,
+  `/edit-image`, `/analyze`, `/gallery`, and `/jobs` all disappear, leaving only
+  `/settings`, `/login`, and auth. `app/page.tsx` re-exports the image page, so
+  the site root breaks first.
