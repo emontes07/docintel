@@ -11,7 +11,6 @@ import { Separator } from "@/components/ui/separator";
 import { ImageSettingsProvider } from "@/context/image-settings-context";
 import { FolderProvider } from "@/context/folder-context";
 import { Toaster } from "@/components/ui/sonner";
-import dynamic from "next/dynamic";
 import { AnimatedLayout } from "@/components/animated-layout";
 import Script from "next/script";
 
@@ -149,7 +148,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
               // Prefetch likely navigation targets
               if ('requestIdleCallback' in window) {
                 requestIdleCallback(() => {
-                  const links = ['/new-image'];
+                  const links = ['/settings'];
                   links.forEach(link => {
                     const linkEl = document.createElement('link');
                     linkEl.rel = 'prefetch';

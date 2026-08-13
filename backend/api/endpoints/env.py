@@ -21,7 +21,6 @@ def env_status():
     required_vars = [
         'AI_FOUNDRY_ENDPOINT',
         'LLM_DEPLOYMENT',
-        'IMAGEGEN_DEPLOYMENT',
         'AZURE_BLOB_SERVICE_URL',
         'AZURE_STORAGE_ACCOUNT_NAME',
         'AZURE_BLOB_IMAGE_CONTAINER',
@@ -29,11 +28,7 @@ def env_status():
     ]
 
     # Optional variables (app can function without them)
-    optional_vars = [
-        'FLUX_KONTEXT_DEPLOYMENT',
-        'IMAGEGEN_1_MINI_DEPLOYMENT',
-        'IMAGEGEN_2_DEPLOYMENT',
-    ]
+    optional_vars = []
 
     set_required_vars = [var for var in required_vars if _is_setting_defined(var)]
     missing_vars = [var for var in required_vars if var not in set_required_vars]

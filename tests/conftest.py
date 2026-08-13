@@ -9,10 +9,8 @@ from unittest.mock import MagicMock, patch
 
 # Set environment variables BEFORE importing anything from the backend,
 # so that Settings() picks up test values instead of requiring real creds.
-os.environ.setdefault("MODEL_PROVIDER", "azure")
 os.environ.setdefault("AI_FOUNDRY_ENDPOINT", "https://test-foundry.cognitiveservices.azure.com/")
 os.environ.setdefault("LLM_DEPLOYMENT", "test-llm-deployment")
-os.environ.setdefault("IMAGEGEN_DEPLOYMENT", "test-deployment")
 os.environ.setdefault("AZURE_STORAGE_ACCOUNT_NAME", "teststorage")
 os.environ.setdefault("AZURE_BLOB_SERVICE_URL", "https://teststorage.blob.core.windows.net/")
 os.environ.setdefault("AZURE_BLOB_IMAGE_CONTAINER", "images")

@@ -3,10 +3,9 @@ from datetime import datetime, timedelta, timezone
 
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from azure.storage.blob import BlobServiceClient, generate_container_sas, ContainerSasPermissions
-from openai import AzureOpenAI, AsyncAzureOpenAI
 
 from .config import settings
-from .gpt_image import GPTImageClient
+from .llm import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -16,40 +15,16 @@ token_provider = get_bearer_token_provider(
     credential, "https://cognitiveservices.azure.com/.default"
 )
 
-# Initialize GPT-Image client (using default model)
+# Foundry chat client; `llm_client` / `async_llm_client` remain available as the
+# raw SDK handles for callers that predate LLMClient.
 try:
-    image_client = GPTImageClient(
-        credential=credential,
-        token_provider=token_provider,
-        model=settings.DEFAULT_IMAGE_MODEL,
-    )
-    logger.info(f"Initialized GPT-Image client with managed identity (model: {settings.DEFAULT_IMAGE_MODEL})")
-except Exception as e:
-    logger.error(f"Failed to initialize GPT-Image client: {str(e)}")
-    image_client = None
-
-# Initialize LLM client (sync)
-try:
-    llm_client = AzureOpenAI(
-        azure_endpoint=settings.AI_FOUNDRY_ENDPOINT,
-        azure_ad_token_provider=token_provider,
-        api_version="2025-01-01-preview",
-    )
-    logger.info("Initialized LLM client with managed identity")
+    llm = LLMClient(token_provider=token_provider)
+    llm_client = llm.sync_client
+    async_llm_client = llm.async_client
 except Exception as e:
     logger.error(f"Failed to initialize LLM client: {str(e)}")
+    llm = None
     llm_client = None
-
-# Initialize async LLM client
-try:
-    async_llm_client = AsyncAzureOpenAI(
-        azure_endpoint=settings.AI_FOUNDRY_ENDPOINT,
-        azure_ad_token_provider=token_provider,
-        api_version="2025-01-01-preview",
-    )
-    logger.info("Initialized async LLM client with managed identity")
-except Exception as e:
-    logger.error(f"Failed to initialize async LLM client: {str(e)}")
     async_llm_client = None
 
 

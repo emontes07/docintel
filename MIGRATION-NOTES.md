@@ -542,3 +542,92 @@ step lands, since `IMAGEGEN_DEPLOYMENT` and `FLUX_KONTEXT_DEPLOYMENT` are still
 read by `backend/core/gpt_image.py` and still listed in
 `backend/api/endpoints/env.py`.
 
+> Update after step 2c: `gpt_image.py` and the image deployment settings are
+> gone. The image deployments are now safe to drop from `infra/`.
+
+---
+
+## LLM client usage
+
+`backend/core/llm.py` wraps the `gpt-4o` Foundry deployment. Callers describe the
+output they want with a Pydantic model; the client asks the deployment for
+JSON-schema-constrained output and returns a validated instance.
+
+```python
+from pydantic import BaseModel, Field
+
+from backend.core import llm  # module-level LLMClient, or construct your own
+
+
+class InvoiceFields(BaseModel):
+    vendor: str = Field(description="Legal name of the issuing company")
+    total_eur: float = Field(description="Invoice total in EUR")
+    due_days: int = Field(description="Payment window in days")
+
+
+result = llm.complete_structured(
+    "Extract the invoice fields from the user's text.",
+    "Invoice 4471 from Contoso Ltd for 12,500 EUR, payable within 30 days.",
+    InvoiceFields,
+)
+
+result.vendor      # 'Contoso Ltd'  -> str, already validated
+result.total_eur   # 12500.0        -> float, not the string the model emitted
+```
+
+`await llm.acomplete_structured(...)` is the async equivalent and takes the same
+arguments.
+
+The model's JSON is parsed and passed through `InvoiceFields.model_validate()`.
+If it does not conform, the call is retried (`max_retries=3`, 2s linear backoff);
+once retries are exhausted the client raises a typed error rather than returning
+a partial dict:
+
+```python
+from backend.core.llm import LLMSchemaValidationError
+
+try:
+    result = llm.complete_structured(system, user, InvoiceFields)
+except LLMSchemaValidationError as exc:
+    exc.schema        # <class 'InvoiceFields'> - the model that was requested
+    exc.raw_content   # the raw string the deployment returned
+    exc.errors        # the pydantic ValidationError (or JSON decode error)
+```
+
+`LLMSchemaValidationError` subclasses `LLMError`, so catching `LLMError` covers
+every failure this client raises. Malformed JSON and schema mismatches both
+surface as `LLMSchemaValidationError` — the distinguishing detail is in
+`exc.errors`.
+
+Notes:
+
+- Schemas are sent in strict mode by default. `_strictify()` rewrites the
+  generated JSON schema so every object sets `additionalProperties: false` and
+  lists all properties as required, which Azure OpenAI requires for strict
+  structured outputs. Pass `strict=False` for schemas that can't satisfy that.
+- Extra keyword arguments (`temperature`, `max_tokens`, ...) are forwarded to the
+  underlying chat completions call.
+
+### Caveats
+
+Two ways this fails silently with a `None` instead of a clear error:
+
+1. **The module-level client can be `None`.** `from backend.core import llm`
+   returns `None` when construction fails at import time (e.g. unset
+   `AI_FOUNDRY_ENDPOINT`) — the same fallback the pre-existing `llm_client` has.
+   Calling into it raises `AttributeError: 'NoneType' object has no attribute
+   'complete_structured'`, which reads like a code bug but is a config problem.
+   Real callers should construct their own `LLMClient()` or guard for `None`.
+2. **`env_file` does not resolve locally.** `Settings.Config.env_file` is
+   `"../.env"`, which points at the parent of the repo root rather than the
+   actual `docintel/.env`. Locally, `AI_FOUNDRY_ENDPOINT` and the storage
+   settings quietly fall back to `None`. Deployed environments are unaffected —
+   Azure Container Apps injects env vars directly, so the file path is
+   irrelevant there. This will matter in Step 3, when extraction first runs
+   against real Foundry deployments from a dev machine.
+
+Both surface as a silent `None` rather than a loud failure, so a failed local
+extraction run is more likely a config problem than a model or code problem.
+
+
+

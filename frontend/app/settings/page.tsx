@@ -370,24 +370,6 @@ export default function SettingsPage() {
                         <div className="space-y-4">
                           {(apiStatus?.set?.length || 0) > 0 ? (
                             <>
-                                                             {/* Image Generation */}
-                               <div className="border rounded-md p-3">
-                                 <h3 className="text-sm font-medium mb-2">Image Generation</h3>
-                                 <div className="flex flex-wrap gap-2">
-                                   {(apiStatus?.set || [])
-                                     .filter(key => key.includes('OPENAI') || key.includes('DALLE') || key.includes('SD') || key.includes('IMAGEGEN'))
-                                     .map((variable) => (
-                                       <Badge key={variable} className="bg-green-100 text-green-800 hover:bg-green-200 flex items-center">
-                                         <Check className="h-3 w-3 mr-1" />
-                                         {variable}
-                                       </Badge>
-                                     ))}
-                                   {(apiStatus?.set || []).filter(key => key.includes('OPENAI') || key.includes('DALLE') || key.includes('SD') || key.includes('IMAGEGEN')).length === 0 && (
-                                     <p className="text-xs text-muted-foreground">No image generation APIs are configured</p>
-                                   )}
-                                 </div>
-                               </div>
-
                               {/* Language Models */}
                               <div className="border rounded-md p-3">
                                 <h3 className="text-sm font-medium mb-2">Language Models & Analysis</h3>

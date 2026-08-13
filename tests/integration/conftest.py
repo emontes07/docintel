@@ -23,19 +23,16 @@ def azure_settings():
     return {
         "AI_FOUNDRY_ENDPOINT": _require_env("AI_FOUNDRY_ENDPOINT"),
         "LLM_DEPLOYMENT": _require_env("LLM_DEPLOYMENT"),
-        "IMAGEGEN_DEPLOYMENT": _require_env("IMAGEGEN_DEPLOYMENT"),
         "AZURE_STORAGE_ACCOUNT_NAME": _require_env("AZURE_STORAGE_ACCOUNT_NAME"),
     }
 
 
 @pytest.fixture(scope="session")
-def image_client(azure_settings):
-    """Real GPTImageClient using Azure credentials."""
-    from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-    from backend.core.gpt_image import GPTImageClient
-    credential = DefaultAzureCredential()
-    token_provider = get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default")
-    return GPTImageClient(credential=credential, token_provider=token_provider, provider="azure")
+def structured_llm(azure_settings):
+    """Real LLMClient wrapping the Foundry LLM deployment."""
+    from backend.core.llm import LLMClient
+
+    return LLMClient()
 
 
 @pytest.fixture(scope="session")

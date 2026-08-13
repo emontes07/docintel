@@ -8,26 +8,11 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
     PROJECT_NAME: str = "Visionary Lab API"
 
-    # Model Provider Configuration
-    MODEL_PROVIDER: str = "azure"  # Can be 'azure' or 'openai'
-
     # AI Foundry endpoint (unified for all AI services via managed identity)
     AI_FOUNDRY_ENDPOINT: Optional[str] = None
 
     # Model deployment names
     LLM_DEPLOYMENT: Optional[str] = None
-    IMAGEGEN_DEPLOYMENT: Optional[str] = None
-    IMAGEGEN_15_DEPLOYMENT: Optional[str] = None
-    IMAGEGEN_1_MINI_DEPLOYMENT: Optional[str] = None
-    IMAGEGEN_2_DEPLOYMENT: Optional[str] = None
-    FLUX_KONTEXT_DEPLOYMENT: Optional[str] = None
-    DEFAULT_IMAGE_MODEL: str = "gpt-image-1.5"
-
-    # OpenAI API for direct OpenAI usage (non-Azure)
-    OPENAI_API_KEY: Optional[str] = None
-    OPENAI_ORG_ID: Optional[str] = None
-    OPENAI_ORG_VERIFIED: bool = False
-    GPT_IMAGE_MAX_TOKENS: int = 150000
 
     # Azure Blob Storage Settings (managed identity — no keys)
     AZURE_BLOB_SERVICE_URL: Optional[str] = None
@@ -54,18 +39,9 @@ class Settings(BaseSettings):
 
     # File storage paths
     UPLOAD_DIR: str = "./static/uploads"
-    IMAGE_DIR: str = "./static/images"
 
     # Logging Configuration
     LOG_LEVEL: str = "INFO"
-
-
-    # GPT-Image-1 Default Settings
-    GPT_IMAGE_DEFAULT_SIZE: str = "1024x1024"
-    GPT_IMAGE_DEFAULT_QUALITY: str = "high"
-    GPT_IMAGE_DEFAULT_FORMAT: str = "PNG"
-    GPT_IMAGE_ALLOW_TRANSPARENT: bool = True
-    GPT_IMAGE_MAX_FILE_SIZE_MB: int = 25
 
     @validator('CORS_ALLOWED_ORIGINS')
     def validate_cors_origins(cls, v):
