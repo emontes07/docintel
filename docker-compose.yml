@@ -12,20 +12,10 @@ services:
     volumes:
       - ./backend/static:/app/backend/static
     environment:
-      # Required Azure OpenAI for Sora Video Generation - MUST BE SET BY USER
-      - SORA_AOAI_RESOURCE=${SORA_AOAI_RESOURCE}
-      - SORA_DEPLOYMENT=${SORA_DEPLOYMENT}
-      - SORA_AOAI_API_KEY=${SORA_AOAI_API_KEY}
-      
       # Required Azure OpenAI for LLM - MUST BE SET BY USER
       - LLM_AOAI_RESOURCE=${LLM_AOAI_RESOURCE}
       - LLM_DEPLOYMENT=${LLM_DEPLOYMENT}
       - LLM_AOAI_API_KEY=${LLM_AOAI_API_KEY}
-      
-      # Required Azure OpenAI for Image Generation - MUST BE SET BY USER
-      - IMAGEGEN_AOAI_RESOURCE=${IMAGEGEN_AOAI_RESOURCE}
-      - IMAGEGEN_DEPLOYMENT=${IMAGEGEN_DEPLOYMENT}
-      - IMAGEGEN_AOAI_API_KEY=${IMAGEGEN_AOAI_API_KEY}
       
       # Required Azure Blob Storage Settings - MUST BE SET BY USER
       - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
