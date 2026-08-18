@@ -19,11 +19,10 @@ param authIssuer string = ''
 param AI_FOUNDRY_ENDPOINT string = ''
 // Model deployment names
 param LLM_DEPLOYMENT string = 'gpt-4o'
-param IMAGEGEN_DEPLOYMENT string = 'gpt-image-1-5'
-param IMAGEGEN_15_DEPLOYMENT string = ''
-param IMAGEGEN_1_MINI_DEPLOYMENT string = ''
-param SORA_DEPLOYMENT string = 'sora'
-param FLUX_KONTEXT_DEPLOYMENT string = ''
+
+// Azure AI Document Intelligence and Azure AI Search
+param AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT string = ''
+param AZURE_SEARCH_ENDPOINT string = ''
 
 // Azure Blob Storage (managed identity — no keys)
 param AZURE_BLOB_SERVICE_URL string
@@ -134,24 +133,12 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = if(deployNew) {
               value: LLM_DEPLOYMENT
             }
             {
-              name: 'IMAGEGEN_DEPLOYMENT'
-              value: IMAGEGEN_DEPLOYMENT
+              name: 'AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT'
+              value: AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT
             }
             {
-              name: 'IMAGEGEN_15_DEPLOYMENT'
-              value: IMAGEGEN_15_DEPLOYMENT
-            }
-            {
-              name: 'IMAGEGEN_1_MINI_DEPLOYMENT'
-              value: IMAGEGEN_1_MINI_DEPLOYMENT
-            }
-            {
-              name: 'SORA_DEPLOYMENT'
-              value: SORA_DEPLOYMENT
-            }
-            {
-              name: 'FLUX_KONTEXT_DEPLOYMENT'
-              value: FLUX_KONTEXT_DEPLOYMENT
+              name: 'AZURE_SEARCH_ENDPOINT'
+              value: AZURE_SEARCH_ENDPOINT
             }
             {
               name: 'AZURE_BLOB_SERVICE_URL'

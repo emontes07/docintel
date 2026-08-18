@@ -34,16 +34,6 @@ param aiFoundryLocation string = 'eastus2'
 // Model deployment names
 @description('Name of the LLM deployment')
 param LLM_DEPLOYMENT string = 'gpt-5'
-@description('Name of the image generation deployment')
-param IMAGEGEN_DEPLOYMENT string = ''
-@description('Name of the gpt-image-1.5 deployment')
-param IMAGEGEN_15_DEPLOYMENT string = ''
-@description('Name of the gpt-image-1-mini deployment')
-param IMAGEGEN_1_MINI_DEPLOYMENT string = ''
-@description('Name of the Sora deployment')
-param SORA_DEPLOYMENT string = ''
-@description('Name of the FLUX Kontext Pro deployment')
-param FLUX_KONTEXT_DEPLOYMENT string = ''
 
 // Model types and versions (for Bicep-managed deployments)
 // NOTE: gpt-4o (2024-08-06, 2024-11-20) and gpt-4.1 (2025-04-14) are all in
@@ -53,22 +43,28 @@ param FLUX_KONTEXT_DEPLOYMENT string = ''
 // Announced inference deprecation: 2027-02-06.
 param llmModelType string = 'gpt-5'
 param llmModelVersion string = '2025-08-07'
-// Image/video models may be deployed via CLI when Bicep doesn't support the format
-@description('Set to true to deploy image gen models via Bicep (requires OpenAI-format models)')
-param deployImageGenModels bool = false
-param imageGenModelType string = 'gpt-image-1.5'
-param imageGenModelVersion string = '2024-04-01'
-param imageGen15ModelVersion string = '2024-04-01'
-param imageGen1MiniModelVersion string = '2024-04-01'
-@description('Set to true to deploy Sora via Bicep')
-param deploySoraModel bool = false
-@description('Sora model name in the AI Foundry catalog (e.g., `sora-2`). README documents `sora-2` for video generation.')
-param soraModelName string = 'sora-2'
-// TODO: Confirm the exact published `sora-2` version for your region with:
-//   az cognitiveservices model list -l <region> --query "[?model.name=='sora-2'].model.version" -o tsv
-// The value below is the last known Sora-family version shipped by the template and
-// may need to be updated to a Sora 2 release date before enabling `deploySoraModel`.
-param soraModelVersion string = '2025-05-02'
+
+// TODO(step 3.2): bulk extraction deployment. Hard gate before extract.py can be
+// written — confirm the model name, version, and SKU are actually available in
+// the Foundry resource's region first:
+//   az cognitiveservices model list -l <aiFoundryLocation> -o table
+// param bulkExtractionDeploymentName string = ''
+// param bulkExtractionModelType string = ''
+// param bulkExtractionModelVersion string = ''
+
+// Azure AI Document Intelligence
+@description('Unique name for the Document Intelligence resource')
+param docIntelName string = 'di${toLower(uniqueString(resourceGroup().id, environmentName))}'
+
+// Azure AI Search
+@description('Unique name for the AI Search service (2-60 lowercase letters, digits, and dashes)')
+param searchServiceName string = 'srch${toLower(uniqueString(resourceGroup().id, environmentName))}'
+@description('SKU for the AI Search service')
+param searchSkuName string = 'basic'
+
+// Container Apps Job for batch extraction runs
+@description('Name of the Container Apps Job')
+param containerAppJobName string = 'caj-extract-${environmentName}'
 
 // Docker images for the backend and frontend container apps
 param DOCKER_IMAGE_BACKEND string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
@@ -264,60 +260,41 @@ module llmDeployment './modules/aiFoundryModelDeployment.bicep' = {
   ]
 }
 
-module imageGenDeployment './modules/aiFoundryModelDeployment.bicep' = if (deployImageGenModels && IMAGEGEN_DEPLOYMENT != '') {
-  name: 'imageGenDeployment'
+// TODO(step 3.2): chain the bulk extraction deployment after llmDeployment once
+// the model name/version has been confirmed available in aiFoundryLocation.
+// module bulkExtractionDeployment './modules/aiFoundryModelDeployment.bicep' = if (bulkExtractionDeploymentName != '') {
+//   name: 'bulkExtractionDeployment'
+//   params: {
+//     aiFoundryName: aiFoundryName
+//     deploymentName: bulkExtractionDeploymentName
+//     modelName: bulkExtractionModelType
+//     modelVersion: bulkExtractionModelVersion
+//     skuCapacity: 30
+//   }
+//   dependsOn: [
+//     llmDeployment
+//   ]
+// }
+
+// ─── Azure AI Document Intelligence ───
+module documentIntelligenceMod './modules/documentIntelligence.bicep' = {
+  name: 'documentIntelligenceMod'
   params: {
-    aiFoundryName: aiFoundryName
-    deploymentName: IMAGEGEN_DEPLOYMENT
-    modelName: imageGenModelType
-    modelVersion: imageGenModelVersion
-    skuCapacity: 1
+    docIntelName: docIntelName
+    location: location
+    deployNew: true
   }
-  dependsOn: [
-    llmDeployment
-  ]
 }
 
-module imageGen15Deployment './modules/aiFoundryModelDeployment.bicep' = if (deployImageGenModels && IMAGEGEN_15_DEPLOYMENT != '') {
-  name: 'imageGen15Deployment'
+// ─── Azure AI Search ───
+module searchServiceMod './modules/searchService.bicep' = {
+  name: 'searchServiceMod'
   params: {
-    aiFoundryName: aiFoundryName
-    deploymentName: IMAGEGEN_15_DEPLOYMENT
-    modelName: 'gpt-image-1.5'
-    modelVersion: imageGen15ModelVersion
-    skuCapacity: 1
+    searchServiceName: searchServiceName
+    location: location
+    skuName: searchSkuName
+    deployNew: true
   }
-  dependsOn: [
-    imageGenDeployment
-  ]
-}
-
-module imageGen1MiniDeployment './modules/aiFoundryModelDeployment.bicep' = if (deployImageGenModels && IMAGEGEN_1_MINI_DEPLOYMENT != '') {
-  name: 'imageGen1MiniDeployment'
-  params: {
-    aiFoundryName: aiFoundryName
-    deploymentName: IMAGEGEN_1_MINI_DEPLOYMENT
-    modelName: 'gpt-image-1-mini'
-    modelVersion: imageGen1MiniModelVersion
-    skuCapacity: 1
-  }
-  dependsOn: [
-    imageGen15Deployment
-  ]
-}
-
-module soraDeployment './modules/aiFoundryModelDeployment.bicep' = if (deploySoraModel && SORA_DEPLOYMENT != '') {
-  name: 'soraDeployment'
-  params: {
-    aiFoundryName: aiFoundryName
-    deploymentName: SORA_DEPLOYMENT
-    modelName: soraModelName
-    modelVersion: soraModelVersion
-    skuCapacity: 1
-  }
-  dependsOn: [
-    imageGen1MiniDeployment
-  ]
 }
 
 // ─── Container App Environment ───
@@ -351,11 +328,8 @@ module containerAppBackend './modules/containerApp.bicep' = {
     AZURE_CONTAINER_REGISTRY_PASSWORD: containerRegistryMod.outputs.containerRegistryPassword
     AI_FOUNDRY_ENDPOINT: aiFoundryMod.outputs.aiFoundryEndpoint
     LLM_DEPLOYMENT: LLM_DEPLOYMENT
-    IMAGEGEN_DEPLOYMENT: IMAGEGEN_DEPLOYMENT
-    IMAGEGEN_15_DEPLOYMENT: IMAGEGEN_15_DEPLOYMENT
-    IMAGEGEN_1_MINI_DEPLOYMENT: IMAGEGEN_1_MINI_DEPLOYMENT
-    SORA_DEPLOYMENT: SORA_DEPLOYMENT
-    FLUX_KONTEXT_DEPLOYMENT: FLUX_KONTEXT_DEPLOYMENT
+    AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: documentIntelligenceMod.outputs.docIntelEndpoint
+    AZURE_SEARCH_ENDPOINT: searchServiceMod.outputs.searchEndpoint
     COSMOS_ENDPOINT: cosmosDbMod.outputs.cosmosAccountEndpoint
     COSMOS_DATABASE_NAME: cosmosDbMod.outputs.databaseName
     COSMOS_CONTAINER_NAME: cosmosDbMod.outputs.containerName
@@ -382,11 +356,8 @@ module containerAppFrontend './modules/containerApp.bicep' = {
     AZURE_CONTAINER_REGISTRY_PASSWORD: containerRegistryMod.outputs.containerRegistryPassword
     AI_FOUNDRY_ENDPOINT: aiFoundryMod.outputs.aiFoundryEndpoint
     LLM_DEPLOYMENT: LLM_DEPLOYMENT
-    IMAGEGEN_DEPLOYMENT: IMAGEGEN_DEPLOYMENT
-    IMAGEGEN_15_DEPLOYMENT: IMAGEGEN_15_DEPLOYMENT
-    IMAGEGEN_1_MINI_DEPLOYMENT: IMAGEGEN_1_MINI_DEPLOYMENT
-    SORA_DEPLOYMENT: SORA_DEPLOYMENT
-    FLUX_KONTEXT_DEPLOYMENT: FLUX_KONTEXT_DEPLOYMENT
+    AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: documentIntelligenceMod.outputs.docIntelEndpoint
+    AZURE_SEARCH_ENDPOINT: searchServiceMod.outputs.searchEndpoint
     API_PROTOCOL: API_PROTOCOL == '' ? 'https' : API_PROTOCOL
     API_PORT: API_PORT == '' ? '443' : API_PORT
     API_HOSTNAME: API_HOSTNAME == '' ? '${containerAppNameBackend}.${containerAppEnvMod.outputs.containerAppDefaultDomain}' : API_HOSTNAME
@@ -398,6 +369,31 @@ module containerAppFrontend './modules/containerApp.bicep' = {
     customDomainName: frontendCustomDomain
     certificateId: frontendCertificateId
     azdServiceName: 'frontend'
+  }
+}
+
+// ─── Container Apps Job: batch extraction ───
+module containerAppJobMod './modules/containerAppJob.bicep' = {
+  name: 'containerAppJobMod'
+  params: {
+    location: location
+    jobName: containerAppJobName
+    containerAppEnvId: containerAppEnvMod.outputs.containerAppEnvId
+    DOCKER_IMAGE: DOCKER_IMAGE_BACKEND
+    deployNew: true
+    AZURE_CONTAINER_REGISTRY_ENDPOINT: containerRegistryMod.outputs.containerRegistryLoginServer
+    AZURE_CONTAINER_REGISTRY_USERNAME: containerRegistryMod.outputs.containerRegistryUsername
+    AZURE_CONTAINER_REGISTRY_PASSWORD: containerRegistryMod.outputs.containerRegistryPassword
+    AI_FOUNDRY_ENDPOINT: aiFoundryMod.outputs.aiFoundryEndpoint
+    LLM_DEPLOYMENT: LLM_DEPLOYMENT
+    AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: documentIntelligenceMod.outputs.docIntelEndpoint
+    AZURE_SEARCH_ENDPOINT: searchServiceMod.outputs.searchEndpoint
+    AZURE_BLOB_SERVICE_URL: storageAccountMod.outputs.storageAccountPrimaryEndpoint
+    AZURE_STORAGE_ACCOUNT_NAME: storageAccountName
+    AZURE_BLOB_IMAGE_CONTAINER: 'images'
+    COSMOS_ENDPOINT: cosmosDbMod.outputs.cosmosAccountEndpoint
+    COSMOS_DATABASE_NAME: cosmosDbMod.outputs.databaseName
+    COSMOS_CONTAINER_NAME: cosmosDbMod.outputs.containerName
   }
 }
 
@@ -429,6 +425,71 @@ module storageRoleAssignmentMod './modules/storageRoleAssignment.bicep' = {
   }
 }
 
+module docIntelRoleAssignmentMod './modules/documentIntelligenceRoleAssignment.bicep' = {
+  name: 'docIntelRoleAssignmentMod'
+  params: {
+    docIntelName: documentIntelligenceMod.outputs.docIntelName
+    principalId: containerAppBackend.outputs.containerAppPrincipalId
+  }
+}
+
+module searchRoleAssignmentMod './modules/searchRoleAssignment.bicep' = {
+  name: 'searchRoleAssignmentMod'
+  params: {
+    searchServiceName: searchServiceMod.outputs.searchServiceName
+    principalId: containerAppBackend.outputs.containerAppPrincipalId
+  }
+}
+
+// ─── RBAC Role Assignments: extraction job identity ───
+// The job has its own system-assigned identity, so every grant the backend app
+// has must be repeated for the job's principal.
+
+module jobCosmosRoleAssignmentMod './modules/cosmosRoleAssignment.bicep' = {
+  name: 'jobCosmosRoleAssignmentMod'
+  params: {
+    cosmosAccountName: cosmosAccountNamePrefixed
+    containerAppPrincipalId: containerAppJobMod.outputs.jobPrincipalId
+    dataContributorRoleId: cosmosDbMod.outputs.dataContributorRoleId
+  }
+  dependsOn: [
+    cosmosRoleAssignmentMod
+  ]
+}
+
+module jobAiFoundryRoleAssignmentMod './modules/aiFoundryRoleAssignment.bicep' = {
+  name: 'jobAiFoundryRoleAssignmentMod'
+  params: {
+    aiFoundryId: aiFoundryMod.outputs.aiFoundryId
+    aiFoundryName: aiFoundryName
+    containerAppPrincipalId: containerAppJobMod.outputs.jobPrincipalId
+  }
+}
+
+module jobStorageRoleAssignmentMod './modules/storageRoleAssignment.bicep' = {
+  name: 'jobStorageRoleAssignmentMod'
+  params: {
+    storageAccountName: storageAccountName
+    containerAppPrincipalId: containerAppJobMod.outputs.jobPrincipalId
+  }
+}
+
+module jobDocIntelRoleAssignmentMod './modules/documentIntelligenceRoleAssignment.bicep' = {
+  name: 'jobDocIntelRoleAssignmentMod'
+  params: {
+    docIntelName: documentIntelligenceMod.outputs.docIntelName
+    principalId: containerAppJobMod.outputs.jobPrincipalId
+  }
+}
+
+module jobSearchRoleAssignmentMod './modules/searchRoleAssignment.bicep' = {
+  name: 'jobSearchRoleAssignmentMod'
+  params: {
+    searchServiceName: searchServiceMod.outputs.searchServiceName
+    principalId: containerAppJobMod.outputs.jobPrincipalId
+  }
+}
+
 // ─── Outputs ───
 output AZURE_LOCATION string = location
 output AZURE_CONTAINER_ENVIRONMENT_NAME string = containerAppEnvMod.outputs.containerAppEnvId
@@ -438,6 +499,9 @@ output BACKEND_INTERNAL_URI string = 'https://${containerAppBackend.outputs.cont
 output FRONTEND_URI string = 'https://${containerAppFrontend.outputs.containerAppFqdn}'
 output AZURE_STORAGE_ACCOUNT_NAME string = storageAccountName
 output AZURE_BLOB_SERVICE_URL string = storageAccountMod.outputs.storageAccountPrimaryEndpoint
+output AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT string = documentIntelligenceMod.outputs.docIntelEndpoint
+output AZURE_SEARCH_ENDPOINT string = searchServiceMod.outputs.searchEndpoint
+output AZURE_EXTRACTION_JOB_NAME string = containerAppJobMod.outputs.jobName
 output AI_FOUNDRY_ENDPOINT string = aiFoundryMod.outputs.aiFoundryEndpoint
 output AI_FOUNDRY_NAME string = aiFoundryName
 output COSMOS_DB_ENDPOINT string = cosmosDbMod.outputs.cosmosAccountEndpoint

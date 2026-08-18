@@ -537,7 +537,52 @@ the application uses.
 **Add:** a cheaper deployment for bulk extraction. Not yet selected; size it for
 high-volume document throughput rather than latency.
 
-### 3. Parked on a working `uv sync`
+> Resolved in step 3.1: the four image/video deployment modules and their
+> parameters were removed from `infra/main.bicep`, `infra/main.parameters.json`,
+> and `infra/modules/containerApp.bicep`.
+
+#### 2a. `LLM_DEPLOYMENT` is `gpt-5`, not `gpt-4o` — docs are wrong
+
+`infra/main.bicep` deploys **`gpt-5` (version `2025-08-07`)**: `llmModelType`,
+`llmModelVersion`, and the `LLM_DEPLOYMENT` default all say `gpt-5`. This is
+intentional — the inline comment records that gpt-4o `2024-08-06` / `2024-11-20`
+are in deprecating state and cannot be used for new deployments in `eastus2`.
+
+`README.md` and `.env.example` still say `gpt-4o`. Those two files should be
+corrected to `gpt-5` in a follow-up documentation pass. No code or infra change
+is needed — the infra is correct and the docs are stale.
+
+#### 2b. Bulk extraction deployment — HARD GATE before `extract.py`
+
+`infra/main.bicep` carries a commented-out `bulkExtractionDeployment` module and
+three commented `bulkExtraction*` parameters. **This is not a someday item.** The
+model name, version, and SKU must be confirmed against what is actually
+available in the Foundry resource's region *before* step 3.2's `extract.py` work
+begins, because the extraction code's batching, token budgeting, and cost model
+all depend on which model is chosen:
+
+```bash
+az cognitiveservices model list -l <aiFoundryLocation> -o table
+```
+
+Uncomment the parameters and the module, fill in the confirmed values, and
+redeploy before writing `extract.py`.
+
+### 3. Public network access on the new AI resources
+
+Step 3.1 provisions Document Intelligence and AI Search with
+`publicNetworkAccess: 'Enabled'`, matching the existing AI Foundry account.
+Cosmos DB and Blob Storage in the same template sit behind **private endpoints**
+with private DNS zones, so the data plane is split: documents and metadata are
+private, but the AI services that read them are reachable from the internet.
+
+Both new services have `disableLocalAuth: true`, so access still requires an
+Entra token — this is a network-exposure gap, not an auth gap. A follow-up pass
+should add private endpoints plus `privatelink.cognitiveservices.azure.com` and
+`privatelink.search.windows.net` DNS zones once the pipeline is proven
+end-to-end. Deliberately deferred to keep step 3.1 reviewable.
+
+### 4. Parked on a working `uv sync`
 
 Two changes are blocked by the PyPI network restriction on the current machine
 and must land together once `uv sync` can run:
@@ -548,6 +593,119 @@ and must land together once `uv sync` can run:
   skipped in step 2d: `[project].name` is recorded in `uv.lock`, so renaming it
   without regenerating the lock would leave the two out of sync. Only
   `description` was updated.
+
+### 5. Web search backends — known blockers
+
+`backend/core/websearch.py` defines the provider-agnostic interface
+(`SearchResult`, `WebSearchClient`, `get_websearch_client()`), with two backends:
+`websearch_bing.py` (Grounding with Bing Search) and `websearch_webiq.py`
+(stub, pending Core & Main access approval). The Bing backend is written against
+the real API shape but **cannot run yet**. Five separate blockers, each
+independent of the others:
+
+**1. Grounding with Bing does not return raw content to developers.** Per
+[Microsoft Learn](https://learn.microsoft.com/en-us/azure/ai-foundry/agents/how-to/tools/bing-grounding),
+the tool "does NOT return the tool output to developers and end users" and
+"Developers and end users don't have access to raw content returned from
+Grounding with Bing Search." What is exposed is the model's answer plus URL
+citation annotations. So `SearchResult.url` is populated, `title` is best-effort
+from the annotation, and `snippet` is **always empty** for this backend. WebIQ,
+if approved, would populate all three — meaning result quality is not comparable
+across backends. Bing's use-and-display terms additionally require showing both
+the website URLs and the Bing query URL to end users; nothing in the app does
+this yet.
+
+**2. ~~`gpt-5` is not supported~~ — RESOLVED for the Web Search tool.** The
+exclusion is real but applies to **classic Grounding with Bing Search**, whose
+docs state it works with all Agent Service models "except `gpt-4o-mini,
+2024-07-18` and gpt-5 models." It does **not** apply to the Web Search tool,
+which is what `websearch_bing.py` targets (see 4 below).
+
+Confirmed by live test in the Microsoft Foundry portal: project `gpt-test`,
+agent `Test`, model **`gpt-5`**, Web Search tool attached. Query "what is the
+current weather in Denver?" returned a correctly cited answer sourced from the
+National Weather Service in ~21s / 21,790 tokens, with no error. This settles
+the earlier ambiguity — the docs samples only ever showed `gpt-5-mini`, leaving
+full `gpt-5` unverified.
+
+Consequence: **no second, non-gpt-5 deployment is needed.** `LLM_DEPLOYMENT`
+(`gpt-5`, see 2a above) is usable as-is for web search, and this no longer
+constrains the bulk-extraction deployment decision in 2b.
+
+**3. The SDK is not installed and cannot be installed right now.** Grounding with
+Bing requires `azure-ai-projects` / `azure-ai-agents`, not the `AzureOpenAI`
+client in `core/llm.py`. Neither package is in `pyproject.toml` nor in the
+environment, and `uv sync` is still network-blocked (see 4 above). The backend
+therefore imports the SDK **lazily inside `search()`** and raises
+`WebSearchError` with remediation text rather than an `ImportError` at module
+scope, so application import stays clean. Add both packages when `uv sync` works.
+
+**4. Infra requirement — lifted, by switching to the Web Search tool.** Two
+distinct tools exist. **Classic Grounding with Bing Search** (GA, retiring
+2027-03-31) requires a `Microsoft.Bing/accounts` resource you create and manage,
+Contributor/Owner to create it, and **Foundry Project Manager** to create the
+project connection. The newer **Web Search tool** (GA, recommended) does not:
+per Microsoft Learn its Grounding-with-Bing resource is *"Managed by Microsoft"*,
+and *"Web Search requires no extra roles beyond your Foundry project access."*
+Attaching `WebSearchTool` directly to a prompt agent *"doesn't require a toolbox
+or a separate Bing project connection."*
+
+`websearch_bing.py` therefore targets the **Web Search tool** path
+(`azure-ai-projects` → `AIProjectClient` → `PromptAgentDefinition(tools=[WebSearchTool()])`
+→ Responses API), not classic Grounding with Bing. **No new Azure resource, no
+project connection, and no extra RBAC are required**, so this blocker is
+resolved. `BING_CONNECTION_ID` is retained in config but is no longer required
+by the client; it is only relevant if domain-restricted Bing Custom Search is
+adopted later, which *does* reintroduce a Bing resource, an instance, and a
+project connection.
+
+Two caveats that survive the switch:
+
+- **Domain restriction is still not free.** General Web Search has no
+  server-side domain filter, so `allowed_domains` is applied client-side (see
+  the TODO in `websearch_bing.py`). Server-side restriction requires the Bing
+  Custom Search path and its infra.
+- **~~Endpoint form is unverified~~ — RESOLVED.** The Web Search tool requires a
+  *project* endpoint
+  (`https://<resource>.services.ai.azure.com/api/projects/<project>`), which is a
+  different value from the account endpoint
+  (`https://<name>.cognitiveservices.azure.com/`). Both are now carried as
+  separate settings: `AI_FOUNDRY_ENDPOINT` (account, used by `core/llm.py`) and
+  the new `AI_FOUNDRY_PROJECT_ENDPOINT` (project, used by
+  `FoundryWebSearchClient`). The project endpoint must be populated per
+  environment; the client raises `NotConfiguredError` naming it when blank.
+
+**Data boundary — applies to both variants, and is a governance item.** The
+Microsoft [Data Protection Addendum](https://aka.ms/dpa) does **not** apply to
+data sent to Grounding with Bing Search or Grounding with Bing Custom Search, and
+queries flow *outside the Azure compliance and geographic boundary*. Web Search
+is built on Grounding with Bing, so this exclusion applies **identically** to
+both tool variants — choosing the newer tool does not change it. Microsoft also
+notes this waives elevated Government Community Cloud commitments, including
+data sovereignty, where applicable. This is a **Core & Main governance
+conversation, independent of which Bing tool is used**, and independent of the
+WebIQ approval track. Resolve it before any real customer or vendor data is put
+into a web search query.
+
+**5. Networking — confirmed VNet-integrated, but not necessarily fatal.** The
+docs state Grounding with Bing "only works with agents that are not using VPN or
+Private Endpoints. The agent must have normal network access."
+`infra/modules/containerAppEnv.bicep` sets `vnetConfiguration.infrastructureSubnetId`
+from `vnetMod.outputs.containerAppsSubnetId`, so the Container Apps environment
+**is** VNet-integrated — but with `internal: false`, i.e. external ingress and
+default (unrestricted) outbound internet access. The restriction in the docs
+targets the *Foundry agent's* network configuration rather than the calling
+container, and the Foundry account is currently `publicNetworkAccess: 'Enabled'`
+with no private endpoint (see 3 above). Best reading: this is **not** a blocker
+today, but it becomes one the moment the follow-up pass puts Foundry behind a
+private endpoint. Verify against a live call before relying on it, and treat it
+as a constraint on that private-endpoint work.
+
+Consequence: `WEBSEARCH_PROVIDER` defaults to `"bing"`, so calling
+`get_websearch_client().search(...)` today raises `WebSearchError` (the
+`azure-ai-projects` SDK is not installed) or `NotConfiguredError` (no
+`AI_FOUNDRY_PROJECT_ENDPOINT` / `LLM_DEPLOYMENT`). Both are explicit; neither
+fails silently.
 
 Sequencing note: do not remove the image deployments until the image generation
 step lands, since `IMAGEGEN_DEPLOYMENT` and `FLUX_KONTEXT_DEPLOYMENT` are still

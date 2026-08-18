@@ -10,6 +10,9 @@ class Settings(BaseSettings):
 
     # AI Foundry endpoint (unified for all AI services via managed identity)
     AI_FOUNDRY_ENDPOINT: Optional[str] = None
+    # Project-scoped endpoint, required by the Foundry Agents/Web Search surface.
+    # Format: https://<resource>.services.ai.azure.com/api/projects/<project>
+    AI_FOUNDRY_PROJECT_ENDPOINT: Optional[str] = None
 
     # Model deployment names
     LLM_DEPLOYMENT: Optional[str] = None
@@ -36,6 +39,15 @@ class Settings(BaseSettings):
 
     # Azure OpenAI API Version
     AOAI_API_VERSION: str = "2025-04-01-preview"
+
+    # Web search backend for the tier-3/tier-4 source cascade
+    WEBSEARCH_PROVIDER: str = "bing"
+    # Only needed for domain-restricted Bing Custom Search; the general Foundry
+    # Web Search tool requires no Bing resource or project connection.
+    BING_CONNECTION_ID: Optional[str] = None
+    # WebIQ — pending Core & Main access approval
+    WEBIQ_ENDPOINT: Optional[str] = None
+    WEBIQ_API_KEY: Optional[str] = None
 
     # File storage paths
     UPLOAD_DIR: str = "./static/uploads"
