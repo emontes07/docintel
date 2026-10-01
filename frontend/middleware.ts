@@ -4,6 +4,35 @@ import type { NextRequest } from 'next/server';
 export function middleware(request: NextRequest) {
   // Get the pathname of the request
   const path = request.nextUrl.pathname;
+  const hosted = process.env.NODE_ENV === 'production' || Boolean(process.env.CONTAINER_APP_NAME || process.env.IDENTITY_ENDPOINT);
+  if (hosted && path.startsWith('/api/') &&
+      path !== '/api/auth' && !path.startsWith('/api/auth/') &&
+      path !== '/api/batches' && !path.startsWith('/api/batches/')) {
+    return NextResponse.json({ detail: 'Route unavailable in hosted batch mode' }, { status: 404, headers: { 'Cache-Control': 'no-store' } });
+  }
+
+  if (path === '/api/batches' || path.startsWith('/api/batches/')) {
+    if (request.method === 'OPTIONS' || request.headers.get('sec-fetch-site') === 'cross-site') {
+      return NextResponse.json({ detail: 'Same-origin batch access required' }, { status: 403 });
+    }
+    const response = NextResponse.next();
+    response.headers.set('Cache-Control', 'no-store');
+    return response;
+  }
+
+  if (path === '/api/pilot' || path.startsWith('/api/pilot/')) {
+    const host = request.headers.get('host') || '';
+    const origin = request.headers.get('origin');
+    if (!/^(127\.0\.0\.1|localhost):\d+$/.test(host) ||
+        (origin && origin !== `http://${host}`) ||
+        request.headers.get('sec-fetch-site') === 'cross-site' ||
+        request.method === 'OPTIONS') {
+      return NextResponse.json({ detail: 'Local same-origin access only' }, { status: 403 });
+    }
+    const response = NextResponse.next();
+    response.headers.set('Cache-Control', 'no-store');
+    return response;
+  }
 
   // Handle OPTIONS request for CORS preflight
   if (request.method === 'OPTIONS') {

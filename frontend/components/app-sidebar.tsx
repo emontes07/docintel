@@ -1,6 +1,6 @@
 "use client"
 
-import { Settings } from "lucide-react"
+import { FileCheck2, FileSpreadsheet, Settings } from "lucide-react"
 import Link from 'next/link';
 import Image from 'next/image';
 import { useTheme } from "next-themes";
@@ -22,6 +22,18 @@ import {
 
 // Manage section items
 const manageItems = [
+  {
+    title: "Batch Enrichment",
+    url: "/batches",
+    icon: FileSpreadsheet,
+    description: "Workbook batches and exceptions"
+  },
+  {
+    title: "Local Pilot (Development)",
+    url: "/pilot",
+    icon: FileCheck2,
+    description: "Local product run and review"
+  },
   {
     title: "Settings",
     url: "/settings",

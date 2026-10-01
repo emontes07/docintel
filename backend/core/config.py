@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pathlib import Path
 from typing import Optional
 from pydantic import Extra, Field, validator
 
@@ -15,6 +16,7 @@ class Settings(BaseSettings):
     AI_FOUNDRY_PROJECT_ENDPOINT: Optional[str] = None
 
     # Model deployment names
+    LLM_ENDPOINT: Optional[str] = None
     LLM_DEPLOYMENT: Optional[str] = None
 
     # Azure Blob Storage Settings (managed identity — no keys)
@@ -25,6 +27,8 @@ class Settings(BaseSettings):
     # Container names
     AZURE_BLOB_IMAGE_CONTAINER: str = "images"
     AZURE_BLOB_VIDEO_CONTAINER: str = "videos"
+    AZURE_BLOB_PARSE_CACHE_CONTAINER: str = "parsed"
+    AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: Optional[str] = None
 
     # CORS Configuration
     CORS_ALLOWED_ORIGINS: str = Field(
@@ -76,7 +80,7 @@ class Settings(BaseSettings):
         return v
 
     class Config:
-        env_file = "../.env"
+        env_file = Path(__file__).resolve().parents[2] / ".env"
         case_sensitive = True
         extra = Extra.allow
 

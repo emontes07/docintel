@@ -6,6 +6,11 @@ param jobName string
 param containerAppEnvId string
 param DOCKER_IMAGE string
 param deployNew bool = true
+param batchContainer string = ''
+param workerIdentityId string = ''
+param workerClientId string = ''
+param scheduleEnabled bool = false
+param syntheticAcceptanceOnly bool = false
 
 @description('Seconds a replica may run before it is terminated')
 param replicaTimeout int = 1800
@@ -41,27 +46,34 @@ param AZURE_CONTAINER_REGISTRY_PASSWORD string = ''
 resource containerAppJob 'Microsoft.App/jobs@2024-03-01' = if (deployNew) {
   name: jobName
   location: location
-  identity: {
-    type: 'SystemAssigned'
+  identity: empty(workerIdentityId) ? { type: 'SystemAssigned' } : {
+    type: 'UserAssigned'
+    userAssignedIdentities: { '${workerIdentityId}': {} }
   }
   properties: {
     environmentId: containerAppEnvId
     configuration: {
-      triggerType: 'Manual'
+      triggerType: scheduleEnabled ? 'Schedule' : 'Manual'
       replicaTimeout: replicaTimeout
-      replicaRetryLimit: 1
-      manualTriggerConfig: {
+      replicaRetryLimit: 0
+      manualTriggerConfig: scheduleEnabled ? null : {
         parallelism: parallelism
         replicaCompletionCount: parallelism
       }
+      scheduleTriggerConfig: scheduleEnabled ? {
+        cronExpression: '*/5 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      } : null
       registries: AZURE_CONTAINER_REGISTRY_ENDPOINT != '' ? [
         {
           server: AZURE_CONTAINER_REGISTRY_ENDPOINT
-          username: AZURE_CONTAINER_REGISTRY_USERNAME
-          passwordSecretRef: 'acr-password'
+          identity: empty(workerIdentityId) ? null : workerIdentityId
+          username: empty(workerIdentityId) ? AZURE_CONTAINER_REGISTRY_USERNAME : null
+          passwordSecretRef: empty(workerIdentityId) ? 'acr-password' : null
         }
       ] : []
-      secrets: AZURE_CONTAINER_REGISTRY_ENDPOINT != '' ? [
+      secrets: AZURE_CONTAINER_REGISTRY_ENDPOINT != '' && empty(workerIdentityId) ? [
         {
           name: 'acr-password'
           value: AZURE_CONTAINER_REGISTRY_PASSWORD
@@ -73,11 +85,19 @@ resource containerAppJob 'Microsoft.App/jobs@2024-03-01' = if (deployNew) {
         {
           name: jobName
           image: DOCKER_IMAGE
+          command: ['/app/.venv/bin/python']
+          args: syntheticAcceptanceOnly
+            ? ['-m', 'backend.batch_worker', '--concurrency', '2', '--max-batches', '1', '--item-limit', '2', '--synthetic-acceptance']
+            : ['-m', 'backend.batch_worker', '--concurrency', '2', '--max-batches', '1', '--item-limit', '100']
           resources: {
             cpu: 1
             memory: '2Gi'
           }
           env: [
+            { name: 'AZURE_CLIENT_ID', value: workerClientId }
+            { name: 'DOCINTEL_BATCH_STORAGE_URL', value: AZURE_BLOB_SERVICE_URL }
+            { name: 'DOCINTEL_BATCH_CONTAINER', value: batchContainer }
+            { name: 'DOCINTEL_BATCH_LIVE_ENABLED', value: 'false' }
             {
               name: 'AI_FOUNDRY_ENDPOINT'
               value: AI_FOUNDRY_ENDPOINT
@@ -131,4 +151,4 @@ resource containerAppJob 'Microsoft.App/jobs@2024-03-01' = if (deployNew) {
 
 output jobId string = containerAppJob.id
 output jobName string = jobName
-output jobPrincipalId string = deployNew ? containerAppJob.identity.principalId : ''
+output jobPrincipalId string = deployNew && empty(workerIdentityId) ? (containerAppJob.?identity.?principalId ?? '') : ''

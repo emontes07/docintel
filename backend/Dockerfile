@@ -1,5 +1,4 @@
-# Use Python 3.12 slim image
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # Install system dependencies needed for OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,10 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.31 /uv /uvx /bin/
 
 # Copy the application into the container.
-COPY . /app
+COPY pyproject.toml uv.lock /app/
+COPY backend /app/backend
 
 # Install the application dependencies.
 WORKDIR /app
@@ -21,7 +21,7 @@ WORKDIR /app
 # but pyproject.toml in the root, we need to set PYTHONPATH
 ENV PYTHONPATH=/app
 
-RUN uv sync --frozen --no-cache
+RUN uv sync --locked --no-cache
 
 # Add the virtual environment to PATH
 ENV PATH="/app/.venv/bin:${PATH}"
@@ -37,5 +37,4 @@ RUN ls -la /app/.venv/bin/ && /app/.venv/bin/fastapi --version
 EXPOSE 80
 
 # Run the application using fastapi CLI with a shell wrapper to ensure PATH is set
-ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["exec /app/.venv/bin/fastapi run backend/main.py --port 80 --host 0.0.0.0"] 
+CMD ["/app/.venv/bin/fastapi", "run", "backend/main.py", "--port", "80", "--host", "0.0.0.0"]

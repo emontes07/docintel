@@ -9,6 +9,8 @@ import os  # noqa: E402
 import uvicorn  # noqa: E402
 from .core.config import settings  # noqa: E402
 from .api.endpoints import metadata_router, gallery, env  # noqa: E402
+from .batch_api import router as batch_router, batch_response_headers as private_batch_response  # noqa: E402
+from .batch_auth import restrict_hosted_routes  # noqa: E402
 
 
 # Create directories if they don't exist
@@ -34,6 +36,14 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 app.include_router(gallery.router, prefix=f"{settings.API_V1_STR}/gallery", tags=["gallery"])
 app.include_router(metadata_router.router, prefix=f"{settings.API_V1_STR}/metadata", tags=["metadata"])
 app.include_router(env.router, prefix=f"{settings.API_V1_STR}", tags=["env"])
+app.include_router(batch_router, prefix=settings.API_V1_STR)
+
+
+@app.middleware("http")
+async def batch_response_headers(request, call_next):
+    if request.url.path.startswith(f"{settings.API_V1_STR}/batches"):
+        return await private_batch_response(request, call_next)
+    return await restrict_hosted_routes(request, call_next, settings.API_V1_STR)
 
 
 @app.get("/")

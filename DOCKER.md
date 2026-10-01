@@ -1,6 +1,15 @@
 # Docker Setup for AI Content Lab
 
-This document provides instructions for building and running both the frontend and backend applications using Docker.
+> **Legacy template reference, not the DocIntel batch activation guide.** The
+> dependency lock/clean-image gate remains open. Do not use the Compose,
+> key-based configuration, rebuild/prune, or public-bind examples below to bypass
+> [deployment approvals and current image mappings](DEPLOYMENT.md). In particular,
+> hosted batch storage uses managed identity and a private container, not an
+> account key. No cleanup or resource deletion is authorized here.
+
+Use [local batch development](DEPLOYMENT.md#local-batch-development) or the
+[local-only pilot](PILOT.md) for current workflows. The remainder describes the
+inherited media-template Docker setup and is not verified batch release guidance.
 
 ## Prerequisites
 
@@ -33,7 +42,7 @@ AZURE_BLOB_SERVICE_URL=https://your-storage-account-name.blob.core.windows.net/
 
 ## Building and Running the Applications
 
-### Using Docker Compose (Recommended)
+### Using Docker Compose (Legacy)
 
 From the root directory, run:
 

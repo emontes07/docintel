@@ -61,27 +61,26 @@ const nextConfig: NextConfig = {
   },
   
   
-  // Disable ESLint during builds
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
-  // Disable TypeScript checks during builds
-  typescript: {
-    ignoreBuildErrors: true,
-  },
-  
   // Enhanced headers with caching and security
   async headers() {
     return [
       {
         // Add CORS headers to all API routes
-        source: "/api/:path*",
+        source: "/api/:path((?!(?:pilot|batches)(?:/|$)).*)",
         headers: [
           { key: "Access-Control-Allow-Credentials", value: "true" },
           { key: "Access-Control-Allow-Origin", value: "*" },
           { key: "Access-Control-Allow-Methods", value: "GET,POST,PUT,DELETE,OPTIONS" },
           { key: "Access-Control-Allow-Headers", value: "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization" },
         ]
+      },
+      {
+        source: '/api/pilot/:path*',
+        headers: [{ key: 'Cache-Control', value: 'no-store' }],
+      },
+      {
+        source: '/pilot',
+        headers: [{ key: 'Cache-Control', value: 'no-store' }],
       },
       {
         // Service worker caching
@@ -99,11 +98,11 @@ const nextConfig: NextConfig = {
       },
       {
         // Cache static assets + security headers
-        source: '/(.*)',
+        source: '/:path((?!api/pilot(?:/|$)|pilot(?:/|$)).*)',
         headers: [
           {
             key: 'Cache-Control',
-            value: 'public, max-age=31536000, immutable',
+            value: process.env.NODE_ENV === 'development' ? 'no-store' : 'public, max-age=31536000, immutable',
           },
           {
             key: 'X-Content-Type-Options',
