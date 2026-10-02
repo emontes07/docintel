@@ -1,0 +1,30 @@
+{
+  "execution_mode": "live_inference",
+  "manifest": {
+    "product": {
+      "item_id": "synthetic-1",
+      "vendor": "Synthetic fixture vendor",
+      "mpn": "TEST-ONLY-1",
+      "hierarchy_node": "synthetic-valves"
+    },
+    "attributes": [
+      {"attribute_id": "material", "description": "Body material", "value_type": "string"}
+    ],
+    "source_ids": ["synthetic-pdf"]
+  },
+  "sources": [{
+    "source_id": "synthetic-pdf",
+    "product": {
+      "item_id": "synthetic-1",
+      "vendor": "Synthetic fixture vendor",
+      "mpn": "TEST-ONLY-1",
+      "hierarchy_node": "synthetic-valves"
+    },
+    "document": {
+      "source": "fixtures/synthetic-document.pdf",
+      "cache_key": "synthetic-v1",
+      "parsed_at": "2026-01-01T00:00:00Z",
+      "paragraphs": [{"text": "Synthetic fixture only. Product category: valve.", "page_number": 1}]
+    }
+  }]
+}

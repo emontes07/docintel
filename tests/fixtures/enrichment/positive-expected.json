@@ -1,0 +1,14 @@
+{
+  "candidates": [{
+    "attribute_id": "material",
+    "value": "brass",
+    "unit": null,
+    "evidence_ids": ["synthetic-pdf:synthetic-v1:paragraph=0"],
+    "origin": "model_generated"
+  }],
+  "evidence": {
+    "evidence_id": "synthetic-pdf:synthetic-v1:paragraph=0",
+    "source_locator": "fixtures/synthetic-document.pdf#page=1&paragraph=0",
+    "text": "Synthetic fixture only. Body material: brass."
+  }
+}

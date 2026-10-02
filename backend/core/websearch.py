@@ -32,6 +32,10 @@ class NotConfiguredError(WebSearchError):
     """The selected backend is missing required configuration."""
 
 
+class ProviderUnavailableError(NotConfiguredError):
+    """The selected provider has no supported integration in this application."""
+
+
 class SearchResult(BaseModel):
     """A single citable web source.
 

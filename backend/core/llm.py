@@ -119,7 +119,7 @@ class LLMClient:
         api_version: str = LLM_API_VERSION,
         timeout: float = DEFAULT_TIMEOUT,
     ):
-        self.endpoint = endpoint or settings.AI_FOUNDRY_ENDPOINT
+        self.endpoint = endpoint or settings.LLM_ENDPOINT or settings.AI_FOUNDRY_ENDPOINT
         self.deployment = deployment or settings.LLM_DEPLOYMENT
         self.timeout = timeout
 

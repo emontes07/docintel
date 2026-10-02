@@ -1,0 +1,55 @@
+{
+  "execution_mode": "offline_replay",
+  "manifest": {
+    "product": {
+      "item_id": "synthetic-1",
+      "vendor": "Synthetic fixture vendor",
+      "mpn": "TEST-ONLY-1",
+      "hierarchy_node": "synthetic-valves"
+    },
+    "attributes": [
+      {
+        "attribute_id": "material",
+        "description": "Body material",
+        "value_type": "string",
+        "examples": ["Example only, not product evidence"]
+      },
+      {
+        "attribute_id": "diameter",
+        "description": "Nominal diameter",
+        "value_type": "number",
+        "unit": "mm"
+      }
+    ],
+    "source_ids": ["synthetic-pdf"]
+  },
+  "sources": [
+    {
+      "source_id": "synthetic-pdf",
+      "product": {
+        "item_id": "synthetic-1",
+        "vendor": "Synthetic fixture vendor",
+        "mpn": "TEST-ONLY-1",
+        "hierarchy_node": "synthetic-valves"
+      },
+      "document": {
+        "source": "fixtures/synthetic-document.pdf",
+        "cache_key": "synthetic-v1",
+        "parsed_at": "2026-01-01T00:00:00Z",
+        "paragraphs": [
+          {"text": "Synthetic fixture only. Body material: brass.", "page_number": 1}
+        ]
+      }
+    }
+  ],
+  "generated_response": {
+    "candidates": [
+      {
+        "attribute_id": "material",
+        "value": "brass",
+        "evidence_ids": ["synthetic-pdf:synthetic-v1:paragraph=0"],
+        "origin": "model_generated"
+      }
+    ]
+  }
+}

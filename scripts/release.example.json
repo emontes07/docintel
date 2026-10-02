@@ -1,0 +1,21 @@
+{
+  "subscription": "",
+  "tenant": "",
+  "group": "",
+  "environment": "",
+  "registry": "",
+  "storage": "",
+  "frontend": "",
+  "backend": "",
+  "job": "",
+  "container": "",
+  "frontend_origin": "",
+  "backend_origin": "",
+  "api_client_id": "",
+  "frontend_client_id": "",
+  "frontend_image": "",
+  "backend_image": "",
+  "auth_secret_ref": "",
+  "entra_secret_ref": "",
+  "baseline_authenticated": false
+}

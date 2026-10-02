@@ -9,12 +9,21 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       clientSecret: process.env.AUTH_MICROSOFT_ENTRA_ID_SECRET,
       authorization: {
         params: {
-          scope: "openid profile email User.Read",
+          scope: `openid profile email ${process.env.DOCINTEL_API_SCOPE || ""}`,
         },
       },
     }),
   ],
   secret: process.env.AUTH_SECRET,
+  callbacks: {
+    async jwt({ token, account }) {
+      if (account) {
+        token.batchAccessToken = account.access_token;
+        token.batchExpiresAt = account.expires_at;
+      }
+      return token;
+    },
+  },
   // Trust localhost and development URLs
   trustHost: true,
   // If you want to add custom pages, you can do so here:

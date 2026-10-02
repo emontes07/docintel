@@ -1,165 +1,78 @@
 # DocIntel
 
-**Batch document attribute extraction on Azure AI Foundry — extract structured, validated fields from large document sets.**
+Turn product workbooks and explicitly associated technical documents into
+traceable attribute proposals, human decisions, and a qualified Excel export.
+DocIntel addresses the manual work of finding missing product attributes while
+keeping source evidence, conflicting values, and uncertainty visible.
 
-## Key Features
+> **WIP SOURCE CHECKPOINT: NOT READY TO MERGE OR DEPLOY.** The committed dependency
+> lock is inconsistent with Document Intelligence and PyJWT requirements; a clean
+> locked installation/image is not verified. SharePoint download remains blocked.
+> Hosted batch authentication, private persistence, and worker execution have not
+> passed Azure acceptance. Local tests and Bicep compilation do not remove these
+> gates. Do not run `azd up`, provision, deploy, grant access, or process customer
+> batches without separate approval. Never bypass the lock, hooks, CI, or signing.
 
-### Structured Extraction
-- Define the fields you want as a Pydantic model; the extraction client requests JSON-schema-constrained output from the model deployment and returns a validated instance
-- Schema violations raise a typed error instead of silently returning partial data
-- Built-in retry, timeout, and logging around every model call
+## The Batch Workflow
 
-### Asset & Metadata Management
-- Documents are stored in Azure Blob Storage with folder support
-- Extracted attributes are persisted to Azure Cosmos DB alongside each asset
-- Query, search, folder statistics, and metadata sync endpoints over the stored results
+1. Upload a **Product manifest** and **Attribute definitions** workbook. Validate
+   exact product/source associations, hierarchy, types, and units before submission.
+2. Submit one batch. The portal provides queue status, progress, exceptions,
+   filters, and paging. A finite worker processes bounded slices durably.
+3. Open individual products to inspect proposals, source excerpts, conflicts, and
+   qualifications. Record an approval, correction, or rejection separately from
+   the original machine result.
+4. **Export Excel** with inputs, proposals, evidence, provenance, exceptions, and
+   review decisions. Cited/schema-valid output is neither automatically correct
+   nor approved master data. There are no automatic master-data writes.
 
-## Architecture
+The product screen is a **drill-down for evidence and review**, not a requirement
+to submit thousands of products individually. Large catalogs are the intended
+workload, not a measured performance claim: intake is bounded to 10,000 product
+rows, the UI pages 50 items, and the default worker handles 100 items with two
+threads per slice. History/filter scans are not an indexed enterprise queue.
 
-DocIntel uses **Azure AI Foundry** as a single unified AI resource with all model deployments, and **managed identity** for all service connections (no API keys).
+## Where It Runs
 
-| Component | Service | Auth |
-|-----------|---------|------|
-| AI Models | Azure AI Foundry (AIServices) | Managed Identity |
-| Document Storage | Azure Blob Storage | Managed Identity |
-| Metadata | Azure Cosmos DB | Managed Identity |
-| Hosting | Azure Container Apps | SystemAssigned MI |
+The intended experience is an Azure-hosted Next.js portal and FastAPI backend,
+Entra sign-in, private Blob batch state, and a manually started Container Apps Job.
+Document Intelligence parsing and Azure OpenAI structured extraction are distinct
+service calls, not a Foundry agent. Live work remains disabled by default and
+restricted to a previously approved pilot scope, not arbitrary catalog products.
 
-### Supported Model Deployments
+Local development is an explicit loopback-only mode with unverified identity and
+private SQLite state. The separate local pilot can replay prior results. Its
+local authentication controls do **not** secure hosted use.
 
-| Deployment | Model | Purpose |
-|-----------|-------|---------|
-| `gpt-4o` | GPT-4o | LLM for structured attribute extraction and analysis |
+| Capability | Evidence as of 2026-10-01 |
+| --- | --- |
+| Intake, queue, finite worker, review, Excel export | Implemented; locally exercised with temporary synthetic data. |
+| Validation, leases, replay safety | Offline tests; no duplicate batch/review writes in the focused regression. |
+| Desktop/mobile browser workflow | Initial attempts 1-3 failed on an automation sandbox defect; corrected attempts 4-6 passed consecutively on warm servers. Two earlier user Retry incidents remain uncorrelated. No cold-start or real-device acceptance claim. |
+| Azure frontend/backend | Last inspection found healthy **older revisions**, not deployment of this batch increment. No job existed in the inspected group. |
+| Hosted identity, Blob leases, manual worker | Implementation/template present; Azure end-to-end acceptance still blocked. |
+| AI and document sources | Prior bounded parsing/inference observations and two synthetic model cases are not catalog accuracy evidence. SharePoint retained metadata 200, content 302, download 401; no active fallback. |
+| Clean installation and release | Blocked on a reconciled, approved dependency lock and clean-image verification. Unrelated working lock edits do not establish reproducibility. |
 
-## Prerequisites
+## Guides
 
-Azure resources:
+| Reader | Start here |
+| --- | --- |
+| Business operator | [User guide](docs/USER_GUIDE.md): workbooks, validation, execution choices, exceptions, review, export. |
+| Developer or architect | [Architecture](docs/ARCHITECTURE.md): original Mermaid diagrams, implemented wiring, blocked connections, deployed-state distinction. |
+| Azure maintainer | [Deployment](DEPLOYMENT.md): settings, command ownership, gated activation, acceptance and rollback. |
+| Release reviewer | [Consolidated batch findings](BATCH.md): evidence, costs, security gates, complete browser attempt history. |
+| Local pilot operator | [Local pilot](PILOT.md): private setup, replay/live controls, conservative budgets, local-only security. |
+| Extraction developer | [Enrichment contracts](docs/ENRICHMENT.md): supplied-evidence CLI, validation, diagnostic limitations. |
 
-- Azure AI Foundry resource with deployed models (see table above)
-- Azure Storage Account with a Blob Container for documents
-- Azure Cosmos DB account
+## Lineage And License
 
-Compute environment:
-
-- Python 3.12+
-- Node.js 19+ and npm
-- Git
-- uv package manager
-- Azure CLI (`az login` required for local development)
-
-## Step 1: Installation (One-time)
-
-### Option A: Quick Start with GitHub Codespaces
-
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new?hide_repo_select=true&ref=main&repo=Azure-Samples/visionary-lab)
-
-Wait for the Codespace to initialize, then continue with [Step 2: Configure Resources](#step-2-configure-resources).
-
-### Option B: Local Installation
-
-#### 1. Clone the Repository
-
-```bash
-git clone https://github.com/Azure-Samples/visionary-lab
-```
-
-#### 2. Backend Setup
-
-##### 2.1 Install UV Package Manager
-
-Mac/Linux:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-##### 2.2 Copy environment file template
-
-```bash
-cp .env.example .env
-```
-
-#### 3. Frontend Setup
-
-```bash
-cd frontend
-npm install --legacy-peer-deps
-```
-
-## Step 2: Configure Resources
-
-1. **Login to Azure** (required for managed identity authentication):
-
-   ```bash
-   az login
-   ```
-
-2. **Configure environment variables** in `.env`:
-
-   ```bash
-   code .env
-   ```
-
-   | Setting | Description |
-   |---------|-------------|
-   | `AI_FOUNDRY_ENDPOINT` | Your AI Foundry endpoint (e.g., `https://your-foundry.cognitiveservices.azure.com/`) |
-   | `LLM_DEPLOYMENT` | LLM deployment name (e.g., `gpt-4o`) |
-   | `AZURE_BLOB_SERVICE_URL` | Blob Storage URL |
-   | `AZURE_STORAGE_ACCOUNT_NAME` | Storage account name |
-   | `AZURE_COSMOS_DB_ENDPOINT` | Cosmos DB endpoint URL |
-
-   > **No API keys needed.** All services authenticate via `DefaultAzureCredential` which uses your `az login` session locally and managed identity in Azure.
-
-## Step 3: Running the Application
-
-1. Start the backend:
-
-   ```bash
-   cd backend
-   uv run fastapi dev
-   ```
-
-   The backend server will start on http://localhost:8000.
-
-2. Open a new terminal to start the frontend:
-
-   ```bash
-   cd frontend
-   npm run build
-   npm start
-   ```
-
-   The frontend will be available at http://localhost:3000.
-
-## 🚀 Deploy to Azure
-
-For production deployment, use Azure Developer CLI:
-
-**Prerequisites**: [Azure Developer CLI (azd)](https://learn.microsoft.com/en-us/azure/developer/azure-developer-cli/install-azd)
-
-```bash
-git clone https://github.com/Azure-Samples/visionary-lab
-cd visionary-lab
-
-azd auth login
-azd up
-```
-
-During `azd up`, you'll be prompted for:
-- **AI Foundry name**: Globally unique name for your AI Foundry resource
-- **Model deployment names**: Which models to deploy (gpt-4o)
-
-✨ That's it! DocIntel will be running on Azure Container Apps with:
-- Azure AI Foundry with all model deployments
-- Managed identity for all service connections (no API keys)
-- Azure Storage and Cosmos DB for document and metadata management
-- RBAC role assignments auto-configured
-- Optional Entra ID authentication (configurable per deployment)
-
-📖 For detailed deployment instructions, see [DEPLOYMENT.md](DEPLOYMENT.md)
+DocIntel is derived from Microsoft's
+[Azure-Samples/visionary-lab](https://github.com/Azure-Samples/visionary-lab)
+template; its inherited gallery/media, infrastructure, and configuration surfaces
+are not all part of the batch workflow. Preserve the Microsoft notice and terms
+in [LICENSE.md](LICENSE.md). Legacy routes require a separate security review.
+The local frontend environment file is no longer tracked and is excluded from
+image contexts. Inherited literal `dummy` values were resolved as placeholders,
+not exposed credentials. The clean publication branch excludes the unpublished
+development history; never merge the checkpoint branch into it.

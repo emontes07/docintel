@@ -1,7 +1,5 @@
 # Root-level .dockerignore
-# Both azure.yaml services use `context: .` (repo root), so this applies to
-# the ACR remote-build upload context for backend and frontend.
-# Per-service Dockerfiles already have their own .dockerignore for local builds.
+# Backend remote build uses the repository root; frontend uses frontend/.
 
 # Agent / IDE tooling metadata (may contain broken symlinks that break remote build)
 .claude/
@@ -25,6 +23,15 @@ docs/
 .env
 .env.*
 !.env.example
+**/.env
+**/.env.*
+**/*.xlsx
+**/*.xlsm
+**/*.pdf
+**/*.sqlite3
+**/*.sqlite3-*
+.memories/
+frontend/
 
 # Python
 __pycache__/

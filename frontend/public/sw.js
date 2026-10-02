@@ -1,11 +1,10 @@
-const CACHE_NAME = 'docintel-v1';
-const STATIC_CACHE = 'static-v1';
-const IMAGE_CACHE = 'images-v1';
-const API_CACHE = 'api-v1';
+const CACHE_NAME = 'docintel-v2';
+const STATIC_CACHE = 'static-v2';
+const IMAGE_CACHE = 'images-v2';
+const API_CACHE = 'api-v2';
 
 // Assets to cache immediately
 const STATIC_ASSETS = [
-  '/',
   '/manifest.json',
   '/_next/static/css/',
   '/_next/static/js/',
@@ -45,6 +44,10 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
+
+  if (url.pathname === '/' || url.pathname === '/pilot' || /^\/(?:api\/)?batches(?:\/|$)/.test(url.pathname) || url.pathname.startsWith('/api/pilot/')) {
+    return;
+  }
 
   // Skip non-GET requests
   if (request.method !== 'GET') {

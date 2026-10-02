@@ -15,7 +15,6 @@ let API_BASE_URL = API_PORT
 
 // Override with direct API URL if provided
 if (process.env.NEXT_PUBLIC_API_URL) {
-  console.log(`Overriding API URL with NEXT_PUBLIC_API_URL: ${process.env.NEXT_PUBLIC_API_URL}`);
   // Ensure API URL ends with /api/v1
   API_BASE_URL = process.env.NEXT_PUBLIC_API_URL.endsWith('/api/v1') 
     ? process.env.NEXT_PUBLIC_API_URL 
@@ -24,14 +23,6 @@ if (process.env.NEXT_PUBLIC_API_URL) {
 
 // Export the final configured URL
 export { API_BASE_URL };
-
-// Log the configured API URL at startup to help debug connection issues
-console.log(`API configured with: ${API_BASE_URL}`);
-console.log('API environment variables:');
-console.log(`- NEXT_PUBLIC_API_URL: ${process.env.NEXT_PUBLIC_API_URL || 'not set'}`);
-console.log(`- NEXT_PUBLIC_API_PROTOCOL: ${process.env.NEXT_PUBLIC_API_PROTOCOL || 'not set'}`);
-console.log(`- NEXT_PUBLIC_API_HOSTNAME: ${process.env.NEXT_PUBLIC_API_HOSTNAME || 'not set'}`);
-console.log(`- NEXT_PUBLIC_API_PORT: ${process.env.NEXT_PUBLIC_API_PORT || 'not set'}`);
 
 // Enable debug mode to log API requests
 const API_DEBUG = process.env.NEXT_PUBLIC_DEBUG_MODE === 'true';
@@ -53,7 +44,7 @@ export interface GalleryItem {
   content_type: string;
   creation_time: string;
   last_modified: string;
-  metadata?: Record<string, string>;
+  metadata?: AssetMetadata;
 }
 
 export interface GalleryResponse {
@@ -84,12 +75,14 @@ export interface GalleryUploadResponse {
  */
 export interface AssetMetadata {
   [key: string]: string | number | boolean | string[] | object | undefined;
+  prompt?: string;
   analysis?: {
     summary?: string;
     products?: string;
     tags?: string[];
     feedback?: string;
     analyzed_at?: string;
+    analyzed?: boolean;
   };
   has_analysis?: boolean;
 }

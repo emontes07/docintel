@@ -1,0 +1,125 @@
+name: Validate Release
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+      DOCINTEL_BATCH_LIVE_ENABLED: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      NEXT_TELEMETRY_DISABLED: "1"
+      UV_HTTP_RETRIES: "0"
+    steps:
+      - name: Set isolated build paths
+        run: |
+          printf 'RELEASE_WORK=%s/docintel-release\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'EVIDENCE=%s/docintel-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REVISION }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.31"
+          enable-cache: false
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Stage committed source
+        run: python scripts/release.py stage --revision "$SOURCE_REVISION" --work "$RELEASE_WORK"
+      - name: Clean release packaging
+        id: package
+        run: python scripts/release.py package --work "$RELEASE_WORK" --package-access-approved
+      - name: Require committed lock
+        id: lock
+        run: cmp uv.lock "$RELEASE_WORK/source/uv.lock"
+      - name: Full offline regression
+        id: backend
+        working-directory: ${{ env.RELEASE_WORK }}/source
+        run: '"$RELEASE_WORK/.clean-venv/bin/python" -m pytest -m "not integration" -q -p no:cacheprovider'
+      - name: Verify two-product synthetic fixture
+        id: fixture
+        working-directory: ${{ env.RELEASE_WORK }}/source
+        run: '"$RELEASE_WORK/.clean-venv/bin/python" -m scripts.release_fixture --output "$RUNNER_TEMP/docintel-synthetic" --verify'
+      - name: Compile manual job template
+        id: bicep
+        run: az bicep build --file "$RELEASE_WORK/source/infra/batch.bicep" --stdout > /dev/null
+      - name: Build sanitized release context
+        run: python scripts/release.py context --work "$RELEASE_WORK"
+      - name: Build backend container
+        id: backend_image
+        run: docker build --platform linux/amd64 --file "$RELEASE_WORK/context/backend/Dockerfile" --iidfile "$RUNNER_TEMP/backend.iid" --tag "docintel/backend:$SOURCE_REVISION" "$RELEASE_WORK/context"
+      - name: Build frontend container
+        id: frontend_image
+        run: docker build --platform linux/amd64 --file "$RELEASE_WORK/context/frontend/Dockerfile" --iidfile "$RUNNER_TEMP/frontend.iid" --tag "docintel/frontend:$SOURCE_REVISION" "$RELEASE_WORK/context/frontend"
+      - name: Record public build evidence
+        if: always()
+        env:
+          PACKAGE_RESULT: ${{ steps.package.outcome }}
+          LOCK_RESULT: ${{ steps.lock.outcome }}
+          BACKEND_RESULT: ${{ steps.backend.outcome }}
+          FIXTURE_RESULT: ${{ steps.fixture.outcome }}
+          BICEP_RESULT: ${{ steps.bicep.outcome }}
+          BACKEND_IMAGE_RESULT: ${{ steps.backend_image.outcome }}
+          FRONTEND_IMAGE_RESULT: ${{ steps.frontend_image.outcome }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { existsSync, mkdirSync, readFileSync, copyFileSync, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          const environment = process.env;
+          const version = (command, args) => execFileSync(command, args, { encoding: 'utf8' }).trim();
+          const hash = path => existsSync(path) ? createHash('sha256').update(readFileSync(path)).digest('hex') : null;
+          const imageId = kind => {
+            const path = `${environment.RUNNER_TEMP}/${kind}.iid`;
+            return existsSync(path) ? readFileSync(path, 'utf8').trim() : null;
+          };
+          mkdirSync(environment.EVIDENCE, { recursive: true });
+          const lock = `${environment.RELEASE_WORK}/source/uv.lock`;
+          if (existsSync(lock)) copyFileSync(lock, `${environment.EVIDENCE}/uv.lock`);
+          const checks = `${environment.RELEASE_WORK}/clean-checks.json`;
+          if (existsSync(checks)) copyFileSync(checks, `${environment.EVIDENCE}/clean-checks.json`);
+          const evidence = {
+            revision: environment.SOURCE_REVISION,
+            run: `${environment.GITHUB_SERVER_URL}/${environment.GITHUB_REPOSITORY}/actions/runs/${environment.GITHUB_RUN_ID}`,
+            attempt: environment.GITHUB_RUN_ATTEMPT,
+            python: version('python', ['--version']),
+            uv: version('uv', ['--version']),
+            node: process.version,
+            npm: version('npm', ['--version']),
+            docker: version('docker', ['--version']),
+            committed_lock_sha256: hash('uv.lock'),
+            generated_lock_sha256: hash(lock),
+            checks: Object.fromEntries(['PACKAGE', 'LOCK', 'BACKEND', 'FIXTURE', 'BICEP', 'BACKEND_IMAGE', 'FRONTEND_IMAGE'].map(name => [name.toLowerCase(), environment[`${name}_RESULT`]])),
+            images: { backend: imageId('backend'), frontend: imageId('frontend') },
+            platform: 'linux/amd64',
+            published: false,
+          };
+          writeFileSync(`${environment.EVIDENCE}/provenance.json`, JSON.stringify(evidence, null, 2));
+          console.log(JSON.stringify(evidence, null, 2));
+          NODE
+      - name: Upload lock and build receipts only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-${{ env.SOURCE_REVISION }}
+          path: ${{ env.EVIDENCE }}
+          if-no-files-found: error
+          retention-days: 7
