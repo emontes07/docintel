@@ -15,13 +15,15 @@ jobs:
     timeout-minutes: 45
     env:
       SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
-      RELEASE_WORK: ${{ runner.temp }}/docintel-release
-      EVIDENCE: ${{ runner.temp }}/docintel-evidence
       DOCINTEL_BATCH_LIVE_ENABLED: "false"
       PYTHONDONTWRITEBYTECODE: "1"
       NEXT_TELEMETRY_DISABLED: "1"
       UV_HTTP_RETRIES: "0"
     steps:
+      - name: Set isolated build paths
+        run: |
+          printf 'RELEASE_WORK=%s/docintel-release\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'EVIDENCE=%s/docintel-evidence\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Checkout exact source
         uses: actions/checkout@v4
         with:
