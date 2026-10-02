@@ -18,6 +18,33 @@ def test_literal_secrets_are_never_captured():
     assert release.safe_containers(resource)[0]["env"][0]["secretRef"] == "session-secret"
 
 
+def test_synthetic_fixture_checks_both_products_and_export(tmp_path, monkeypatch):
+    from scripts import release_fixture
+    monkeypatch.setenv("DOCINTEL_BATCH_LIVE_ENABLED", "false")
+    output = tmp_path / "fixture"
+    release_fixture.prepare(output)
+    content, batch_id, owner, hashes = release_fixture.verify(output)
+    assert release_fixture.verify_export(content, batch_id, owner, hashes)
+    with pytest.raises(AssertionError):
+        release_fixture.verify_export(content, batch_id, "other-owner", hashes)
+    with pytest.raises(AssertionError):
+        release_fixture.verify_export(content, batch_id, owner, {"2": hashes["2"], "3": "changed"})
+
+
+@pytest.mark.parametrize("sheet,column,value", [("Inputs", "MPN", "WRONG"), ("Results", "Proposed value", "invented"), ("Provenance", "Execution method", "live")])
+def test_synthetic_export_rejects_second_product_corruption(tmp_path, monkeypatch, sheet, column, value):
+    from scripts import release_fixture
+    monkeypatch.setenv("DOCINTEL_BATCH_LIVE_ENABLED", "false")
+    output = tmp_path / "fixture"
+    release_fixture.prepare(output)
+    content, batch_id, owner, hashes = release_fixture.verify(output)
+    workbook = release_fixture.read_workbook(content)
+    workbook[sheet][1][column] = value
+    monkeypatch.setattr(release_fixture, "read_workbook", lambda _: workbook)
+    with pytest.raises(AssertionError):
+        release_fixture.verify_export(content, batch_id, owner, hashes)
+
+
 def test_unapproved_actions_never_reach_azure(tmp_path, monkeypatch):
     monkeypatch.setattr(release, "load_config", lambda _: {})
     monkeypatch.setattr(release, "verify_target", lambda _: pytest.fail("Azure reached without approval"))

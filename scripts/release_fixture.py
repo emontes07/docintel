@@ -68,6 +68,37 @@ def prepare(output):
     (output / "sha256.json").write_text(json.dumps(hashes, indent=2))
 
 
+def verify_export(content, batch_id, owner, machine_hashes):
+    workbook = read_workbook(content)
+    assert set(workbook) == {"Batch", "Inputs", "Definitions", "Results", "Evidence", "Provenance", "Errors", "Reviews"}
+    metadata = {row["Key"]: row["Value"] for row in workbook["Batch"]}
+    assert metadata["Batch ID"] == batch_id and metadata["Batch state"] == "completed"
+    assert metadata["Attribute reference"] == "definitions.xlsx"
+    assert "not approved master data" in metadata["Qualification"]
+    assert [(row["PIMITEM Number"], row["MPN"]) for row in workbook["Inputs"]] == [("001", "PART-1"), ("002", "PART-2")]
+    assert all(row["Vendor Name"] == "Synthetic" and row["Hierarchy Node"] == "Valve" and row["PDF Tech Spec"] == "release-synthetic.pdf" for row in workbook["Inputs"])
+    assert workbook["Definitions"] == [{"node": "Valve", "potential_attribute_name": "Pressure Rating", "potential_attribute_data_type": "Numeric", "unit": "PSI"}]
+    assert [(row["Row"], row["Item ID"], row["MPN"]) for row in workbook["Results"]] == [("2", "001", "PART-1"), ("3", "002", "PART-2")]
+    assert all(row["Attribute"] == "Pressure Rating" and not row["Proposed value"] and not row["Candidate index"] for row in workbook["Results"])
+    assert [row["Review status"] for row in workbook["Results"]] == ["reject", "pending"]
+    assert len(workbook["Reviews"]) == 1
+    review = workbook["Reviews"][0]
+    assert review["Row"] == "2" and review["Attribute"] == "Pressure Rating" and review["Decision"] == "reject"
+    assert review["Reviewer"] == owner and review["Reviewed at"]
+    assert review["Identity status"] == ("development_unverified" if owner.startswith("development:") else "verified_entra")
+    assert workbook["Results"][0]["Reviewer"] == owner
+    assert workbook["Results"][0]["Reviewed at"] == review["Reviewed at"]
+    assert {row["Row"]: row["Machine SHA256"] for row in workbook["Provenance"]} == machine_hashes
+    for row in workbook["Provenance"]:
+        assert row["Execution method"] == "evidence_only"
+        sources = json.loads(row["Source provenance"])
+        assert sources and all(source["parsing"] == "cache" and source["parse_origin"] == "synthetic_fixture_not_service_analysis" for source in sources)
+    assert len(workbook["Errors"]) == 2
+    assert all(row["State"] == "unresolved" and not row["Error"] for row in workbook["Errors"])
+    assert all(row["Source ID"] == "release-synthetic" and "Synthetic acceptance only" in row["Excerpt"] for row in workbook["Evidence"])
+    return True
+
+
 def verify(output):
     with tempfile.TemporaryDirectory(prefix="docintel-release-check-") as temporary:
         with patch.object(socket.socket, "connect", side_effect=AssertionError("Network forbidden")):
@@ -88,9 +119,25 @@ def verify(output):
             assert first["provenance"][0]["parsing"] == "cache"
             assert first["provenance"][0]["parse_origin"] == "synthetic_fixture_not_service_analysis"
             assert first["machine_result"]["model_call_status"] == "not_attempted"
-            run_batch(store, batch["id"])
+            first_bytes = store.read_bytes(f"results/{batch['id']}/row-2.json")
+            store = SQLiteStore(Path(temporary))
+            service = BatchService(store)
+            assert service.get(batch["id"], owner)["state"] == "queued"
+            run_batch(store, batch["id"], item_limit=1, concurrency=1)
             assert service.get(batch["id"], owner)["state"] == "completed"
             assert service.detail(batch["id"], "row-2", owner) == first
+            assert store.read_bytes(f"results/{batch['id']}/row-2.json") == first_bytes
+            machine_hashes = {}
+            result_records = {}
+            for row in (2, 3):
+                detail = service.detail(batch["id"], f"row-{row}", owner)
+                assert detail["machine_result"]["manifest"]["product"]["item_id"] == f"{row - 1:03d}"
+                assert detail["machine_result"]["model_call_status"] == "not_attempted"
+                assert all(not attribute["candidates"] for attribute in detail["machine_result"]["attributes"])
+                assert all(source["parsing"] == "cache" and source["parse_origin"] == "synthetic_fixture_not_service_analysis" for source in detail["provenance"])
+                machine_hashes[str(row)] = detail["machine_sha256"]
+                result_records[row] = store.read_bytes(f"results/{batch['id']}/row-{row}.json")
+            assert not store.keys("analysis-attempts/") and not store.keys("budgets/")
             try:
                 service.get(batch["id"], "other-owner")
             except Missing:
@@ -106,11 +153,13 @@ def verify(output):
             else:
                 raise AssertionError("Duplicate review accepted")
             run_batch(store, batch["id"], processor=lambda *_: (_ for _ in ()).throw(AssertionError("Completed work repeated")))
-            assert service.detail(batch["id"], "row-2", owner)["machine_sha256"] == first["machine_sha256"]
-            workbook = read_workbook(service.export(batch["id"], owner))
-            assert len(workbook["Results"]) == 2 and len(workbook["Reviews"]) == 1
-            assert all(not row["Proposed value"] for row in workbook["Results"])
-    print("PASS: synthetic Blob/cache fixture; no network or AI; continuation, deduplication, ownership and export. Hosted identity/restart acceptance remains unverified.")
+            service = BatchService(SQLiteStore(Path(temporary)))
+            for row, original in result_records.items():
+                assert service.store.read_bytes(f"results/{batch['id']}/row-{row}.json") == original
+            content = service.export(batch["id"], owner)
+            verify_export(content, batch["id"], owner, machine_hashes)
+    print("PASS: both synthetic products; no network/AI; durable continuation, deduplication, ownership, immutable results and workbook cells. Hosted acceptance remains unverified.")
+    return content, batch["id"], owner, machine_hashes
 
 
 if __name__ == "__main__":
