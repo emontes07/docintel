@@ -1,7 +1,4 @@
-name: Docker Image CI - Frontend
-
-# This workflow will build a Docker image and push it to Azure Container Registry
-# It is triggered on push or pull request to the main branch
+name: Validate Frontend
 
 on:
   push:
@@ -9,24 +6,32 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
-  build-frontend:
+  validate-frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Login to Azure Container Registry
-        uses: azure/docker-login@v1
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
-          login-server: aigbbemea.azurecr.io
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
-        with:
-          context: ./frontend
-          file: ./frontend/Dockerfile
-          push: true
-          tags: |
-            aigbbemea.azurecr.io/visionarylab-frontend:${{ github.run_number }}
-            aigbbemea.azurecr.io/visionarylab-frontend:latest
+          node-version: "22"
+      - name: Install committed dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: ./node_modules/.bin/eslint .
+      - name: Typecheck
+        run: ./node_modules/.bin/tsc --noEmit --incremental false
+      - name: Unit tests
+        run: node --test tests/*.test.mjs
+      - name: Production build
+        run: npm run build

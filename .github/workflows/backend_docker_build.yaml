@@ -1,7 +1,4 @@
-name: Docker Image CI - Backend
-
-# This workflow will build a Docker image and push it to Azure Container Registry
-# It is triggered on push or pull request to the main branch
+name: Validate Backend
 
 on:
   push:
@@ -9,24 +6,33 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
-  build-backend:
+  validate-backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DOCINTEL_BATCH_LIVE_ENABLED: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      UV_HTTP_RETRIES: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Login to Azure Container Registry
-        uses: azure/docker-login@v1
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          login-server: aigbbemea.azurecr.io
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
         with:
-          context: .
-          file: ./backend/Dockerfile
-          push: true
-          tags: |
-            aigbbemea.azurecr.io/visionarylab:${{ github.run_number }}
-            aigbbemea.azurecr.io/visionarylab:latest
+          version: "0.11.31"
+      - name: Install committed dependencies
+        run: uv sync --locked --python 3.13
+      - name: Offline regression
+        run: .venv/bin/python -m pytest -m 'not integration' -q
+      - name: Verify synthetic fixture
+        run: .venv/bin/python -m scripts.release_fixture --output "$RUNNER_TEMP/docintel-synthetic" --verify
+      - name: Compile manual job template
+        run: az bicep build --file infra/batch.bicep --stdout > /dev/null
