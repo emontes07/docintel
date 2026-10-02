@@ -27,8 +27,9 @@ validation, provenance, qualifications, and review application logic.
    calls, and does not manufacture attribute proposals. Live enrichment requires
   confirmation, the disabled-by-default server switch, exact approved pilot scope,
    and a separate expiring operator approval with durable budgets.
-4. The scheduled worker picks up queued batches. A slice processes at most 100
-   items with two threads, then exits. API status includes finished/unresolved/
+4. An operator starts the manual worker for one explicit synthetic batch. Acceptance
+  uses a one-item slice followed by continuation, at most two items/two threads
+  per execution, then exits. API status includes finished/unresolved/
    failed counts; item pages contain at most 100 rows (UI uses 50).
 5. Filter unresolved, failed, or pending-review products. Open an item for its exact
    input row, identifiers, source status, original proposals, citations, and human
@@ -113,8 +114,8 @@ ETags and per-item reservations fence competing workers. Completed work is skipp
 on restart; remaining items resume. An interrupted reservation without a result
 becomes `interrupted`, requiring operator investigation, not blind retry.
 
-Live processing remains constrained to the previously approved pilot identity,
-two qualified attributes, and exact approved PDF hash. Optional
+Live processing remains disabled for this milestone. Any later live processing
+requires separately approved private product identity, attributes and PDF hash. Optional
 `configuration/live-approval.json` requires UUID `id`, `approved_by`, timezone-aware
 `expires_at`, `analysis_limit` (0-1) and `inference_limit` (0-2). These are maximum
 remaining ceilings, not newly granted budgets. Do not create/rotate approvals to
@@ -139,7 +140,7 @@ did not repeat Azure inspection.
 - Older backend ready revision suffix: `--azd-1786594547`.
 - Older frontend ready revision suffix: `--azd-1786594614`.
 - Both active, healthy/running, single-revision mode, 100% traffic when inspected.
-- No Container Apps Job exists in this resource group. Current images do not
+- No Container Apps Job existed when inspected. Current images do not
   establish that the new batch/pilot code is deployed.
 - Auth configuration inspection returned no established platform enforcement.
   Hosted sign-in/consent/token exchange has NOT been accepted end to end.
@@ -153,14 +154,14 @@ not added or changed. The new worker receives no inherited backend AI permission
 
 The separate [infra/batch.bicep](infra/batch.bicep) compiled with no diagnostics and
 is NOT connected to `azd provision`. It targets approved existing storage, ACR,
-and Container Apps environment parameters. Always override its environment-specific
-default job name using the [canonical runbook](DEPLOYMENT.md#compile-and-activate-only-after-approval).
+and Container Apps environment parameters. Supply its required explicit job name
+using the [canonical runbook](DEPLOYMENT.md#compile-and-activate-only-after-approval).
 Proposed additions:
 
 | Addition | Exact Scope / Impact |
 | --- | --- |
 | Private Blob container | `<storage-account>/blobServices/default/containers/<batch-container>`; no public access |
-| Job | `<batch-job>`; same immutable backend image, finite module command, 1 vCPU/2 GiB, 600-second timeout, zero replica retries, every five minutes |
+| Job | `<batch-job>`; same immutable backend image, manual synthetic-only command, 1 vCPU/2 GiB, 600-second timeout, zero replica retries, one replica; no schedule |
 | User-assigned identity | `<batch-job>-identity`; attached only to job |
 | Blob Data Contributor | Job identity, only the new container; backend already has account-level access |
 | AcrPull | Job identity, only the approved existing registry |
@@ -172,10 +173,10 @@ Container Apps environment must be verified before approval. Retention, backup,
 operator write access and data classification for the container require approval.
 
 Consumption impact: Blob capacity/transactions and existing log ingestion grow.
-The schedule creates up to 288 short executions/day even when idle. A deliberately
-conservative timeout bound is 172,800 vCPU-seconds and 345,600 GiB-seconds/day
-(two scheduled executions can overlap); this is not expected idle usage. Apply
-current East US consumption rates/free grants to those quantities before approval.
+Each approved manual execution is bounded to 600 vCPU-seconds and 1,200 GiB-seconds;
+a one-item slice plus one continuation doubles those upper bounds. There is no
+scheduled idle execution. Image builds and registry storage are separate costs.
+Approve the number of executions, spending ceiling and retention before activation.
 There is no quoted price or new fixed database tier. AI cost is zero while disabled;
 future approved DI pages and model tokens are separately metered. Budget/alert and
 retention configuration are not silently provisioned.
@@ -199,8 +200,8 @@ public session JSON. Expired tokens require sign-in again; refresh-token rotatio
 is not implemented. Backend validates RS256 signature, issuer, audience, expiry,
 tenant, object ID, authorized client and delegated scope. `X-DocIntel-Local` is
 never hosted authorization. Batch ownership is uploader-only; cross-user sharing
-is not implemented. Existing unrelated legacy API routes retain their own behavior
-and require a separate access-control review before a whole-site production claim.
+is not implemented. Hosted legacy data routes are denied by the current
+backend/frontend boundary. Verify deployed enforcement before a whole-site claim.
 
 ## Deployment Mapping and Release Gates
 
@@ -232,7 +233,7 @@ resolution and a separately approved re-test remain external gates.
 
 Other acceptance gates: approved workbook mappings and source registry, actual
 private Blob ETag/lease/network tests, Entra sign-in and negative-token acceptance
-on Azure, worker scheduler/restart acceptance, resource/cost approval, clean lock,
+on Azure, manual worker continuation/restart acceptance, resource/cost approval, clean lock,
 and legacy surface security review. These are not substituted by local tests.
 
 ## Commands After Approval Only
@@ -257,9 +258,10 @@ Protected private baseline verification passed through a read-only SQLite
 connection: both original runs, their reviews, budgets, and all 12 recorded file
 hashes match. Browser acceptance used only temporary synthetic data and unverified
 development identity; hosted Entra/Blob acceptance remains blocked as listed above.
-An inherited tracked frontend `.env.local` remains unchanged and is excluded from
-both image contexts; review existing environment-file history separately before
-making a whole-repository secret-hygiene claim.
+The old test counts above are historical, not a fresh clean installation. The
+frontend local environment file was subsequently removed from tracking and remains
+excluded from image contexts. Inherited literal `dummy` values were resolved as
+placeholders; do not reopen that finding or merge excluded checkpoint history.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -m 'not integration' -q

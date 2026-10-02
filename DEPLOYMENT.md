@@ -34,8 +34,9 @@ working-tree lock edits are not proof of a reproducible release.
 Required maintainer tooling: approved Azure CLI and azd, Bicep compiler, image-build
 capability, and authorized resource/role administration. Use the narrowest approved
 permissions; do not prescribe blanket Owner access. No secret values belong in
-commands, docs, logs, screenshots, or Git. Existing tracked environment-file history
-needs a separate security review even though image contexts exclude env files.
+commands, docs, logs, screenshots, or Git. The local frontend environment file is
+no longer tracked; inherited literal `dummy` values were resolved as placeholders.
+Keep excluded checkpoint history out of the publication branch.
 
 SharePoint remains metadata 200 -> content 302 -> download 401. Do not add cookie,
 auth-forwarding, or local-file workarounds. A separately approved access correction
@@ -48,11 +49,12 @@ Approved workbook type/unit mappings and full source associations are also gates
 | --- | --- |
 | Bicep compilation | Validates template syntax/types locally; does not verify Azure permission, policy, quota, network, runtime or application behavior. |
 | Infrastructure provisioning | Creates/changes resources and grants. The separate batch template must be reviewed and authorized; it is not wired into azd provisioning. |
-| Backend deployment | Builds/deploys the API image; does not deploy or update the worker. |
-| Frontend deployment | Builds/deploys the portal image; does not prove Entra sign-in or API permission. |
-| Worker deployment/update | Explicit separate job operation with the same tested immutable backend image. Scheduling can start processing queued work. |
+| Local packaging | Isolated locked installation, offline tests and Next build; no image publication or Azure changes. |
+| Image build/publication | Separate approved ACR builds from reviewed source/context, producing immutable digests; no app deployment. |
+| Backend/frontend deployment | Applies approved digests and hosted settings; does not start the worker or prove hosted acceptance. |
+| Worker deployment/update | Explicit separate manual job operation with the same tested immutable backend image; no automatic processing. |
 | Local development | Loopback, explicit development identity, private SQLite; not hosted identity/persistence acceptance. |
-| Hosted acceptance | Authorized synthetic tests on the deployed revisions, including identity isolation, Blob conditional writes, scheduler and interruption recovery. |
+| Hosted acceptance | Authorized synthetic tests on the deployed revisions, including identity isolation, Blob conditional writes, manual continuation and interruption recovery. |
 
 ## Image And Entry-Point Mapping
 
@@ -62,7 +64,7 @@ Verified against [azure.yaml](azure.yaml):
 | --- | --- | --- |
 | `backend` | Project/context repository root; [backend/Dockerfile](backend/Dockerfile); ACR remote build; Python 3.13, uv 0.11.31, `uv sync --locked`. | `fastapi run backend/main.py --port 80 --host 0.0.0.0`; batch router `/api/v1/batches`. |
 | `frontend` | Project/context `frontend/`; [frontend/Dockerfile](frontend/Dockerfile); Node 22, `npm ci`, Next standalone build. | `node server.js`, port 3000. |
-| Worker | Same tested backend image; [job module](infra/modules/containerAppJob.bicep) overrides the HTTP command. | `/app/.venv/bin/python -m backend.batch_worker --concurrency 2 --max-batches 1 --item-limit 100`; exits after a finite slice. |
+| Worker | Same tested backend image; [job module](infra/modules/containerAppJob.bicep) overrides the HTTP command. | `/app/.venv/bin/python -m backend.batch_worker --concurrency 2 --max-batches 1 --item-limit 1 --synthetic-acceptance --batch-id <validated-id>`; one-item slice followed by continuation. |
 
 The alternate Dockerfiles under `docker/` and local Compose files are not selected
 by azd. A successful local Next build does not establish clean backend packaging.
@@ -117,74 +119,92 @@ Operator-managed `configuration/sources.json`, document bytes, and compatible pa
 caches reside in the private store. Their contract is in [BATCH.md](BATCH.md#storage-and-execution).
 `configuration/live-approval.json` is not an environment variable or portal form;
 do not create/rotate it to reset consumed budgets. General live-catalog processing
-is not enabled: exact prior pilot identity/attributes/hash remain enforced in code.
+is not enabled: any later live scope requires private identity/attributes/hash approval.
 
 ## Compile And Activate Only After Approval
 
-All shell examples run from the repository root. Set the named shell variables to
-approved environment values; no personal resource names or default job name should
-be assumed. Compiler output is discarded here; no resources are changed:
+Run from the clean publication checkout. `REVISION` is the full reviewed commit;
+`WORK` and `FIXTURE` are fresh private directories outside Git. `CFG` is an
+owner-only target JSON using [the example schema](scripts/release.example.json),
+containing approved resource identifiers and secret-reference names, never secrets.
+The job name is required explicitly. Commands below do not themselves grant approval.
+
+### Local Packaging And Tests
+
+Use an existing approved artifact-access environment with Python 3.13, uv 0.11.31,
+Node 22 and public PyPI/npm access. Do not retry a known failing artifact path
+without a concrete changed condition or inherit alternate-index overrides.
 
 ```sh
+python3.13 scripts/release.py stage --revision "$REVISION" --work "$WORK"
+python3.13 scripts/release.py package --work "$WORK" --package-access-approved
 az bicep build --file infra/batch.bicep --stdout > /dev/null
 ```
 
-After the clean-image, identity, network, cost and change approvals are complete,
-review a what-if against the intended subscription/group. `DOCINTEL_BACKEND_IMAGE`
-must identify the reviewed immutable image, not a mutable convenience tag.
+Packaging resolves the missing DI/direct PyJWT lock metadata, rejects unrelated
+version churn, then runs locked installation, focused backend tests, npm ci,
+lint/type checks, frontend tests and Next build. PyJWT already exists transitively.
+Review and commit only the required generated lock delta. Restage the final commit
+in a new private directory and repeat packaging. Run the full offline suite with
+that clean environment, then `python -m scripts.release_fixture --output "$FIXTURE"
+--verify`. This does not build an image or prove Azure authentication.
+
+### Image Build And Publication
+
+After explicit ACR build/publication and cost approval, use the final clean receipts:
 
 ```sh
-az deployment group what-if --subscription "$AZURE_SUBSCRIPTION_ID" \
-  --resource-group "$AZURE_RESOURCE_GROUP" --template-file infra/batch.bicep \
-  --parameters storageAccountName="$DOCINTEL_STORAGE_ACCOUNT" \
-  registryName="$DOCINTEL_REGISTRY" environmentName="$DOCINTEL_ENVIRONMENT" \
-  jobName="$DOCINTEL_JOB_NAME" containerName="$DOCINTEL_BATCH_CONTAINER" \
-  backendImage="$DOCINTEL_BACKEND_IMAGE"
+python3.13 scripts/release.py context --work "$WORK"
+python3.13 scripts/release.py publish --config "$CFG" --work "$WORK" --approve publish
 ```
 
-The template's compiled default job name is environment-specific; always override
-it as above. Approval covers a private container, job identity, two scoped grants,
-and a job scheduled every five minutes: 1 vCPU, 2 GiB, 600-second timeout, zero
-replica retries. At most 288 scheduled executions/day and possible overlap require
-cost and lease testing; see [cost qualifications](BATCH.md#approval-request).
+The tool builds the root/backend and frontend contexts separately in the approved
+registry, records immutable digests and requires the committed lock/source hashes
+to match clean checks. It never uses the inherited registry or mutable `latest`.
+Record those digests in the private target configuration before baseline capture.
 
-Capture previous image digests/revisions and settings before deployment. Confirm
-the selected azd environment matches the authorized subscription/group. These two
-commands deploy only their respective app; they do not activate the worker:
+### Provisioning And Deployment
+
+Verify Entra registrations, consent, secret references, private network access,
+retention and the rollback policy before mutation. Read-only checks and baseline
+capture precede a reviewed what-if; app deployment does not start the worker:
 
 ```sh
-azd deploy backend
-azd deploy frontend
+python3.13 scripts/release.py identity-check --config "$CFG" --work "$WORK"
+python3.13 scripts/release.py capture --config "$CFG" --work "$WORK"
+python3.13 scripts/release.py what-if --config "$CFG" --work "$WORK"
 ```
 
-Apply reviewed hosted settings/secret references through the approved process.
-Only with a reviewed immutable backend image available and no unauthorized queued
-work may the following provisioning step activate the scheduled worker:
+Only after approval of the exact what-if, seed writes and deployment:
 
 ```sh
-az deployment group create --subscription "$AZURE_SUBSCRIPTION_ID" \
-  --resource-group "$AZURE_RESOURCE_GROUP" --template-file infra/batch.bicep \
-  --parameters storageAccountName="$DOCINTEL_STORAGE_ACCOUNT" \
-  registryName="$DOCINTEL_REGISTRY" environmentName="$DOCINTEL_ENVIRONMENT" \
-  jobName="$DOCINTEL_JOB_NAME" containerName="$DOCINTEL_BATCH_CONTAINER" \
-  backendImage="$DOCINTEL_BACKEND_IMAGE"
+python3.13 scripts/release.py provision --config "$CFG" --work "$WORK" --approve provision
+python3.13 scripts/release.py seed --config "$CFG" --work "$WORK" --fixture "$FIXTURE" --approve seed
+python3.13 scripts/release.py deploy --config "$CFG" --work "$WORK" --approve deploy
 ```
 
-For a later approved worker-image update, update it explicitly, never assuming an
-API deployment changed the job:
+Provisioning creates a manual synthetic-only job, private container, job identity,
+container-scoped Blob Data Contributor and registry-scoped AcrPull. One replica,
+1 vCPU/2 GiB, 600-second timeout, zero retries; no schedule/event trigger or AI grants.
+Seeding refuses nonempty storage. Deployment checks intended healthy image revisions.
+Stop on drift or failure; inspect partial state rather than blindly repeating writes.
+
+### Hosted Acceptance
+
+Use the synthetic fixture and signed-in browser helpers in
+[the acceptance module](frontend/tests/batch-hosted.acceptance.mjs). Submit once in
+`evidence_only` mode with live AI false. After explicit execution approval:
 
 ```sh
-az containerapp job update --subscription "$AZURE_SUBSCRIPTION_ID" \
-  --resource-group "$AZURE_RESOURCE_GROUP" --name "$DOCINTEL_JOB_NAME" \
-  --image "$DOCINTEL_BACKEND_IMAGE"
+python3.13 scripts/release.py start --config "$CFG" --work "$WORK" --batch-id "$BATCH_ID" --item-limit 1 --approve start
 ```
 
-Dedicated DI account creation/role grants are **not** part of this activation.
-Reuse only an approved dedicated account; a new one needs separate geography/SKU,
-cost, identity, and resource-scoped permission review. Keep local/key auth disabled.
-Cognitive Services User is broader than analysis-only access; Data Reader alone
-does not grant analysis submission. Do not modify Foundry or broaden grants to
-work around denial. Local byte-input pilot constraints remain in [PILOT.md](PILOT.md).
+Observe completion and queued remainder before the second identical one-item command.
+Record both executions and stable first-product results. Never start concurrently or
+resubmit a batch to bypass interrupted work. The template omits a batch ID so an
+unconfigured start exits before storage access. Cached synthetic evidence may yield
+no candidates; test rejection without claiming an unexercised candidate approval.
+DI, model calls, customer inputs and SharePoint retries remain out of scope.
 
 ## Local Batch Development
 
@@ -233,7 +253,7 @@ These are required future checks, not completed work:
 2. Verify private Blob network access, no public access, conditional writes, leases,
    source hashes, cache integrity and durability across replica replacement.
 3. Use a synthetic no-AI batch to exercise validation, idempotent submission,
-   scheduled execution, slice continuation, concurrent fencing and interruption
+  manual execution, slice continuation, concurrent fencing and interruption
    recovery. Verify no duplicated calls or writes before testing any live scope.
 4. Check evidence, qualifications, approval/correction/rejection and qualified
    export against immutable results. Complete desktop/mobile, cold/warm and failure
@@ -249,29 +269,20 @@ repeat paid calls, or change customer decisions to satisfy an acceptance check.
 
 ## Rollback And Maintenance
 
-Only after separate authorization: inspect active executions, stop each by name,
-and disable/remove the new schedule before rolling back app images. Retain private
-inputs/results/reviews/budgets; do not reset usage or delete data to force a retry.
-No blanket cleanup is appropriate. The commands below remove only the specifically
-approved new job, not the store or pre-existing resources:
+After separate authorization, use the captured baseline and guarded rollback:
 
 ```sh
-az containerapp job execution list --subscription "$AZURE_SUBSCRIPTION_ID" \
-  --resource-group "$AZURE_RESOURCE_GROUP" --name "$DOCINTEL_JOB_NAME"
-az containerapp job stop --subscription "$AZURE_SUBSCRIPTION_ID" \
-  --resource-group "$AZURE_RESOURCE_GROUP" --name "$DOCINTEL_JOB_NAME" \
-  --job-execution-name "$DOCINTEL_EXECUTION_NAME"
-az containerapp job delete --subscription "$AZURE_SUBSCRIPTION_ID" \
-  --resource-group "$AZURE_RESOURCE_GROUP" --name "$DOCINTEL_JOB_NAME" --yes
-az containerapp update --subscription "$AZURE_SUBSCRIPTION_ID" \
-  --resource-group "$AZURE_RESOURCE_GROUP" --name "$DOCINTEL_BACKEND_APP" \
-  --image "$DOCINTEL_PREVIOUS_BACKEND_IMAGE"
-az containerapp update --subscription "$AZURE_SUBSCRIPTION_ID" \
-  --resource-group "$AZURE_RESOURCE_GROUP" --name "$DOCINTEL_FRONTEND_APP" \
-  --image "$DOCINTEL_PREVIOUS_FRONTEND_IMAGE"
+python3.13 scripts/release.py stop --config "$CFG" --work "$WORK" --approve stop
+python3.13 scripts/release.py rollback --config "$CFG" --work "$WORK" --approve rollback
 ```
 
-Review removal of new identity/grants separately; preserve pre-existing roles.
+Rollback stops active executions and restores pinned images and exact environment/
+secret-reference settings. It retains the job, identity, roles, container, inputs,
+results, reviews and budgets. It refuses unrelated configuration drift.
+An unauthenticated legacy baseline cannot be restored publicly. Either establish a
+verified secure baseline or explicitly approve `--isolate-legacy-baseline`, which
+disables ingress before restoring old images and causes an outage. Never silently
+authorize isolation, delete nonempty storage, or reset evidence to force a retry.
 Sanitize logs before sharing; do not export signed URLs, bearer tokens, account
 labels, document content, or secrets. No deployment, provisioning, rollback, grants,
 AI calls, customer processing, package installation, or push was performed to

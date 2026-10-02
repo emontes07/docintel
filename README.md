@@ -35,7 +35,7 @@ threads per slice. History/filter scans are not an indexed enterprise queue.
 ## Where It Runs
 
 The intended experience is an Azure-hosted Next.js portal and FastAPI backend,
-Entra sign-in, private Blob batch state, and a scheduled Container Apps Job.
+Entra sign-in, private Blob batch state, and a manually started Container Apps Job.
 Document Intelligence parsing and Azure OpenAI structured extraction are distinct
 service calls, not a Foundry agent. Live work remains disabled by default and
 restricted to a previously approved pilot scope, not arbitrary catalog products.
@@ -50,7 +50,7 @@ local authentication controls do **not** secure hosted use.
 | Validation, leases, replay safety | Offline tests; no duplicate batch/review writes in the focused regression. |
 | Desktop/mobile browser workflow | Initial attempts 1-3 failed on an automation sandbox defect; corrected attempts 4-6 passed consecutively on warm servers. Two earlier user Retry incidents remain uncorrelated. No cold-start or real-device acceptance claim. |
 | Azure frontend/backend | Last inspection found healthy **older revisions**, not deployment of this batch increment. No job existed in the inspected group. |
-| Hosted identity, Blob leases, scheduler | Implementation/template present; Azure end-to-end acceptance still blocked. |
+| Hosted identity, Blob leases, manual worker | Implementation/template present; Azure end-to-end acceptance still blocked. |
 | AI and document sources | Prior bounded parsing/inference observations and two synthetic model cases are not catalog accuracy evidence. SharePoint retained metadata 200, content 302, download 401; no active fallback. |
 | Clean installation and release | Blocked on a reconciled, approved dependency lock and clean-image verification. Unrelated working lock edits do not establish reproducibility. |
 
@@ -72,6 +72,7 @@ DocIntel is derived from Microsoft's
 template; its inherited gallery/media, infrastructure, and configuration surfaces
 are not all part of the batch workflow. Preserve the Microsoft notice and terms
 in [LICENSE.md](LICENSE.md). Legacy routes require a separate security review.
-The inherited tracked frontend environment file is unchanged and excluded from
-image contexts; repository-history secret review remains a gate, not a completed
-whole-repository hygiene claim.
+The local frontend environment file is no longer tracked and is excluded from
+image contexts. Inherited literal `dummy` values were resolved as placeholders,
+not exposed credentials. The clean publication branch excludes the unpublished
+development history; never merge the checkpoint branch into it.
