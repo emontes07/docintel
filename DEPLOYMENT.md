@@ -161,6 +161,9 @@ python3.13 scripts/release.py publish --config "$CFG" --work "$WORK" --approve p
 The tool builds the root/backend and frontend contexts separately in the approved
 registry, records immutable digests and requires the committed lock/source hashes
 to match clean checks. It never uses the inherited registry or mutable `latest`.
+Each ACR build has a 900-second timeout. Absolute Dockerfile paths point into the
+verified context; only successful builds produce digest/run-ID receipts. A failure
+stops publication without automatically repeating either build.
 Record those digests in the private target configuration before baseline capture.
 
 ### Provisioning And Deployment
@@ -188,6 +191,20 @@ container-scoped Blob Data Contributor and registry-scoped AcrPull. One replica,
 1 vCPU/2 GiB, 600-second timeout, zero retries; no schedule/event trigger or AI grants.
 Seeding refuses nonempty storage. Deployment checks intended healthy image revisions.
 Stop on drift or failure; inspect partial state rather than blindly repeating writes.
+
+If the operator cannot reach private Blob storage, deploy the authenticated backend
+first, then seed through its existing managed identity instead of granting the
+operator data access or opening the storage firewall:
+
+```sh
+python3.13 scripts/release.py deploy --config "$CFG" --work "$WORK" --approve deploy
+python3.13 scripts/release.py seed --config "$CFG" --work "$WORK" --fixture "$FIXTURE" --seed-via-backend --approve seed
+```
+
+This path requires the ready backend to use the published immutable image, hosted
+mode and live AI false. It verifies the same three synthetic seed files, refuses a
+nonempty container, uploads without overwrite and verifies the stored bytes. No
+worker starts. A missing success receipt requires inspection, not a blind retry.
 
 ### Hosted Acceptance
 

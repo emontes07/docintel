@@ -1,4 +1,5 @@
 import importlib.util
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -100,6 +101,114 @@ def test_packaging_requires_new_access_evidence_before_any_command(tmp_path, mon
     monkeypatch.setattr(release, "command", lambda *args, **kwargs: pytest.fail("Download attempted"))
     with pytest.raises(ValueError, match="approved runner"):
         release.package(tmp_path, False)
+
+
+@pytest.mark.parametrize("build_status", ["Succeeded", "Failed"])
+def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_path, monkeypatch, build_status):
+    from argparse import Namespace
+    config = {"registry": "synthetic", "subscription": "subscription"}
+    source = {"revision": "a" * 40, "files": {}}
+    for relative in ("backend/Dockerfile", "frontend/Dockerfile"):
+        path = tmp_path / "context" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("FROM synthetic")
+        source["files"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    release.save(tmp_path / "source.json", source)
+    release.save(tmp_path / "context.json", source["files"])
+    release.save(tmp_path / "clean-checks.json", {"revision": source["revision"], "lock_sha256": hashlib.sha256(b"lock").hexdigest()})
+    monkeypatch.setattr(release, "load_config", lambda _: config)
+    monkeypatch.setattr(release, "verify_source", lambda _: source)
+    monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
+    monkeypatch.setattr(release, "command", lambda *args, **kwargs: b"lock")
+    builds = []
+    def azure(*args):
+        if args[:2] == ("acr", "build"):
+            builds.append(args)
+            return {"status": build_status, "runId": "run-" + str(len(builds))}
+        return {"digest": "sha256:" + "b" * 64}
+    monkeypatch.setattr(release, "azure", azure)
+    options = Namespace(action="publish", work=tmp_path, config=None, approve="publish")
+    if build_status == "Failed":
+        with pytest.raises(ValueError, match="did not succeed"):
+            release.run(options)
+        assert len(builds) == 1
+        assert not (tmp_path / "images.json").exists()
+    else:
+        release.run(options)
+        assert len(builds) == 2
+        assert json.loads((tmp_path / "images.json").read_text())["frontend_run_id"] == "run-2"
+    for arguments in builds:
+        dockerfile = Path(arguments[arguments.index("--file") + 1])
+        assert dockerfile.is_absolute() and dockerfile.is_file()
+        assert dockerfile.is_relative_to(Path(arguments[-1]))
+        assert arguments[arguments.index("--timeout") + 1] == "900"
+
+
+@pytest.mark.parametrize("nonempty", [False, True])
+def test_private_seed_checks_environment_empty_container_and_hashes(monkeypatch, nonempty):
+    from types import SimpleNamespace
+    import azure.identity
+    import azure.storage.blob
+    content = b"synthetic"
+    payload = {name: {"content": base64.b64encode(content).decode(), "sha256": hashlib.sha256(content).hexdigest()} for name in ("documents/release-synthetic.pdf", "configuration/sources.json", "parses/" + "a" * 64 + ".json")}
+    blobs = {"existing": b"retained"} if nonempty else {}
+    writes = []
+    class Container:
+        def list_blobs(self):
+            return [SimpleNamespace(name=name) for name in blobs]
+        def upload_blob(self, name, value, overwrite):
+            assert overwrite is False and name not in blobs
+            writes.append(name)
+            blobs[name] = value
+        def download_blob(self, name):
+            return SimpleNamespace(readall=lambda: blobs[name])
+    monkeypatch.setattr(azure.identity, "ManagedIdentityCredential", lambda: "managed")
+    monkeypatch.setattr(azure.storage.blob, "BlobServiceClient", lambda *args, **kwargs: SimpleNamespace(get_container_client=lambda _: Container()))
+    monkeypatch.setenv("DOCINTEL_BATCH_MODE", "hosted")
+    monkeypatch.setenv("DOCINTEL_BATCH_LIVE_ENABLED", "false")
+    monkeypatch.setenv("DOCINTEL_BATCH_STORAGE_URL", "https://synthetic.blob.core.windows.net")
+    monkeypatch.setenv("DOCINTEL_BATCH_CONTAINER", "batches")
+    code = release.remote_seed_code({"storage": "synthetic", "container": "batches"}, payload)
+    if nonempty:
+        with pytest.raises(AssertionError, match="nonempty"):
+            exec(code, {})
+        assert not writes
+    else:
+        exec(code, {})
+        assert len(writes) == 3
+    monkeypatch.setenv("DOCINTEL_BATCH_LIVE_ENABLED", "true")
+    with pytest.raises(AssertionError):
+        exec(code, {})
+
+
+def test_private_seed_requires_explicit_remote_confirmation(tmp_path, monkeypatch):
+    config = {"backend": "backend", "backend_image": "synthetic.azurecr.io/docintel/backend@sha256:" + "a" * 64, "registry": "synthetic", "storage": "synthetic", "container": "batches", "subscription": "subscription", "group": "group"}
+    resource = {"properties": {"provisioningState": "Succeeded", "latestRevisionName": "ready", "latestReadyRevisionName": "ready", "template": {"containers": [{"image": config["backend_image"]}]}}}
+    monkeypatch.setattr(release, "app", lambda *args: resource)
+    fixture = tmp_path / "fixture"
+    files = {}
+    for name in ("documents/release-synthetic.pdf", "configuration/sources.json", "parses/" + "a" * 64 + ".json"):
+        path = fixture / "seed" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic")
+        files["seed/" + name] = hashlib.sha256(b"synthetic").hexdigest()
+    monkeypatch.setattr(release, "command", lambda *args, **kwargs: b"remote process failed but CLI exited zero")
+    with pytest.raises(ValueError, match="did not confirm"):
+        release.seed_via_backend(config, fixture, files, tmp_path)
+    assert not (tmp_path / "seed.json").exists()
+    def command(arguments):
+        assert arguments[arguments.index("--revision") + 1] == "ready"
+        remote = arguments[-1].split(" -c ", 1)[1]
+        encoded = remote.split("b64decode('", 1)[1].split("'", 1)[0]
+        code = base64.b64decode(encoded).decode()
+        marker = code.split("print('", 1)[1].split("'", 1)[0]
+        return (marker + "\r\n").encode()
+    monkeypatch.setattr(release, "command", command)
+    release.seed_via_backend(config, fixture, files, tmp_path)
+    assert len(json.loads((tmp_path / "seed.json").read_text())["files"]) == 3
+    resource["properties"]["template"]["containers"][0]["image"] = "wrong"
+    with pytest.raises(ValueError, match="differs"):
+        release.seed_via_backend(config, fixture, files, tmp_path)
 
 
 def test_rollback_restores_configuration_without_deleting_resources(tmp_path, monkeypatch):

@@ -1,6 +1,7 @@
 """Guarded release operations; private target configuration stays outside Git."""
 
 import argparse
+import base64
 import copy
 import hashlib
 import io
@@ -253,6 +254,47 @@ def require_release_images(config, work):
         require(receipt[kind] == image(config, kind), "Configured digest differs from the release publication receipt")
 
 
+def remote_seed_code(config, payload):
+    encoded = base64.b64encode(json.dumps(payload, sort_keys=True).encode()).decode()
+    url = f"https://{config['storage']}.blob.core.windows.net"
+    marker = "DOCINTEL_SYNTHETIC_SEED_OK:" + fingerprint(payload)
+    return f'''import base64, hashlib, json, os
+from azure.identity import ManagedIdentityCredential
+from azure.storage.blob import BlobServiceClient
+assert os.environ.get("DOCINTEL_BATCH_MODE") == "hosted"
+assert os.environ.get("DOCINTEL_BATCH_LIVE_ENABLED") == "false"
+assert os.environ.get("DOCINTEL_BATCH_STORAGE_URL") == {url!r}
+assert os.environ.get("DOCINTEL_BATCH_CONTAINER") == {config['container']!r}
+payload = json.loads(base64.b64decode({encoded!r}))
+content = {{name: base64.b64decode(entry["content"], validate=True) for name, entry in payload.items()}}
+assert len(content) == 3
+assert all(hashlib.sha256(value).hexdigest() == payload[name]["sha256"] for name, value in content.items())
+client = BlobServiceClient({url!r}, credential=ManagedIdentityCredential(), retry_total=0, connection_timeout=10, read_timeout=30)
+container = client.get_container_client({config['container']!r})
+assert next(iter(container.list_blobs()), None) is None, "Refusing a nonempty seed container"
+for name, value in content.items():
+    container.upload_blob(name, value, overwrite=False)
+assert {{blob.name for blob in container.list_blobs()}} == set(content)
+for name, value in content.items():
+    assert container.download_blob(name).readall() == value
+print({marker!r})
+'''
+
+
+def seed_via_backend(config, fixture, files, work):
+    backend = app(config, config["backend"])
+    properties = backend["properties"]
+    require(properties["provisioningState"] == "Succeeded" and properties["latestRevisionName"] == properties["latestReadyRevisionName"], "Backend must be ready before private seeding")
+    require([container["image"] for container in safe_containers(backend)] == [image(config, "backend")], "Seed backend differs from published release")
+    payload = {name.removeprefix("seed/"): {"sha256": digest, "content": base64.b64encode((fixture / name).read_bytes()).decode()} for name, digest in files.items() if name.startswith("seed/")}
+    require(sum(len(entry["content"]) for entry in payload.values()) <= 16384, "Synthetic seed exceeds remote execution bound")
+    encoded = base64.b64encode(remote_seed_code(config, payload).encode()).decode()
+    output = command(["az", "containerapp", "exec", "--subscription", config["subscription"], "-g", config["group"], "-n", config["backend"], "--revision", properties["latestReadyRevisionName"], "--command", f"/app/.venv/bin/python -c exec(__import__('base64').b64decode('{encoded}'))"])
+    marker = "DOCINTEL_SYNTHETIC_SEED_OK:" + fingerprint(payload)
+    require(marker in output.decode().splitlines(), "Private seed did not confirm all hashes; inspect partial state, never blindly retry")
+    save(work / "seed.json", {"backend_image": image(config, "backend"), "revision": properties["latestReadyRevisionName"], "files": {name: entry["sha256"] for name, entry in payload.items()}})
+
+
 def run(options):
     work = private_path(options.work)
     if options.action == "stage":
@@ -303,11 +345,13 @@ def run(options):
         published = {"revision": source["revision"]}
         for kind in ("backend", "frontend"):
             context = work / "context" if kind == "backend" else work / "context/frontend"
-            dockerfile = "backend/Dockerfile" if kind == "backend" else "Dockerfile"
+            dockerfile = context / ("backend/Dockerfile" if kind == "backend" else "Dockerfile")
             tag = f"docintel/{kind}:{source['revision']}"
-            azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--no-logs", "--file", dockerfile, "--image", tag, str(context))
+            result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--timeout", "900", "--no-logs", "--file", str(dockerfile), "--image", tag, str(context))
+            require(result.get("status") == "Succeeded", "ACR build did not succeed; inspect the run before another attempt")
             digest = azure("acr", "repository", "show", "--name", config["registry"], "--image", tag)["digest"]
             published[kind] = config["registry"] + f".azurecr.io/docintel/{kind}@" + digest
+            published[kind + "_run_id"] = result["runId"]
             save(work / "publication-progress.json", published)
         save(work / "images.json", published)
     elif options.action in {"what-if", "provision"}:
@@ -326,6 +370,9 @@ def run(options):
         require(files == hashes, "Synthetic fixture hash mismatch or unexpected files")
         seed_files = {name.removeprefix("seed/") for name in files if name.startswith("seed/")}
         require(len(seed_files) == 3 and {"documents/release-synthetic.pdf", "configuration/sources.json"} <= seed_files and sum(bool(re.fullmatch(r"parses/[a-f0-9]{64}\.json", name)) for name in seed_files) == 1, "Unexpected synthetic seed layout")
+        if options.seed_via_backend:
+            seed_via_backend(config, fixture, files, work)
+            return
         existing = azure("storage", "blob", "list", "--account-name", config["storage"], "--container-name", config["container"], "--auth-mode", "login")
         require(not existing, "Refusing to overwrite a nonempty container; inspect partial seeding or existing data")
         azure("storage", "blob", "upload-batch", "--account-name", config["storage"], "--destination", config["container"], "--source", str(fixture / "seed"), "--auth-mode", "login", "--overwrite", "false")
@@ -401,6 +448,7 @@ def main():
     parser.add_argument("--approve", choices=sorted(OPERATIONS))
     parser.add_argument("--batch-id")
     parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--seed-via-backend", action="store_true", help="Seed only the verified synthetic fixture through the ready published backend managed identity; no public storage access or operator data grant")
     parser.add_argument("--item-limit", type=int, default=2)
     parser.add_argument("--isolate-legacy-baseline", action="store_true", help="Explicitly approve ingress isolation before restoring an unauthenticated legacy image; this causes an outage")
     options = parser.parse_args()
