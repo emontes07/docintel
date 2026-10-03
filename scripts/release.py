@@ -189,7 +189,8 @@ def stage(revision, work):
     with tarfile.open(fileobj=io.BytesIO(archive)) as contents:
         contents.extractall(source, filter="data")
     for path in source.rglob("*"):
-        path.chmod(0o700 if path.is_dir() or path.stat().st_mode & 0o111 else 0o600)
+        if not path.is_symlink():
+            path.chmod(0o700 if path.is_dir() or path.stat().st_mode & 0o111 else 0o600)
     require(not list(source.rglob(".env.local")), "Source commit still tracks a local environment file")
     files = {str(path.relative_to(source)): hashlib.sha256(path.read_bytes()).hexdigest() for path in source.rglob("*") if path.is_file()}
     save(work / "source.json", {"revision": revision, "files": files})

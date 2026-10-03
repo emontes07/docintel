@@ -176,6 +176,26 @@ def test_context_excludes_private_material_and_environments(tmp_path):
     assert paths == {"backend/main.py", "frontend/package.json", "pyproject.toml", "uv.lock", ".dockerignore"}
 
 
+def test_stage_protects_files_without_following_dangling_tool_links(tmp_path, monkeypatch):
+    import io
+    import tarfile
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as contents:
+        file = tarfile.TarInfo("application.txt")
+        file.mode = 0o644
+        file.size = len(b"synthetic")
+        contents.addfile(file, io.BytesIO(b"synthetic"))
+        link = tarfile.TarInfo("tool-link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "absent-tool"
+        contents.addfile(link)
+    monkeypatch.setattr(release, "command", lambda *args, **kwargs: archive.getvalue())
+    release.stage("a" * 40, tmp_path)
+    assert (tmp_path / "source/tool-link").is_symlink()
+    assert (tmp_path / "source/application.txt").stat().st_mode & 0o777 == 0o600
+    assert set(json.loads((tmp_path / "source.json").read_text())["files"]) == {"application.txt"}
+
+
 def test_restrictive_context_preserves_private_permissions(tmp_path):
     source = tmp_path / "source"
     for relative in ("backend/main.py", "frontend/public/mock-gens/synthetic.txt", "frontend/Dockerfile", "pyproject.toml", "uv.lock", ".dockerignore"):
