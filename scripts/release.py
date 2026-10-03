@@ -17,7 +17,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"Succeeded", "Failed", "Stopped"}
-OPERATIONS = {"provision", "publish", "seed", "deploy", "start", "stop", "rollback"}
+OPERATIONS = {"provision", "publish", "publish-frontend", "seed", "deploy", "start", "stop", "rollback"}
 
 
 def require(condition, message):
@@ -188,6 +188,9 @@ def stage(revision, work):
     source.mkdir(parents=True, mode=0o700)
     with tarfile.open(fileobj=io.BytesIO(archive)) as contents:
         contents.extractall(source, filter="data")
+    for path in source.rglob("*"):
+        if not path.is_symlink():
+            path.chmod(0o700 if path.is_dir() or path.stat().st_mode & 0o111 else 0o600)
     require(not list(source.rglob(".env.local")), "Source commit still tracks a local environment file")
     files = {str(path.relative_to(source)): hashlib.sha256(path.read_bytes()).hexdigest() for path in source.rglob("*") if path.is_file()}
     save(work / "source.json", {"revision": revision, "files": files})
@@ -224,6 +227,7 @@ def build_context(work):
             path.unlink()
     inventory = {str(path.relative_to(target)): hashlib.sha256(path.read_bytes()).hexdigest() for path in target.rglob("*") if path.is_file()}
     save(work / "context.json", inventory)
+    save(work / "context-modes.json", {str(path.relative_to(target)): path.stat().st_mode & 0o777 for path in target.rglob("*")})
     return target
 
 
@@ -265,8 +269,48 @@ def require_release_images(config, work):
     receipt = json.loads((work / "images.json").read_text())
     source = json.loads((work / "source.json").read_text())
     require(receipt["revision"] == source["revision"], "Published source mismatch")
+    if "preserved_backend" in receipt:
+        previous = private_path(receipt["preserved_backend"]["work"])
+        previous_source = verify_source(previous)
+        previous_images = json.loads((previous / "images.json").read_text())
+        require(previous_images["revision"] == previous_source["revision"], "Preserved backend source mismatch")
+        require(fingerprint(previous_images) == receipt["preserved_backend"]["receipt_sha256"], "Preserved publication receipt changed")
+        require(previous_images["backend"] == receipt["backend"], "Preserved backend digest mismatch")
     for kind in ("backend", "frontend"):
         require(receipt[kind] == image(config, kind), "Configured digest differs from the release publication receipt")
+
+
+def publish_frontend(config, work, previous_work):
+    source = verify_source(work)
+    previous = private_path(previous_work)
+    previous_source = verify_source(previous)
+    previous_images = json.loads((previous / "images.json").read_text())
+    require(previous_images["revision"] == previous_source["revision"], "Preserved backend source mismatch")
+    require(previous_images["backend"] == image(config, "backend"), "Backend must retain its original published digest")
+    protected = lambda name: name.startswith("backend/") or name in {"pyproject.toml", "uv.lock"}
+    require({name: digest for name, digest in source["files"].items() if protected(name)} == {name: digest for name, digest in previous_source["files"].items() if protected(name)}, "Frontend repair changed backend source or dependencies")
+    checks = json.loads((work / "clean-checks.json").read_text())
+    smoke = json.loads((work / "frontend-smoke.json").read_text())
+    inventory = json.loads((work / "context.json").read_text())
+    modes = json.loads((work / "context-modes.json").read_text())
+    context = work / "context"
+    require(inventory == {str(path.relative_to(context)): hashlib.sha256(path.read_bytes()).hexdigest() for path in context.rglob("*") if path.is_file()}, "Build context drift")
+    require(modes == {str(path.relative_to(context)): path.stat().st_mode & 0o777 for path in context.rglob("*")}, "Build context permission drift")
+    require(all(source["files"].get(name) == digest for name, digest in inventory.items()), "Context differs from reviewed source")
+    require(checks["revision"] == smoke["revision"] == source["revision"], "Validation source mismatch")
+    require(checks["lock_sha256"] == hashlib.sha256(command(["git", "show", source["revision"] + ":uv.lock"], cwd=ROOT)).hexdigest(), "Committed lock mismatch")
+    require(smoke["passed"] is True and smoke["context_sha256"] == fingerprint(inventory) and smoke["modes_sha256"] == fingerprint(modes), "Frontend startup/context validation required")
+    attempt = work / "frontend-publication-attempt.json"
+    require(not attempt.exists() and not (work / "images.json").exists(), "Frontend publication already attempted; no automatic retry")
+    save(attempt, {"revision": source["revision"], "timeout_seconds": 900, "status": "attempted"})
+    tag = "docintel/frontend:" + source["revision"]
+    result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--timeout", "900", "--no-logs", "--file", str(context / "frontend/Dockerfile"), "--image", tag, str(context / "frontend"))
+    save(work / "frontend-publication-result.json", {name: result.get(name) for name in ("runId", "status", "startTime", "finishTime")})
+    require(result.get("status") == "Succeeded", "Frontend ACR build failed; no automatic retry")
+    digest = azure("acr", "repository", "show", "--name", config["registry"], "--image", tag)["digest"]
+    published = {"revision": source["revision"], "frontend": config["registry"] + ".azurecr.io/docintel/frontend@" + digest, "frontend_run_id": result["runId"], "backend": previous_images["backend"], "preserved_backend": {"work": str(previous), "revision": previous_source["revision"], "receipt_sha256": fingerprint(previous_images)}, "tool_revision": command(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
+    image({**config, "frontend_image": published["frontend"]}, "frontend")
+    save(work / "images.json", published)
 
 
 def remote_seed_code(config, payload):
@@ -332,6 +376,8 @@ def run(options):
         require_release_images(config, work)
     if options.action == "identity-check":
         identity_contract(config)
+    elif options.action == "publish-frontend":
+        publish_frontend(config, work, options.previous_work)
     elif options.action == "capture":
         require(not (work / "baseline.json").exists(), "Refusing to replace rollback baseline")
         baseline = {kind: {"containers": safe_containers(app(config, config[kind]))} for kind in ("backend", "frontend")}
@@ -455,7 +501,8 @@ def run(options):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["plan", "stage", "package", "context", "identity-check", "capture", "publish", "what-if", "provision", "seed", "deploy", "start", "stop", "rollback"])
+    parser.add_argument("action", choices=["plan", "stage", "package", "context", "identity-check", "capture", "publish", "publish-frontend", "what-if", "provision", "seed", "deploy", "start", "stop", "rollback"])
+    parser.add_argument("--previous-work", type=Path)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--revision")
