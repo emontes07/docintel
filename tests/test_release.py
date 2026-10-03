@@ -123,6 +123,37 @@ def test_console_transport_handles_long_code_and_remote_error():
         release.console_code([sys.executable, "-q"], "raise ValueError('synthetic failure')", marker, timeout=2)
 
 
+@pytest.mark.parametrize("executions", [[], [{"name": "already-used"}]])
+def test_worker_image_patch_preserves_configuration_and_never_starts(tmp_path, monkeypatch, executions):
+    config = {"subscription": "synthetic", "group": "synthetic", "job": "worker", "registry": "synthetic", "backend_image": "synthetic.azurecr.io/docintel/backend@sha256:" + "a" * 64}
+    job = {"id": "/subscriptions/synthetic/resourceGroups/synthetic/providers/Microsoft.App/jobs/worker", "identity": {"type": "UserAssigned"}, "properties": {"configuration": {"triggerType": "Manual", "replicaTimeout": 600, "replicaRetryLimit": 0, "registries": [{"server": "synthetic.azurecr.io", "identity": "preserved"}], "manualTriggerConfig": {"parallelism": 1, "replicaCompletionCount": 1}}, "template": {"containers": [{"name": "worker", "image": "old", "command": ["python"], "args": ["-m", "backend.batch_worker"], "env": [{"name": "DOCINTEL_BATCH_LIVE_ENABLED", "value": "false"}], "resources": {"cpu": 1, "memory": "2Gi"}}]}}}
+    release.save(tmp_path / "worker-baseline.json", {"target": release.fingerprint(config), "resource": job})
+    before = copy.deepcopy(job)
+    calls = []
+    def azure(*arguments):
+        calls.append(arguments)
+        if arguments[:3] == ("containerapp", "job", "show"):
+            return job
+        if arguments[:4] == ("containerapp", "job", "execution", "list"):
+            return executions
+        assert arguments[:3] == ("rest", "--method", "PATCH")
+    monkeypatch.setattr(release, "azure", azure)
+    if executions:
+        with pytest.raises(ValueError, match="unused"):
+            release.update_worker_image(config, tmp_path)
+        assert not (tmp_path / "worker-image-patch.json").exists()
+    else:
+        release.update_worker_image(config, tmp_path)
+        expected = copy.deepcopy(job["properties"]["template"]["containers"])
+        expected[0]["image"] = config["backend_image"]
+        assert json.loads((tmp_path / "worker-image-patch.json").read_text()) == {"properties": {"template": {"containers": expected}}}
+        with pytest.raises(ValueError, match="already attempted"):
+            release.update_worker_image(config, tmp_path)
+        assert sum(arguments[0] == "rest" for arguments in calls) == 1
+    assert job == before
+    assert not any("start" in arguments for arguments in calls)
+
+
 def test_literal_secrets_are_never_captured():
     resource = {"properties": {"template": {"containers": [{"env": [{"name": "AUTH_SECRET", "value": "synthetic-private"}]}]}}}
     with pytest.raises(ValueError, match="secret reference"):
@@ -224,24 +255,26 @@ def test_restrictive_context_preserves_private_permissions(tmp_path):
 
 
 @pytest.mark.parametrize("defect", [None, "smoke", "mode", "backend", "failed_build"])
-def test_frontend_only_publication_preserves_backend_and_refuses_retry(tmp_path, monkeypatch, defect):
+@pytest.mark.parametrize("kind", ["frontend", "backend"])
+def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path, monkeypatch, defect, kind):
+    retained = "frontend" if kind == "backend" else "backend"
     previous = tmp_path / "previous"
     work = tmp_path / "replacement"
-    config = {"registry": "synthetic", "subscription": "synthetic", "backend_image": "synthetic.azurecr.io/docintel/backend@sha256:" + "b" * 64}
-    previous_images = {"revision": "b" * 40, "backend": config["backend_image"]}
+    config = {"registry": "synthetic", "subscription": "synthetic", retained + "_image": "synthetic.azurecr.io/docintel/" + retained + "@sha256:" + "b" * 64}
+    previous_images = {"revision": "b" * 40, retained: config[retained + "_image"]}
     release.save(previous / "source.json", {"revision": "b" * 40, "files": {}})
     release.save(previous / "images.json", previous_images)
     context = work / "context"
-    (context / "frontend").mkdir(parents=True)
-    (context / "frontend/Dockerfile").write_text("FROM synthetic")
-    inventory = {"frontend/Dockerfile": hashlib.sha256(b"FROM synthetic").hexdigest()}
+    (context / kind).mkdir(parents=True)
+    (context / kind / "Dockerfile").write_text("FROM synthetic")
+    inventory = {kind + "/Dockerfile": hashlib.sha256(b"FROM synthetic").hexdigest()}
     modes = {str(path.relative_to(context)): path.stat().st_mode & 0o777 for path in context.rglob("*")}
     source = {"revision": "a" * 40, "files": inventory}
     release.save(work / "source.json", source)
     release.save(work / "context.json", inventory)
     release.save(work / "context-modes.json", modes)
     release.save(work / "clean-checks.json", {"revision": source["revision"], "lock_sha256": hashlib.sha256(b"lock").hexdigest()})
-    release.save(work / "frontend-smoke.json", {"revision": source["revision"], "passed": defect != "smoke", "context_sha256": release.fingerprint(inventory), "modes_sha256": release.fingerprint(modes)})
+    release.save(work / (kind + "-smoke.json"), {"revision": source["revision"], "passed": defect != "smoke", "context_sha256": release.fingerprint(inventory), "modes_sha256": release.fingerprint(modes)})
     monkeypatch.setattr(release, "verify_source", lambda path: json.loads((path / "source.json").read_text()))
     monkeypatch.setattr(release, "command", lambda args, **kwargs: b"lock" if "show" in args else b"a" * 40)
     calls = []
@@ -249,28 +282,30 @@ def test_frontend_only_publication_preserves_backend_and_refuses_retry(tmp_path,
         calls.append(arguments)
         if arguments[:2] == ("acr", "build"):
             assert arguments[arguments.index("--timeout") + 1] == "900"
-            assert arguments[arguments.index("--image") + 1].startswith("docintel/frontend:")
+            assert arguments[arguments.index("--image") + 1].startswith("docintel/" + kind + ":")
+            assert arguments[arguments.index("--file") + 1] == str(context / kind / "Dockerfile")
+            assert arguments[-1] == str(context if kind == "backend" else context / "frontend")
             return {"status": "Failed" if defect == "failed_build" else "Succeeded", "runId": "synthetic-run"}
         return {"digest": "sha256:" + "c" * 64}
     monkeypatch.setattr(release, "azure", azure)
     if defect == "mode":
-        (context / "frontend/Dockerfile").chmod(0o400)
+        (context / kind / "Dockerfile").chmod(0o400)
     if defect == "backend":
-        config["backend_image"] = config["backend_image"].replace("b" * 64, "d" * 64)
+        config[retained + "_image"] = config[retained + "_image"].replace("b" * 64, "d" * 64)
     if defect:
         with pytest.raises(ValueError):
-            release.publish_frontend(config, work, previous)
+            release.publish_component(config, work, previous, kind)
         assert len(calls) == (1 if defect == "failed_build" else 0)
     else:
-        release.publish_frontend(config, work, previous)
+        release.publish_component(config, work, previous, kind)
         receipt = json.loads((work / "images.json").read_text())
-        assert receipt["backend"] == previous_images["backend"]
-        assert receipt["preserved_backend"]["revision"] == "b" * 40
-        release.require_release_images({**config, "frontend_image": receipt["frontend"]}, work)
+        assert receipt[retained] == previous_images[retained]
+        assert receipt["preserved_" + retained]["revision"] == "b" * 40
+        release.require_release_images({**config, kind + "_image": receipt[kind]}, work)
     if defect in (None, "failed_build"):
         count = len(calls)
         with pytest.raises(ValueError, match="already attempted"):
-            release.publish_frontend(config, work, previous)
+            release.publish_component(config, work, previous, kind)
         assert len(calls) == count
     assert json.loads((previous / "images.json").read_text()) == previous_images
 

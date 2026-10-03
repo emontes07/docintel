@@ -15,6 +15,7 @@ jobs:
     outputs:
       helper_only: ${{ steps.scope.outputs.helper_only }}
       frontend_only: ${{ steps.scope.outputs.frontend_only }}
+      backend_only: ${{ steps.scope.outputs.backend_only }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,9 +32,11 @@ jobs:
           allowed = {'scripts/release.py', 'tests/test_release.py', '.github/workflows/release_validation.yaml'}
           helper_only = bool(paths) and set(paths) <= allowed
           frontend_only = bool(paths) and set(paths) <= (allowed | {'frontend/Dockerfile', 'frontend/replace-env.mjs', 'scripts/frontend_smoke.py'})
+          backend_only = bool(paths) and set(paths) <= (allowed | {'backend/batch_store.py', 'tests/test_batch.py', 'tests/test_batch_api.py', 'scripts/backend_smoke.py', '.github/workflows/frontend_docker_build.yaml'})
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'helper_only={str(helper_only).lower()}\n')
               output.write(f'frontend_only={str(frontend_only).lower()}\n')
+              output.write(f'backend_only={str(backend_only).lower()}\n')
           PY
   release-helper:
     needs: changes
@@ -102,7 +105,14 @@ jobs:
         run: python scripts/release.py stage --revision "$SOURCE_REVISION" --work "$RELEASE_WORK"
       - name: Clean release packaging
         id: package
-        run: python scripts/release.py package --work "$RELEASE_WORK" --package-access-approved
+        env:
+          BACKEND_ONLY: ${{ needs.changes.outputs.backend_only }}
+        run: |
+          if [ "$BACKEND_ONLY" = true ]; then
+            python scripts/release.py package-backend --work "$RELEASE_WORK" --package-access-approved
+          else
+            python scripts/release.py package --work "$RELEASE_WORK" --package-access-approved
+          fi
       - name: Require committed lock
         id: lock
         run: cmp uv.lock "$RELEASE_WORK/source/uv.lock"
@@ -125,10 +135,16 @@ jobs:
         run: docker build --platform linux/amd64 --file "$RELEASE_WORK/context/backend/Dockerfile" --iidfile "$RUNNER_TEMP/backend.iid" --tag "docintel/backend:$SOURCE_REVISION" "$RELEASE_WORK/context"
       - name: Build frontend container
         id: frontend_image
+        if: needs.changes.outputs.backend_only != 'true'
         run: docker build --platform linux/amd64 --file "$RELEASE_WORK/context/frontend/Dockerfile" --iidfile "$RUNNER_TEMP/frontend.iid" --tag "docintel/frontend:$SOURCE_REVISION" "$RELEASE_WORK/context/frontend"
       - name: Non-root frontend startup with restrictive release context
         id: frontend_smoke
+        if: needs.changes.outputs.backend_only != 'true'
         run: python -m scripts.frontend_smoke --work "$RELEASE_WORK" --image "docintel/frontend:$SOURCE_REVISION"
+      - name: Backend image Blob SDK contract without network
+        id: backend_smoke
+        if: needs.changes.outputs.frontend_only != 'true'
+        run: python -m scripts.backend_smoke --work "$RELEASE_WORK" --image "docintel/backend:$SOURCE_REVISION"
       - name: Record public build evidence
         if: always()
         env:
@@ -140,6 +156,7 @@ jobs:
           BACKEND_IMAGE_RESULT: ${{ steps.backend_image.outcome }}
           FRONTEND_IMAGE_RESULT: ${{ steps.frontend_image.outcome }}
           FRONTEND_SMOKE_RESULT: ${{ steps.frontend_smoke.outcome }}
+          BACKEND_SMOKE_RESULT: ${{ steps.backend_smoke.outcome }}
         run: |
           node --input-type=module <<'NODE'
           import { existsSync, mkdirSync, readFileSync, copyFileSync, writeFileSync } from 'node:fs';
@@ -157,7 +174,7 @@ jobs:
           if (existsSync(lock)) copyFileSync(lock, `${environment.EVIDENCE}/uv.lock`);
           const checks = `${environment.RELEASE_WORK}/clean-checks.json`;
           if (existsSync(checks)) copyFileSync(checks, `${environment.EVIDENCE}/clean-checks.json`);
-          for (const name of ['context.json', 'context-modes.json', 'frontend-smoke.json', 'frontend-smoke-diagnostics.json']) {
+          for (const name of ['context.json', 'context-modes.json', 'frontend-smoke.json', 'frontend-smoke-diagnostics.json', 'backend-smoke.json']) {
             const path = `${environment.RELEASE_WORK}/${name}`;
             if (existsSync(path)) copyFileSync(path, `${environment.EVIDENCE}/${name}`);
           }
@@ -172,7 +189,7 @@ jobs:
             docker: version('docker', ['--version']),
             committed_lock_sha256: hash('uv.lock'),
             generated_lock_sha256: hash(lock),
-            checks: Object.fromEntries(['PACKAGE', 'LOCK', 'BACKEND', 'FIXTURE', 'BICEP', 'BACKEND_IMAGE', 'FRONTEND_IMAGE', 'FRONTEND_SMOKE'].map(name => [name.toLowerCase(), environment[`${name}_RESULT`]])),
+            checks: Object.fromEntries(['PACKAGE', 'LOCK', 'BACKEND', 'FIXTURE', 'BICEP', 'BACKEND_IMAGE', 'FRONTEND_IMAGE', 'FRONTEND_SMOKE', 'BACKEND_SMOKE'].map(name => [name.toLowerCase(), environment[`${name}_RESULT`]])),
             images: { backend: imageId('backend'), frontend: imageId('frontend') },
             platform: 'linux/amd64',
             published: false,

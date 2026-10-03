@@ -21,17 +21,37 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect frontend source changes
+        id: scope
+        working-directory: .
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if git diff --quiet "$BASE" "$HEAD" -- frontend; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
       - name: Set up Node
+        if: steps.scope.outputs.changed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
       - name: Install committed dependencies
+        if: steps.scope.outputs.changed == 'true'
         run: npm ci --no-audit --no-fund
       - name: Lint
+        if: steps.scope.outputs.changed == 'true'
         run: ./node_modules/.bin/eslint .
       - name: Typecheck
+        if: steps.scope.outputs.changed == 'true'
         run: ./node_modules/.bin/tsc --noEmit --incremental false
       - name: Unit tests
+        if: steps.scope.outputs.changed == 'true'
         run: node --test tests/*.test.mjs
       - name: Production build
+        if: steps.scope.outputs.changed == 'true'
         run: npm run build

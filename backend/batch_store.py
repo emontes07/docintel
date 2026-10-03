@@ -100,7 +100,7 @@ class BlobStore:
 
     def read_bytes(self, key, max_bytes=64 * 1024 * 1024):
         try:
-            response = self.container.get_blob_client(key).download_blob(length=max_bytes + 1)
+            response = self.container.get_blob_client(key).download_blob(offset=0, length=max_bytes + 1)
             content = response.readall()
             if len(content) > max_bytes:
                 raise ValueError("Stored record exceeds read limit")

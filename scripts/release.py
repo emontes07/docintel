@@ -17,7 +17,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"Succeeded", "Failed", "Stopped"}
-OPERATIONS = {"provision", "publish", "publish-frontend", "seed", "deploy", "start", "stop", "rollback"}
+OPERATIONS = {"provision", "publish", "publish-frontend", "publish-backend", "update-worker", "seed", "deploy", "start", "stop", "rollback"}
 
 
 def require(condition, message):
@@ -239,7 +239,7 @@ def check_lock(before, after):
     require(resolved.get("azure-ai-documentintelligence") == "1.0.2", "Committed Document Intelligence constraint was not satisfied")
 
 
-def package(work, approved):
+def package(work, approved, backend_only=False):
     require(approved, "An existing approved runner with verified package/artifact access is required; do not retry the known failing host")
     require(not any(os.environ.get(name) for name in ("UV_INDEX", "UV_INDEX_URL", "UV_DEFAULT_INDEX", "UV_EXTRA_INDEX_URL", "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL")), "Review inherited registry overrides before using the committed registry; no automatic substitution")
     source = work / "source"
@@ -247,20 +247,22 @@ def package(work, approved):
     baseline = work / "baseline.lock"
     require(not baseline.exists(), "Prior packaging attempt exists; inspect it rather than retrying a failed download loop")
     require(command(["uv", "--version"]).decode().startswith("uv 0.11.31"), "Use the pinned uv 0.11.31 toolchain")
-    require(int(command(["node", "--version"]).decode().strip().lstrip("v").split(".")[0]) == 22, "Clean frontend checks require the Dockerfile's Node 22 toolchain")
+    if not backend_only:
+        require(int(command(["node", "--version"]).decode().strip().lstrip("v").split(".")[0]) == 22, "Clean frontend checks require the Dockerfile's Node 22 toolchain")
     baseline.write_bytes((source / "uv.lock").read_bytes())
     environment = {**os.environ, "UV_HTTP_RETRIES": "0", "UV_PYTHON_DOWNLOADS": "never", "UV_PROJECT_ENVIRONMENT": str(work / ".clean-venv"), "PYTHONDONTWRITEBYTECODE": "1", "NEXT_TELEMETRY_DISABLED": "1"}
     command(["uv", "lock", "--directory", str(source)], env=environment)
     check_lock(tomllib.loads(baseline.read_text()), tomllib.loads((source / "uv.lock").read_text()))
     command(["uv", "sync", "--locked", "--python", "3.13", "--directory", str(source)], env=environment)
     command([str(work / ".clean-venv/bin/python"), "-m", "pytest", "tests/test_batch.py", "tests/test_batch_api.py", "tests/test_workbooks.py", "tests/test_release.py", "tests/test_pilot.py", "tests/test_pilot_api.py", "tests/test_pilot_server.py", "-q"], cwd=source, env=environment)
-    frontend = source / "frontend"
-    command(["npm", "ci", "--no-audit", "--no-fund"], cwd=frontend, env=environment)
-    for arguments in (["node_modules/.bin/eslint", "."], ["node_modules/.bin/tsc", "--noEmit", "--incremental", "false"], ["node", "--test", *[str(path) for path in (frontend / "tests").glob("*.test.mjs")]], ["npm", "run", "build"]):
-        command(arguments, cwd=frontend, env=environment)
+    if not backend_only:
+        frontend = source / "frontend"
+        command(["npm", "ci", "--no-audit", "--no-fund"], cwd=frontend, env=environment)
+        for arguments in (["node_modules/.bin/eslint", "."], ["node_modules/.bin/tsc", "--noEmit", "--incremental", "false"], ["node", "--test", *[str(path) for path in (frontend / "tests").glob("*.test.mjs")]], ["npm", "run", "build"]):
+            command(arguments, cwd=frontend, env=environment)
     verify_source(work, allow_lock_change=True)
     revision = json.loads((work / "source.json").read_text())["revision"]
-    save(work / "clean-checks.json", {"revision": revision, "lock_sha256": hashlib.sha256((source / "uv.lock").read_bytes()).hexdigest(), "frontend": "clean_npm_ci_checks_build", "backend": "clean_locked_install_offline_tests"})
+    save(work / "clean-checks.json", {"revision": revision, "lock_sha256": hashlib.sha256((source / "uv.lock").read_bytes()).hexdigest(), "frontend": "unchanged_not_rebuilt" if backend_only else "clean_npm_ci_checks_build", "backend": "clean_locked_install_offline_tests"})
     print("Isolated clean checks passed. Review/commit the generated lock before release; no image was built or published.")
 
 
@@ -269,28 +271,37 @@ def require_release_images(config, work):
     receipt = json.loads((work / "images.json").read_text())
     source = json.loads((work / "source.json").read_text())
     require(receipt["revision"] == source["revision"], "Published source mismatch")
-    if "preserved_backend" in receipt:
-        previous = private_path(receipt["preserved_backend"]["work"])
+    for kind in ("backend", "frontend"):
+        preserved = receipt.get("preserved_" + kind)
+        if preserved is None:
+            continue
+        previous = private_path(preserved["work"])
         previous_source = verify_source(previous)
         previous_images = json.loads((previous / "images.json").read_text())
-        require(previous_images["revision"] == previous_source["revision"], "Preserved backend source mismatch")
-        require(fingerprint(previous_images) == receipt["preserved_backend"]["receipt_sha256"], "Preserved publication receipt changed")
-        require(previous_images["backend"] == receipt["backend"], "Preserved backend digest mismatch")
+        require(previous_images["revision"] == previous_source["revision"], "Preserved source mismatch")
+        require(fingerprint(previous_images) == preserved["receipt_sha256"], "Preserved publication receipt changed")
+        require(previous_images[kind] == receipt[kind], "Preserved digest mismatch")
     for kind in ("backend", "frontend"):
         require(receipt[kind] == image(config, kind), "Configured digest differs from the release publication receipt")
 
 
 def publish_frontend(config, work, previous_work):
+    publish_component(config, work, previous_work, "frontend")
+
+
+def publish_component(config, work, previous_work, kind):
+    require(kind in {"backend", "frontend"}, "Unsupported publication component")
+    retained = "frontend" if kind == "backend" else "backend"
     source = verify_source(work)
     previous = private_path(previous_work)
     previous_source = verify_source(previous)
     previous_images = json.loads((previous / "images.json").read_text())
-    require(previous_images["revision"] == previous_source["revision"], "Preserved backend source mismatch")
-    require(previous_images["backend"] == image(config, "backend"), "Backend must retain its original published digest")
-    protected = lambda name: name.startswith("backend/") or name in {"pyproject.toml", "uv.lock"}
-    require({name: digest for name, digest in source["files"].items() if protected(name)} == {name: digest for name, digest in previous_source["files"].items() if protected(name)}, "Frontend repair changed backend source or dependencies")
+    require(previous_images["revision"] == previous_source["revision"], "Preserved source mismatch")
+    require(previous_images[retained] == image(config, retained), "Unchanged component must retain its original published digest")
+    protected = lambda name: name.startswith(retained + "/") or name in {"pyproject.toml", "uv.lock"}
+    require({name: digest for name, digest in source["files"].items() if protected(name)} == {name: digest for name, digest in previous_source["files"].items() if protected(name)}, "Repair changed preserved source or dependencies")
     checks = json.loads((work / "clean-checks.json").read_text())
-    smoke = json.loads((work / "frontend-smoke.json").read_text())
+    smoke = json.loads((work / (kind + "-smoke.json")).read_text())
     inventory = json.loads((work / "context.json").read_text())
     modes = json.loads((work / "context-modes.json").read_text())
     context = work / "context"
@@ -299,18 +310,39 @@ def publish_frontend(config, work, previous_work):
     require(all(source["files"].get(name) == digest for name, digest in inventory.items()), "Context differs from reviewed source")
     require(checks["revision"] == smoke["revision"] == source["revision"], "Validation source mismatch")
     require(checks["lock_sha256"] == hashlib.sha256(command(["git", "show", source["revision"] + ":uv.lock"], cwd=ROOT)).hexdigest(), "Committed lock mismatch")
-    require(smoke["passed"] is True and smoke["context_sha256"] == fingerprint(inventory) and smoke["modes_sha256"] == fingerprint(modes), "Frontend startup/context validation required")
-    attempt = work / "frontend-publication-attempt.json"
-    require(not attempt.exists() and not (work / "images.json").exists(), "Frontend publication already attempted; no automatic retry")
+    require(smoke["passed"] is True and smoke["context_sha256"] == fingerprint(inventory) and smoke["modes_sha256"] == fingerprint(modes), "Runtime/context validation required")
+    attempt = work / (kind + "-publication-attempt.json")
+    require(not attempt.exists() and not (work / "images.json").exists(), "Component publication already attempted; no automatic retry")
     save(attempt, {"revision": source["revision"], "timeout_seconds": 900, "status": "attempted"})
-    tag = "docintel/frontend:" + source["revision"]
-    result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--timeout", "900", "--no-logs", "--file", str(context / "frontend/Dockerfile"), "--image", tag, str(context / "frontend"))
-    save(work / "frontend-publication-result.json", {name: result.get(name) for name in ("runId", "status", "startTime", "finishTime")})
-    require(result.get("status") == "Succeeded", "Frontend ACR build failed; no automatic retry")
+    tag = "docintel/" + kind + ":" + source["revision"]
+    build_directory = context if kind == "backend" else context / "frontend"
+    result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--timeout", "900", "--no-logs", "--file", str(context / kind / "Dockerfile"), "--image", tag, str(build_directory))
+    save(work / (kind + "-publication-result.json"), {name: result.get(name) for name in ("runId", "status", "startTime", "finishTime")})
+    require(result.get("status") == "Succeeded", "ACR build failed; no automatic retry")
     digest = azure("acr", "repository", "show", "--name", config["registry"], "--image", tag)["digest"]
-    published = {"revision": source["revision"], "frontend": config["registry"] + ".azurecr.io/docintel/frontend@" + digest, "frontend_run_id": result["runId"], "backend": previous_images["backend"], "preserved_backend": {"work": str(previous), "revision": previous_source["revision"], "receipt_sha256": fingerprint(previous_images)}, "tool_revision": command(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
-    image({**config, "frontend_image": published["frontend"]}, "frontend")
+    published = {"revision": source["revision"], kind: config["registry"] + ".azurecr.io/docintel/" + kind + "@" + digest, kind + "_run_id": result["runId"], retained: previous_images[retained], "preserved_" + retained: {"work": str(previous), "revision": previous_source["revision"], "receipt_sha256": fingerprint(previous_images)}, "tool_revision": command(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
+    image({**config, kind + "_image": published[kind]}, kind)
     save(work / "images.json", published)
+
+
+def update_worker_image(config, work):
+    baseline = json.loads((work / "worker-baseline.json").read_text())
+    require(baseline["target"] == fingerprint(config), "Worker snapshot target mismatch")
+    job = azure("containerapp", "job", "show", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"])
+    require(job == baseline["resource"], "Worker drift since reviewed snapshot")
+    resource_id = f"/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.App/jobs/{config['job']}"
+    require(job["id"].lower() == resource_id.lower(), "Worker resource target mismatch")
+    settings = job["properties"]["configuration"]
+    require(settings["triggerType"] == "Manual" and settings["replicaTimeout"] == 600 and settings["replicaRetryLimit"] == 0, "Worker execution bounds changed")
+    executions = azure("containerapp", "job", "execution", "list", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"])
+    require(not executions, "Worker executions must remain unused before image repair")
+    containers = safe_containers(job)
+    require(any(entry["name"] == "DOCINTEL_BATCH_LIVE_ENABLED" and entry.get("value") == "false" for entry in containers[0]["env"]), "Worker live AI must remain disabled")
+    containers[0]["image"] = image(config, "backend")
+    body = work / "worker-image-patch.json"
+    require(not body.exists(), "Worker image update already attempted; inspect state before proceeding")
+    save(body, {"properties": {"template": {"containers": writable_containers(containers)}}})
+    azure("rest", "--method", "PATCH", "--url", "https://management.azure.com" + resource_id + "?api-version=2024-03-01", "--body", "@" + str(body))
 
 
 def remote_seed_code(config, payload):
@@ -417,8 +449,8 @@ def run(options):
     if options.action == "context":
         build_context(work)
         return
-    if options.action == "package":
-        package(work, options.package_access_approved)
+    if options.action in {"package", "package-backend"}:
+        package(work, options.package_access_approved, backend_only=options.action == "package-backend")
         return
     config = load_config(options.config)
     if options.action == "plan":
@@ -427,12 +459,16 @@ def run(options):
     if options.action in OPERATIONS:
         require(options.approve == options.action, "Explicit approval for this operation is required")
     verify_target(config, allow_isolated=options.action == "rollback" and options.isolate_legacy_baseline)
-    if options.action in {"provision", "seed", "deploy", "start"}:
+    if options.action in {"provision", "seed", "deploy", "start", "update-worker"}:
         require_release_images(config, work)
     if options.action == "identity-check":
         identity_contract(config)
     elif options.action == "publish-frontend":
         publish_frontend(config, work, options.previous_work)
+    elif options.action == "publish-backend":
+        publish_component(config, work, options.previous_work, "backend")
+    elif options.action == "update-worker":
+        update_worker_image(config, work)
     elif options.action == "capture":
         require(not (work / "baseline.json").exists(), "Refusing to replace rollback baseline")
         baseline = {kind: {"containers": safe_containers(app(config, config[kind]))} for kind in ("backend", "frontend")}
@@ -556,7 +592,7 @@ def run(options):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["plan", "stage", "package", "context", "identity-check", "capture", "publish", "publish-frontend", "what-if", "provision", "seed", "deploy", "start", "stop", "rollback"])
+    parser.add_argument("action", choices=["plan", "stage", "package", "package-backend", "context", "identity-check", "capture", "publish", "publish-frontend", "publish-backend", "update-worker", "what-if", "provision", "seed", "deploy", "start", "stop", "rollback"])
     parser.add_argument("--previous-work", type=Path)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--work", type=Path, required=True)
