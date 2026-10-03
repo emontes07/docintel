@@ -10,7 +10,60 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      helper_only: ${{ steps.scope.outputs.helper_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python - <<'PY'
+          import os, subprocess
+          paths = subprocess.check_output(['git', 'diff', '--name-only', os.environ['BASE'], os.environ['HEAD']], text=True).splitlines()
+          allowed = {'scripts/release.py', 'tests/test_release.py', '.github/workflows/release_validation.yaml'}
+          helper_only = bool(paths) and set(paths) <= allowed
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'helper_only={str(helper_only).lower()}\n')
+          PY
+  release-helper:
+    needs: changes
+    if: needs.changes.outputs.helper_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      DOCINTEL_BATCH_LIVE_ENABLED: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      UV_HTTP_RETRIES: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.31"
+      - name: Verify unchanged application context and lock
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: git diff --exit-code "$BASE" HEAD -- backend frontend infra pyproject.toml uv.lock .dockerignore
+      - name: Install committed dependencies
+        run: uv sync --locked --python 3.13
+      - name: Release helper regression
+        run: .venv/bin/python -m pytest tests/test_release.py -q -p no:cacheprovider
   release:
+    needs: changes
+    if: needs.changes.outputs.helper_only != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:

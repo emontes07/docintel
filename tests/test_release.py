@@ -1,5 +1,6 @@
 import importlib.util
 import base64
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -9,6 +10,107 @@ import pytest
 spec = importlib.util.spec_from_file_location("release", Path(__file__).parents[1] / "scripts/release.py")
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
+
+
+@pytest.fixture
+def container_read_response():
+    return {"identity": {"type": "SystemAssigned"}, "properties": {
+        "configuration": {"registries": [{"server": "synthetic.azurecr.io", "passwordSecretRef": "acr-password"}]},
+        "template": {"volumes": [{"name": "cache", "storageType": "EmptyDir"}], "containers": [{
+            "name": "synthetic", "image": "synthetic.azurecr.io/old:tag", "imageType": "ContainerImage",
+            "command": ["python"], "args": ["-m", "backend.main"],
+            "env": [{"name": "SETTING", "value": "retained"}, {"name": "AUTH_SECRET", "secretRef": "retained-reference"}],
+            "resources": {"cpu": 1, "memory": "2Gi", "ephemeralStorage": "4Gi"},
+            "probes": [{"type": "Readiness", "httpGet": {"path": "/health", "port": 80, "scheme": "HTTP", "httpHeaders": [{"name": "X-Probe", "value": "synthetic"}]}, "initialDelaySeconds": 1, "periodSeconds": 10, "timeoutSeconds": 2, "failureThreshold": 3, "successThreshold": 1}],
+            "volumeMounts": [{"volumeName": "cache", "mountPath": "/cache", "subPath": "retained"}],
+        }]}}}
+
+
+@pytest.mark.parametrize("kind", ["backend", "frontend"])
+def test_patch_projects_read_response_without_mutation(tmp_path, monkeypatch, container_read_response, kind):
+    original = copy.deepcopy(container_read_response)
+    config = {"subscription": "synthetic", "group": "synthetic", kind: kind}
+    containers = release.safe_containers(container_read_response)
+    containers[0]["image"] = "synthetic.azurecr.io/new@sha256:" + "a" * 64
+    containers[0]["env"].append({"name": "AUTH_MICROSOFT_ENTRA_ID_SECRET", "secretRef": "entra-reference"})
+    calls = []
+    monkeypatch.setattr(release, "azure", lambda *arguments: calls.append(arguments))
+    release.patch_app(config, kind, containers, tmp_path)
+    payload = json.loads((tmp_path / (kind + "-patch.json")).read_text())
+    expected = copy.deepcopy(containers)
+    expected[0].pop("imageType")
+    expected[0]["resources"].pop("ephemeralStorage")
+    assert payload == {"properties": {"template": {"containers": expected}}}
+    assert container_read_response == original
+    assert containers[0]["imageType"] == "ContainerImage"
+    assert "api-version=2024-03-01" in calls[0][calls[0].index("--url") + 1]
+    assert calls[0][calls[0].index("--method") + 1] == "PATCH"
+
+
+@pytest.mark.parametrize("change", [{"imageType": "Artifact"}, {"futureSetting": True}, {"resources": {"gpu": 1}}])
+def test_projection_rejects_unknown_configuration(container_read_response, change):
+    containers = release.safe_containers(container_read_response)
+    containers[0].update(change)
+    with pytest.raises(ValueError, match="Unknown|Unsupported"):
+        release.writable_containers(containers)
+
+
+@pytest.mark.parametrize("action", ["deploy", "rollback"])
+def test_deploy_and_rollback_use_write_projection(tmp_path, monkeypatch, container_read_response, action):
+    from argparse import Namespace
+    config = {"backend": "backend", "frontend": "frontend", "subscription": "synthetic", "group": "synthetic", "registry": "synthetic", "backend_image": "synthetic.azurecr.io/docintel/backend@sha256:" + "a" * 64, "frontend_image": "synthetic.azurecr.io/docintel/frontend@sha256:" + "b" * 64, "storage": "synthetic", "container": "batches", "tenant": "tenant", "api_client_id": "api", "frontend_client_id": "frontend", "frontend_origin": "https://portal.invalid", "backend_origin": "https://backend.invalid", "auth_secret_ref": "auth-reference", "entra_secret_ref": "entra-reference"}
+    original = release.safe_containers(container_read_response)
+    baseline = {"target": release.fingerprint(config), "authenticated": False, "apps": {kind: {"containers": original, "pinned_image": "synthetic.azurecr.io/old@sha256:" + "c" * 64} for kind in ("backend", "frontend")}}
+    release.save(tmp_path / "baseline.json", baseline)
+    resources = {kind: copy.deepcopy(container_read_response) for kind in ("backend", "frontend")}
+    for kind, resource in resources.items():
+        resource["properties"].update(provisioningState="Succeeded", latestRevisionName="ready", latestReadyRevisionName="ready")
+        resource["properties"]["configuration"]["secrets"] = [{"name": reference} for reference in ("auth-reference", "entra-reference")]
+        if action == "rollback":
+            intended = release.desired_containers(config, kind, original)
+            resource["properties"]["template"]["containers"] = intended
+            release.save(tmp_path / (kind + "-intended.json"), intended)
+    before = copy.deepcopy(resources)
+    calls = []
+    payloads = {}
+    def azure(*arguments):
+        calls.append(arguments)
+        if arguments[:1] == ("rest",):
+            assert arguments[arguments.index("--method") + 1] == "PATCH"
+            assert arguments[arguments.index("--url") + 1].endswith("?api-version=2024-03-01")
+            path = Path(arguments[arguments.index("--body") + 1][1:])
+            kind = path.name.removesuffix("-patch.json")
+            payload = json.loads(path.read_text())
+            payloads[kind] = payload
+            assert set(payload) == {"properties"}
+            assert set(payload["properties"]) == {"template"}
+            assert set(payload["properties"]["template"]) == {"containers"}
+            resources[kind]["properties"]["template"]["containers"] = payload["properties"]["template"]["containers"]
+        elif arguments[:3] == ("containerapp", "revision", "show"):
+            kind = arguments[arguments.index("-n") + 1]
+            return {"properties": {"healthState": "Healthy", "template": resources[kind]["properties"]["template"]}}
+    monkeypatch.setattr(release, "azure", azure)
+    monkeypatch.setattr(release, "load_config", lambda _: config)
+    monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
+    monkeypatch.setattr(release, "require_release_images", lambda *args: None)
+    monkeypatch.setattr(release, "identity_contract", lambda _: None)
+    monkeypatch.setattr(release, "app", lambda _, kind: resources[kind])
+    monkeypatch.setattr(release, "stop", lambda _: calls.append(("stop",)))
+    release.run(Namespace(action=action, approve=action, work=tmp_path, config=None, isolate_legacy_baseline=True))
+    assert set(payloads) == {"backend", "frontend"}
+    for kind, payload in payloads.items():
+        expected = release.desired_containers(config, kind, original) if action == "deploy" else copy.deepcopy(original)
+        if action == "rollback":
+            expected[0]["image"] = baseline["apps"][kind]["pinned_image"]
+        expected[0].pop("imageType")
+        expected[0]["resources"].pop("ephemeralStorage")
+        assert payload["properties"]["template"]["containers"] == expected
+        assert resources[kind]["identity"] == before[kind]["identity"]
+        assert resources[kind]["properties"]["configuration"] == before[kind]["properties"]["configuration"]
+        assert resources[kind]["properties"]["template"]["volumes"] == before[kind]["properties"]["template"]["volumes"]
+    if action == "rollback":
+        assert calls[0] == ("stop",)
+        assert all(call[:3] == ("containerapp", "ingress", "disable") for call in calls[1:3])
 
 
 def test_literal_secrets_are_never_captured():
