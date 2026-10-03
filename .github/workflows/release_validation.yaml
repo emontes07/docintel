@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       helper_only: ${{ steps.scope.outputs.helper_only }}
+      frontend_only: ${{ steps.scope.outputs.frontend_only }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,8 +30,10 @@ jobs:
           paths = subprocess.check_output(['git', 'diff', '--name-only', os.environ['BASE'], os.environ['HEAD']], text=True).splitlines()
           allowed = {'scripts/release.py', 'tests/test_release.py', '.github/workflows/release_validation.yaml'}
           helper_only = bool(paths) and set(paths) <= allowed
+            frontend_only = bool(paths) and set(paths) <= allowed | {'frontend/Dockerfile', 'frontend/replace-env.mjs', 'scripts/frontend_smoke.py'}
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'helper_only={str(helper_only).lower()}\n')
+              output.write(f'frontend_only={str(frontend_only).lower()}\n')
           PY
   release-helper:
     needs: changes
@@ -118,10 +121,14 @@ jobs:
         run: python scripts/release.py context --work "$RELEASE_WORK"
       - name: Build backend container
         id: backend_image
+        if: needs.changes.outputs.frontend_only != 'true'
         run: docker build --platform linux/amd64 --file "$RELEASE_WORK/context/backend/Dockerfile" --iidfile "$RUNNER_TEMP/backend.iid" --tag "docintel/backend:$SOURCE_REVISION" "$RELEASE_WORK/context"
       - name: Build frontend container
         id: frontend_image
         run: docker build --platform linux/amd64 --file "$RELEASE_WORK/context/frontend/Dockerfile" --iidfile "$RUNNER_TEMP/frontend.iid" --tag "docintel/frontend:$SOURCE_REVISION" "$RELEASE_WORK/context/frontend"
+      - name: Non-root frontend startup with restrictive release context
+        id: frontend_smoke
+        run: python -m scripts.frontend_smoke --work "$RELEASE_WORK" --image "docintel/frontend:$SOURCE_REVISION"
       - name: Record public build evidence
         if: always()
         env:
@@ -132,6 +139,7 @@ jobs:
           BICEP_RESULT: ${{ steps.bicep.outcome }}
           BACKEND_IMAGE_RESULT: ${{ steps.backend_image.outcome }}
           FRONTEND_IMAGE_RESULT: ${{ steps.frontend_image.outcome }}
+          FRONTEND_SMOKE_RESULT: ${{ steps.frontend_smoke.outcome }}
         run: |
           node --input-type=module <<'NODE'
           import { existsSync, mkdirSync, readFileSync, copyFileSync, writeFileSync } from 'node:fs';
@@ -149,6 +157,10 @@ jobs:
           if (existsSync(lock)) copyFileSync(lock, `${environment.EVIDENCE}/uv.lock`);
           const checks = `${environment.RELEASE_WORK}/clean-checks.json`;
           if (existsSync(checks)) copyFileSync(checks, `${environment.EVIDENCE}/clean-checks.json`);
+          for (const name of ['context.json', 'context-modes.json', 'frontend-smoke.json']) {
+            const path = `${environment.RELEASE_WORK}/${name}`;
+            if (existsSync(path)) copyFileSync(path, `${environment.EVIDENCE}/${name}`);
+          }
           const evidence = {
             revision: environment.SOURCE_REVISION,
             run: `${environment.GITHUB_SERVER_URL}/${environment.GITHUB_REPOSITORY}/actions/runs/${environment.GITHUB_RUN_ID}`,
@@ -160,7 +172,7 @@ jobs:
             docker: version('docker', ['--version']),
             committed_lock_sha256: hash('uv.lock'),
             generated_lock_sha256: hash(lock),
-            checks: Object.fromEntries(['PACKAGE', 'LOCK', 'BACKEND', 'FIXTURE', 'BICEP', 'BACKEND_IMAGE', 'FRONTEND_IMAGE'].map(name => [name.toLowerCase(), environment[`${name}_RESULT`]])),
+            checks: Object.fromEntries(['PACKAGE', 'LOCK', 'BACKEND', 'FIXTURE', 'BICEP', 'BACKEND_IMAGE', 'FRONTEND_IMAGE', 'FRONTEND_SMOKE'].map(name => [name.toLowerCase(), environment[`${name}_RESULT`]])),
             images: { backend: imageId('backend'), frontend: imageId('frontend') },
             platform: 'linux/amd64',
             published: false,
@@ -175,4 +187,4 @@ jobs:
           name: release-evidence-${{ env.SOURCE_REVISION }}
           path: ${{ env.EVIDENCE }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30

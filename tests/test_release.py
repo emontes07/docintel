@@ -176,6 +176,75 @@ def test_context_excludes_private_material_and_environments(tmp_path):
     assert paths == {"backend/main.py", "frontend/package.json", "pyproject.toml", "uv.lock", ".dockerignore"}
 
 
+def test_restrictive_context_preserves_private_permissions(tmp_path):
+    source = tmp_path / "source"
+    for relative in ("backend/main.py", "frontend/public/mock-gens/synthetic.txt", "frontend/Dockerfile", "pyproject.toml", "uv.lock", ".dockerignore"):
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("synthetic")
+    for path in source.rglob("*"):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    release.save(tmp_path / "source.json", {"revision": "a" * 40, "files": {str(path.relative_to(source)): hashlib.sha256(path.read_bytes()).hexdigest() for path in source.rglob("*") if path.is_file()}})
+    context = release.build_context(tmp_path)
+    assert (context / "frontend/public/mock-gens").stat().st_mode & 0o777 == 0o700
+    assert (context / "frontend/public/mock-gens/synthetic.txt").stat().st_mode & 0o777 == 0o600
+    modes = json.loads((tmp_path / "context-modes.json").read_text())
+    assert modes["frontend/public/mock-gens"] == 0o700
+    assert (tmp_path / "context-modes.json").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("defect", [None, "smoke", "mode", "backend", "failed_build"])
+def test_frontend_only_publication_preserves_backend_and_refuses_retry(tmp_path, monkeypatch, defect):
+    previous = tmp_path / "previous"
+    work = tmp_path / "replacement"
+    config = {"registry": "synthetic", "subscription": "synthetic", "backend_image": "synthetic.azurecr.io/docintel/backend@sha256:" + "b" * 64}
+    previous_images = {"revision": "b" * 40, "backend": config["backend_image"]}
+    release.save(previous / "source.json", {"revision": "b" * 40, "files": {}})
+    release.save(previous / "images.json", previous_images)
+    context = work / "context"
+    (context / "frontend").mkdir(parents=True)
+    (context / "frontend/Dockerfile").write_text("FROM synthetic")
+    inventory = {"frontend/Dockerfile": hashlib.sha256(b"FROM synthetic").hexdigest()}
+    modes = {str(path.relative_to(context)): path.stat().st_mode & 0o777 for path in context.rglob("*")}
+    source = {"revision": "a" * 40, "files": inventory}
+    release.save(work / "source.json", source)
+    release.save(work / "context.json", inventory)
+    release.save(work / "context-modes.json", modes)
+    release.save(work / "clean-checks.json", {"revision": source["revision"], "lock_sha256": hashlib.sha256(b"lock").hexdigest()})
+    release.save(work / "frontend-smoke.json", {"revision": source["revision"], "passed": defect != "smoke", "context_sha256": release.fingerprint(inventory), "modes_sha256": release.fingerprint(modes)})
+    monkeypatch.setattr(release, "verify_source", lambda path: json.loads((path / "source.json").read_text()))
+    monkeypatch.setattr(release, "command", lambda args, **kwargs: b"lock" if "show" in args else b"a" * 40)
+    calls = []
+    def azure(*arguments):
+        calls.append(arguments)
+        if arguments[:2] == ("acr", "build"):
+            assert arguments[arguments.index("--timeout") + 1] == "900"
+            assert arguments[arguments.index("--image") + 1].startswith("docintel/frontend:")
+            return {"status": "Failed" if defect == "failed_build" else "Succeeded", "runId": "synthetic-run"}
+        return {"digest": "sha256:" + "c" * 64}
+    monkeypatch.setattr(release, "azure", azure)
+    if defect == "mode":
+        (context / "frontend/Dockerfile").chmod(0o400)
+    if defect == "backend":
+        config["backend_image"] = config["backend_image"].replace("b" * 64, "d" * 64)
+    if defect:
+        with pytest.raises(ValueError):
+            release.publish_frontend(config, work, previous)
+        assert len(calls) == (1 if defect == "failed_build" else 0)
+    else:
+        release.publish_frontend(config, work, previous)
+        receipt = json.loads((work / "images.json").read_text())
+        assert receipt["backend"] == previous_images["backend"]
+        assert receipt["preserved_backend"]["revision"] == "b" * 40
+        release.require_release_images({**config, "frontend_image": receipt["frontend"]}, work)
+    if defect in (None, "failed_build"):
+        count = len(calls)
+        with pytest.raises(ValueError, match="already attempted"):
+            release.publish_frontend(config, work, previous)
+        assert len(calls) == count
+    assert json.loads((previous / "images.json").read_text()) == previous_images
+
+
 def test_desired_settings_use_references_and_drop_local_store():
     config = {"registry": "synthetic", "backend_image": "synthetic.azurecr.io/docintel/backend@sha256:" + "a" * 64, "frontend_image": "synthetic.azurecr.io/docintel/frontend@sha256:" + "b" * 64, "storage": "synthetic", "container": "batches", "tenant": "tenant", "api_client_id": "api", "frontend_client_id": "frontend", "frontend_origin": "https://portal.invalid", "backend_origin": "https://backend.invalid", "auth_secret_ref": "auth-reference", "entra_secret_ref": "entra-reference"}
     baseline = [{"image": "old", "env": [{"name": "DOCINTEL_BATCH_HOME", "value": "/private/local"}]}]

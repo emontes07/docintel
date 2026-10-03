@@ -54,19 +54,24 @@ COPY --from=builder /app/public ./public
 # Copy built application
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder /app/replace-env.mjs ./replace-env.mjs
+
+RUN chown -R root:nodejs /app && \
+    chmod -R u=rwX,g=rX,o= /app && \
+    find /app/.next -type f -name '*.js' -exec sh -c 'for asset do if grep -q "__NEXT_PUBLIC_" "$asset"; then chmod g+w "$asset"; fi; done' sh {} + && \
+    mkdir -p /app/.next/cache && \
+    chown -R nextjs:nodejs /app/.next/cache && \
+    chmod 700 /app/.next/cache
 
 # Create entrypoint script that replaces placeholders with actual environment values
 RUN echo '#!/bin/sh' > /app/entrypoint.sh && \
     echo 'set -e' >> /app/entrypoint.sh && \
     echo 'echo "Replacing environment variables..."' >> /app/entrypoint.sh && \
-    echo 'find .next -type f -name "*.js" | xargs sed -i "s|__NEXT_PUBLIC_API_PROTOCOL__|$NEXT_PUBLIC_API_PROTOCOL|g"' >> /app/entrypoint.sh && \
-    echo 'find .next -type f -name "*.js" | xargs sed -i "s|__NEXT_PUBLIC_API_HOSTNAME__|$NEXT_PUBLIC_API_HOSTNAME|g"' >> /app/entrypoint.sh && \
-    echo 'find .next -type f -name "*.js" | xargs sed -i "s|__NEXT_PUBLIC_API_PORT__|$NEXT_PUBLIC_API_PORT|g"' >> /app/entrypoint.sh && \
-    echo 'find .next -type f -name "*.js" | xargs sed -i "s|__NEXT_PUBLIC_STORAGE_ACCOUNT_NAME__|$NEXT_PUBLIC_STORAGE_ACCOUNT_NAME|g"' >> /app/entrypoint.sh && \
-    echo 'find .next -type f -name "*.js" | xargs sed -i "s|__NEXT_PUBLIC_DEFAULT_BRAND__|$NEXT_PUBLIC_DEFAULT_BRAND|g"' >> /app/entrypoint.sh && \
+    echo 'node /app/replace-env.mjs' >> /app/entrypoint.sh && \
     echo 'echo "Environment variables replaced."' >> /app/entrypoint.sh && \
     echo 'exec "$@"' >> /app/entrypoint.sh && \
-    chmod +x /app/entrypoint.sh
+    chown root:nodejs /app/entrypoint.sh && \
+    chmod 550 /app/entrypoint.sh
 
 USER nextjs
 
