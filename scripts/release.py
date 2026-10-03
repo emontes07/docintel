@@ -817,8 +817,25 @@ def publish_frontend(config, work, previous_work):
     publish_component(config, work, previous_work, "frontend")
 
 
+def require_unused_publication(work, kinds):
+    require(not (work / "images.json").exists() and not (work / "publication-progress.json").exists(), "Publication already attempted or accepted; no automatic retry")
+    for kind in kinds:
+        require(kind in {"backend", "frontend"}, "Unsupported publication component")
+        require(not (work / f"{kind}-publication-attempt.json").exists() and not (work / f"{kind}-publication-result.json").exists(), "Component publication already attempted; no automatic retry")
+
+
+def reserve_publication_attempt(work, kind, revision):
+    require(kind in {"backend", "frontend"}, "Unsupported publication component")
+    require(not (work / f"{kind}-publication-result.json").exists(), "Component publication already attempted; no automatic retry")
+    save_once(work / f"{kind}-publication-attempt.json", {
+        "revision": revision, "component": kind, "cpu": 2,
+        "timeout_seconds": 900, "status": "attempted",
+    })
+
+
 def publish_component(config, work, previous_work, kind):
     require(kind in {"backend", "frontend"}, "Unsupported publication component")
+    require_unused_publication(work, [kind])
     retained = "frontend" if kind == "backend" else "backend"
     source = verify_source(work)
     previous = private_path(previous_work)
@@ -839,12 +856,11 @@ def publish_component(config, work, previous_work, kind):
     require(checks["revision"] == smoke["revision"] == source["revision"], "Validation source mismatch")
     require(checks["lock_sha256"] == hashlib.sha256(command(["git", "show", source["revision"] + ":uv.lock"], cwd=ROOT)).hexdigest(), "Committed lock mismatch")
     require(smoke["passed"] is True and smoke["context_sha256"] == fingerprint(inventory) and smoke["modes_sha256"] == fingerprint(modes), "Runtime/context validation required")
-    attempt = work / (kind + "-publication-attempt.json")
-    require(not attempt.exists() and not (work / "images.json").exists(), "Component publication already attempted; no automatic retry")
-    save(attempt, {"revision": source["revision"], "timeout_seconds": 900, "status": "attempted"})
+    require_unused_publication(work, [kind])
     tag = "docintel/" + kind + ":" + source["revision"]
     build_directory = context if kind == "backend" else context / "frontend"
-    result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--timeout", "900", "--no-logs", "--file", str(context / kind / "Dockerfile"), "--image", tag, str(build_directory))
+    reserve_publication_attempt(work, kind, source["revision"])
+    result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--cpu", "2", "--timeout", "900", "--no-logs", "--file", str(context / kind / "Dockerfile"), "--image", tag, str(build_directory))
     save(work / (kind + "-publication-result.json"), {name: result.get(name) for name in ("runId", "status", "startTime", "finishTime")})
     require(result.get("status") == "Succeeded", "ACR build failed; no automatic retry")
     digest = azure("acr", "repository", "show", "--name", config["registry"], "--image", tag)["digest"]
@@ -1046,12 +1062,15 @@ def run(options):
         actual = {str(path.relative_to(work / "context")): hashlib.sha256(path.read_bytes()).hexdigest() for path in (work / "context").rglob("*") if path.is_file()}
         require(inventory == actual, "Build context drift")
         require(all(source["files"].get(relative) == digest for relative, digest in actual.items()), "Context differs from reviewed committed source")
+        require_unused_publication(work, ("backend", "frontend"))
         published = {"revision": source["revision"]}
         for kind in ("backend", "frontend"):
             context = work / "context" if kind == "backend" else work / "context/frontend"
             dockerfile = context / ("backend/Dockerfile" if kind == "backend" else "Dockerfile")
             tag = f"docintel/{kind}:{source['revision']}"
-            result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--timeout", "900", "--no-logs", "--file", str(dockerfile), "--image", tag, str(context))
+            reserve_publication_attempt(work, kind, source["revision"])
+            result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--cpu", "2", "--timeout", "900", "--no-logs", "--file", str(dockerfile), "--image", tag, str(context))
+            save(work / (kind + "-publication-result.json"), {name: result.get(name) for name in ("runId", "status", "startTime", "finishTime")})
             require(result.get("status") == "Succeeded", "ACR build did not succeed; inspect the run before another attempt")
             digest = azure("acr", "repository", "show", "--name", config["registry"], "--image", tag)["digest"]
             published[kind] = config["registry"] + f".azurecr.io/docintel/{kind}@" + digest

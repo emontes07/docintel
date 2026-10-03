@@ -161,9 +161,19 @@ python3.13 scripts/release.py publish --config "$CFG" --work "$WORK" --approve p
 The tool builds the root/backend and frontend contexts separately in the approved
 registry, records immutable digests and requires the committed lock/source hashes
 to match clean checks. It never uses the inherited registry or mutable `latest`.
-Each ACR build has a 900-second timeout. Absolute Dockerfile paths point into the
+Each ACR build explicitly requests **two CPUs** (`--cpu 2`) and a **900-second**
+timeout (`--timeout 900`). Absolute Dockerfile paths point into the
 verified context; only successful builds produce digest/run-ID receipts. A failure
 stops publication without automatically repeating either build.
+Full and component publication share atomic, create-once
+`backend-publication-attempt.json` / `frontend-publication-attempt.json` records
+in the same prescribed private `$WORK`. Each record is persisted before its ACR
+request: at most one backend and one frontend attempt are permitted, including
+failed or unknown outcomes and concurrent/rerun commands. Existing attempts,
+results, progress or accepted publication records are not reset or migrated.
+This enforcement is **work-directory scoped**. A different directory is not renewed
+approval; never discard receipts or switch directories to evade a consumed
+allowance. Review an unknown outcome without repeating the paid request.
 Record those digests in the private target configuration before baseline capture.
 
 ### Provisioning And Deployment

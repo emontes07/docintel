@@ -254,7 +254,7 @@ def test_restrictive_context_preserves_private_permissions(tmp_path):
     assert (tmp_path / "context-modes.json").stat().st_mode & 0o777 == 0o600
 
 
-@pytest.mark.parametrize("defect", [None, "smoke", "mode", "backend", "failed_build"])
+@pytest.mark.parametrize("defect", [None, "smoke", "mode", "backend", "failed_build", "unknown_build"])
 @pytest.mark.parametrize("kind", ["frontend", "backend"])
 def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path, monkeypatch, defect, kind):
     retained = "frontend" if kind == "backend" else "backend"
@@ -282,9 +282,14 @@ def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path,
         calls.append(arguments)
         if arguments[:2] == ("acr", "build"):
             assert arguments[arguments.index("--timeout") + 1] == "900"
+            assert arguments[arguments.index("--cpu") + 1] == "2"
+            attempt = release.private_json(work / f"{kind}-publication-attempt.json")
+            assert attempt["cpu"] == 2 and attempt["timeout_seconds"] == 900
             assert arguments[arguments.index("--image") + 1].startswith("docintel/" + kind + ":")
             assert arguments[arguments.index("--file") + 1] == str(context / kind / "Dockerfile")
             assert arguments[-1] == str(context if kind == "backend" else context / "frontend")
+            if defect == "unknown_build":
+                raise ValueError("Synthetic unknown build outcome")
             return {"status": "Failed" if defect == "failed_build" else "Succeeded", "runId": "synthetic-run"}
         return {"digest": "sha256:" + "c" * 64}
     monkeypatch.setattr(release, "azure", azure)
@@ -295,18 +300,26 @@ def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path,
     if defect:
         with pytest.raises(ValueError):
             release.publish_component(config, work, previous, kind)
-        assert len(calls) == (1 if defect == "failed_build" else 0)
+        assert len(calls) == (1 if defect in ("failed_build", "unknown_build") else 0)
     else:
         release.publish_component(config, work, previous, kind)
         receipt = json.loads((work / "images.json").read_text())
         assert receipt[retained] == previous_images[retained]
         assert receipt["preserved_" + retained]["revision"] == "b" * 40
         release.require_release_images({**config, kind + "_image": receipt[kind]}, work)
-    if defect in (None, "failed_build"):
+    if defect in (None, "failed_build", "unknown_build"):
         count = len(calls)
+        attempt_before = (work / f"{kind}-publication-attempt.json").read_bytes()
         with pytest.raises(ValueError, match="already attempted"):
             release.publish_component(config, work, previous, kind)
         assert len(calls) == count
+        from argparse import Namespace
+        monkeypatch.setattr(release, "load_config", lambda _: config)
+        monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
+        with pytest.raises(ValueError, match="already attempted"):
+            release.run(Namespace(action="publish", approve="publish", work=work, config=None))
+        assert len(calls) == count
+        assert (work / f"{kind}-publication-attempt.json").read_bytes() == attempt_before
     assert json.loads((previous / "images.json").read_text()) == previous_images
 
 
@@ -339,7 +352,7 @@ def test_packaging_requires_new_access_evidence_before_any_command(tmp_path, mon
         release.package(tmp_path, False)
 
 
-@pytest.mark.parametrize("build_status", ["Succeeded", "Failed"])
+@pytest.mark.parametrize("build_status", ["Succeeded", "Failed", "Unknown"])
 def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_path, monkeypatch, build_status):
     from argparse import Namespace
     config = {"registry": "synthetic", "subscription": "subscription"}
@@ -360,12 +373,17 @@ def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_p
     def azure(*args):
         if args[:2] == ("acr", "build"):
             builds.append(args)
+            kind = "backend" if len(builds) == 1 else "frontend"
+            attempt = release.private_json(tmp_path / f"{kind}-publication-attempt.json")
+            assert attempt["component"] == kind and attempt["cpu"] == 2 and attempt["timeout_seconds"] == 900
+            if build_status == "Unknown":
+                raise ValueError("Synthetic unknown build outcome")
             return {"status": build_status, "runId": "run-" + str(len(builds))}
         return {"digest": "sha256:" + "b" * 64}
     monkeypatch.setattr(release, "azure", azure)
     options = Namespace(action="publish", work=tmp_path, config=None, approve="publish")
-    if build_status == "Failed":
-        with pytest.raises(ValueError, match="did not succeed"):
+    if build_status in ("Failed", "Unknown"):
+        with pytest.raises(ValueError, match="did not succeed|unknown"):
             release.run(options)
         assert len(builds) == 1
         assert not (tmp_path / "images.json").exists()
@@ -378,6 +396,50 @@ def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_p
         assert dockerfile.is_absolute() and dockerfile.is_file()
         assert dockerfile.is_relative_to(Path(arguments[-1]))
         assert arguments[arguments.index("--timeout") + 1] == "900"
+        assert arguments[arguments.index("--cpu") + 1] == "2"
+    count = len(builds)
+    attempts = {path.name: path.read_bytes() for path in tmp_path.glob("*-publication-attempt.json")}
+    with pytest.raises(ValueError, match="already attempted"):
+        release.run(options)
+    with pytest.raises(ValueError, match="already attempted"):
+        release.publish_component(config, tmp_path, None, "backend")
+    assert len(builds) == count
+    assert {path.name: path.read_bytes() for path in tmp_path.glob("*-publication-attempt.json")} == attempts
+
+
+def test_publication_attempt_reservation_is_atomic_and_component_scoped(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    barrier = threading.Barrier(4)
+
+    def reserve(kind):
+        barrier.wait()
+        try:
+            release.reserve_publication_attempt(tmp_path, kind, "a" * 40)
+            return kind
+        except ValueError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(reserve, ("backend", "backend", "frontend", "frontend")))
+    assert outcomes.count("backend") == outcomes.count("frontend") == 1
+    assert len(list(tmp_path.glob("*-publication-attempt.json"))) == 2
+    for kind in ("backend", "frontend"):
+        before = (tmp_path / f"{kind}-publication-attempt.json").read_bytes()
+        with pytest.raises(ValueError, match="already attempted"):
+            release.reserve_publication_attempt(tmp_path, kind, "b" * 40)
+        assert (tmp_path / f"{kind}-publication-attempt.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("legacy", ["backend-publication-attempt.json", "frontend-publication-result.json", "publication-progress.json", "images.json"])
+def test_publication_does_not_reset_or_migrate_existing_records(tmp_path, legacy):
+    content = {"legacy": "retained"}
+    release.save(tmp_path / legacy, content)
+    before = (tmp_path / legacy).read_bytes()
+    with pytest.raises(ValueError, match="already attempted"):
+        release.require_unused_publication(tmp_path, ("backend", "frontend"))
+    assert (tmp_path / legacy).read_bytes() == before
 
 
 @pytest.mark.parametrize("nonempty", [False, True])
