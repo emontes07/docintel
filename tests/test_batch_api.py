@@ -53,11 +53,12 @@ def test_hosted_legacy_routes_and_local_header_are_closed(monkeypatch):
     assert TestClient(development_app, client=("127.0.0.1", 9999)).get("/api/v1/batches", headers={"x-docintel-development": "1"}).status_code == 503
 
 
-def test_hosted_synthetic_continuation_review_and_export(tmp_path, monkeypatch):
+@pytest.mark.parametrize("blob_reads", [False, True])
+def test_hosted_synthetic_continuation_review_and_export(tmp_path, monkeypatch, blob_reads):
     import socket
     from types import SimpleNamespace
     from backend.batch import BatchService
-    from backend.batch_store import SQLiteStore
+    from backend.batch_store import BlobStore, SQLiteStore
     from backend.batch_worker import run_batch
     from scripts.release_fixture import prepare, verify_export
 
@@ -77,7 +78,21 @@ def test_hosted_synthetic_continuation_review_and_export(tmp_path, monkeypatch):
     other = {"authorization": "Bearer " + jwt.encode({**claims, "oid": frontend}, key, algorithm="RS256")}
     fixture = tmp_path / "fixture"
     prepare(fixture)
-    store = SQLiteStore(tmp_path / "state")
+    def open_store():
+        backing = SQLiteStore(tmp_path / "state")
+        if blob_reads:
+            original_read = backing.read_bytes
+            def blob_client(key):
+                def download_blob(*, offset, length):
+                    assert offset == 0 and length > 0
+                    content, etag = original_read(key, max_bytes=length)
+                    return SimpleNamespace(readall=lambda: content[offset:offset + length], properties=SimpleNamespace(etag=etag))
+                return SimpleNamespace(download_blob=download_blob)
+            adapter = object.__new__(BlobStore)
+            adapter.container = SimpleNamespace(get_blob_client=blob_client)
+            backing.read_bytes = adapter.read_bytes
+        return backing
+    store = open_store()
     for path in (fixture / "seed").rglob("*"):
         if path.is_file():
             store.write_bytes(path.relative_to(fixture / "seed").as_posix(), path.read_bytes())
@@ -103,7 +118,7 @@ def test_hosted_synthetic_continuation_review_and_export(tmp_path, monkeypatch):
     run_batch(store, batch_id, item_limit=1, concurrency=1)
     assert client.get(base, headers=headers).json()["state"] == "queued"
     first_result = store.read_bytes(f"results/{batch_id}/row-2.json")
-    batch_service = BatchService(SQLiteStore(tmp_path / "state"))
+    batch_service = BatchService(open_store())
     run_batch(batch_service.store, batch_id, item_limit=1, concurrency=1)
     assert client.get(base, headers=headers).json()["state"] == "completed"
     hashes = {}
@@ -124,7 +139,7 @@ def test_hosted_synthetic_continuation_review_and_export(tmp_path, monkeypatch):
     assert client.post(reviews, headers=headers, json=review).status_code == 200
     assert client.post(reviews, headers=headers, json=review).status_code == 422
     run_batch(batch_service.store, batch_id, processor=lambda *_: pytest.fail("Completed work repeated"))
-    batch_service = BatchService(SQLiteStore(tmp_path / "state"))
+    batch_service = BatchService(open_store())
     assert all(batch_service.store.read_bytes(f"results/{batch_id}/row-{row}.json") == original for row, original in originals.items())
     assert not batch_service.store.keys("analysis-attempts/") and not batch_service.store.keys("budgets/")
     exported = client.get(base + "/export", headers=headers)

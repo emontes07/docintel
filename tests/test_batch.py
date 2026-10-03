@@ -135,6 +135,64 @@ def test_finite_worker_preserves_blocked_sources_and_resumes_without_repeating(s
     assert service.items(record["id"], "actor", view="pending")["total"] == 2
 
 
+def test_blob_read_passes_installed_sdk_validation_without_network(monkeypatch):
+    from unittest.mock import Mock
+    from azure.core.pipeline.transport import RequestsTransport
+    from azure.storage.blob import BlobClient
+    from backend.batch_store import BlobStore
+
+    class TransportReached(RuntimeError):
+        pass
+
+    requests = []
+    def blocked_transport(self, request, **kwargs):
+        requests.append(request)
+        raise TransportReached("SDK validation passed; network blocked")
+
+    monkeypatch.setattr(RequestsTransport, "send", blocked_transport)
+    client = BlobClient("https://synthetic.invalid", "synthetic", "record")
+    with pytest.raises(ValueError, match="Offset value must not be None"):
+        client.download_blob(length=5)
+    assert not requests
+    store = object.__new__(BlobStore)
+    store.container = Mock()
+    store.container.get_blob_client.return_value = client
+    with pytest.raises(TransportReached):
+        store.read_bytes("record", max_bytes=4)
+    assert len(requests) == 1
+    assert requests[0].headers["x-ms-range"] == "bytes=0-4"
+
+
+@pytest.mark.parametrize("content", [b"", b"a", b"1234", b"12345"])
+def test_blob_read_preserves_bound_and_size_detection(content):
+    from unittest.mock import Mock
+    from backend.batch_store import BlobStore
+    store = object.__new__(BlobStore)
+    store.container = Mock()
+    blob = store.container.get_blob_client.return_value
+    response = blob.download_blob.return_value
+    response.readall.return_value = content
+    response.properties.etag = "synthetic-etag"
+    if len(content) > 4:
+        with pytest.raises(ValueError, match="exceeds read limit"):
+            store.read_bytes("record", max_bytes=4)
+    else:
+        assert store.read_bytes("record", max_bytes=4) == (content, "synthetic-etag")
+    blob.download_blob.assert_called_once_with(offset=0, length=5)
+
+
+def test_blob_missing_read_still_maps_to_missing():
+    from unittest.mock import Mock
+    from azure.core.exceptions import ResourceNotFoundError
+    from backend.batch_store import BlobStore
+    store = object.__new__(BlobStore)
+    store.container = Mock()
+    store.container.get_blob_client.return_value.download_blob.side_effect = ResourceNotFoundError("synthetic missing blob")
+    with pytest.raises(Missing):
+        store.read_bytes("missing", max_bytes=4)
+    store.container.get_blob_client.return_value.download_blob.assert_called_once_with(offset=0, length=5)
+
+
 def test_blob_conditional_write_uses_blob_client_response():
     from unittest.mock import Mock
     from backend.batch_store import BlobStore
