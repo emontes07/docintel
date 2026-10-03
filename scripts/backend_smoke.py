@@ -1,10 +1,20 @@
-"""Verify non-root backend startup and the installed Blob SDK contract offline."""
+"""Verify non-root startup with synthetic hosted authentication and offline Blob SDK checks."""
 
 import argparse
 import json
 from pathlib import Path
 
 from scripts.release import command, fingerprint, require, save
+
+SMOKE_ENVIRONMENT = {
+    "DOCINTEL_BATCH_MODE": "hosted",
+    "DOCINTEL_AUTH_TENANT_ID": "11111111-1111-4111-8111-111111111111",
+    "DOCINTEL_AUTH_AUDIENCE": "synthetic-batch-api",
+    "DOCINTEL_AUTH_CLIENT_ID": "22222222-2222-4222-8222-222222222222",
+    "DOCINTEL_BATCH_LIVE_ENABLED": "false",
+    "DOCINTEL_REAL_PILOT_ENABLED": "false",
+    "DOCINTEL_PILOT_UPLOAD_ENABLED": "false",
+}
 
 
 def smoke(work, image):
@@ -66,7 +76,8 @@ with patch.object(RequestsTransport, "send", blocked):
     else:
         raise AssertionError("SDK boundary not exercised")
 '''
-    output = command(["docker", "run", "--rm", "--network", "none", "--entrypoint", "/app/.venv/bin/python", image, "-c", code])
+    environment = [argument for name, value in SMOKE_ENVIRONMENT.items() for argument in ["--env", f"{name}={value}"]]
+    output = command(["docker", "run", "--rm", "--network", "none", *environment, "--entrypoint", "/app/.venv/bin/python", image, "-c", code])
     require("DOCINTEL_BACKEND_SDK_RANGE_OK" in output.decode().splitlines(), "Backend SDK runtime check failed")
     require("DOCINTEL_BACKEND_NONROOT_STARTUP_OK" in output.decode().splitlines(), "Backend non-root startup failed")
     source = json.loads((work / "source.json").read_text())
