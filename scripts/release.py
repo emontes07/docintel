@@ -144,9 +144,24 @@ def desired_containers(config, kind, baseline):
     return containers
 
 
+def writable_containers(containers):
+    supported = {"name", "image", "command", "args", "env", "resources", "probes", "volumeMounts"}
+    result = []
+    for container in containers:
+        require(not (set(container) - supported - {"imageType"}), "Unknown container fields; review compatibility with API 2024-03-01")
+        require(container.get("imageType") in (None, "ContainerImage"), "Unsupported image type for API 2024-03-01")
+        projected = {name: copy.deepcopy(value) for name, value in container.items() if name in supported}
+        if projected.get("resources") is not None:
+            resources = projected["resources"]
+            require(not (set(resources) - {"cpu", "memory", "ephemeralStorage"}), "Unknown container resource fields; review write compatibility")
+            resources.pop("ephemeralStorage", None)
+        result.append(projected)
+    return result
+
+
 def patch_app(config, kind, containers, work):
     body = work / (kind + "-patch.json")
-    save(body, {"properties": {"template": {"containers": containers}}})
+    save(body, {"properties": {"template": {"containers": writable_containers(containers)}}})
     resource = f"/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.App/containerApps/{config[kind]}"
     azure("rest", "--method", "PATCH", "--url", "https://management.azure.com" + resource + "?api-version=2024-03-01", "--body", "@" + str(body))
 
