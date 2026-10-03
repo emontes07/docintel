@@ -157,7 +157,7 @@ jobs:
           if (existsSync(lock)) copyFileSync(lock, `${environment.EVIDENCE}/uv.lock`);
           const checks = `${environment.RELEASE_WORK}/clean-checks.json`;
           if (existsSync(checks)) copyFileSync(checks, `${environment.EVIDENCE}/clean-checks.json`);
-          for (const name of ['context.json', 'context-modes.json', 'frontend-smoke.json']) {
+          for (const name of ['context.json', 'context-modes.json', 'frontend-smoke.json', 'frontend-smoke-diagnostics.json']) {
             const path = `${environment.RELEASE_WORK}/${name}`;
             if (existsSync(path)) copyFileSync(path, `${environment.EVIDENCE}/${name}`);
           }
