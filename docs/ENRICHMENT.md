@@ -3,9 +3,16 @@
 [README](../README.md) | [User guide](USER_GUIDE.md) | [Local pilot](../PILOT.md)
 
 This developer guide retains the README's earlier single-product CLI and diagnostic
-scope. It is not the business batch submission workflow. The dependency lock and
-clean-install gate in [BATCH.md](../BATCH.md#deployment-mapping-and-release-gates)
-still applies; use only the existing installed environment for offline checks.
+scope. It is not the business batch submission workflow. The committed dependency
+lock is reconciled; each release still requires a clean locked validation.
+
+The separate `real_pilot` batch mode uses the same extraction, citation validation,
+immutable result, review, and export contracts. It calls the attribute-level cascade:
+internal PDF, vendor table, manufacturer web, then explicitly permitted web.
+Later tiers receive only unresolved/conflicted attributes. Source failures remain
+visible without discarding independent supported findings. This mode requires
+server-side scope, service, deadline, attempt, token, and cost reservations; selecting
+it in the portal is not operator approval.
 
 ## Replay And Explicit Live Mode
 
@@ -44,8 +51,8 @@ are not loaded automatically. No WebIQ key is needed for extraction.
 
 A bundle includes `manifest.product` (`item_id`, `vendor`, `mpn`, `hierarchy_node`),
 typed `attributes`, optional `existing_values`, and explicit `source_ids`. Every
-source must match all product fields and supply either a parsed `document` or an
-`error_code`. A document has `source`, `cache_key`, `parsed_at`, and located
+source must match all product fields and supply a parsed `document`, explicitly
+located `excerpts`, or an `error_code`. A document has `source`, `cache_key`, `parsed_at`, and located
 paragraphs/table cells. Unlocated `raw_text` is not cited evidence. Missing page,
 provider retrieval time, or source publication time is not invented; application
 observation time is distinct.
@@ -54,6 +61,15 @@ Attribute examples never become prompt evidence or reference answers. Candidate
 validation checks cited IDs, type, unit, and literal support, not inferred
 conversions or full semantic correctness. Conflicts remain separate, existing
 values remain unchanged, and partial source failure can coexist with proposals.
+Real-pilot proposals additionally require verbatim supporting quotations and
+product/component applicability qualifications. Evidence has an explicit source
+tier and approved attribute scope. Unknown numeric units are not assumed
+dimensionless: unit guidance must be resolved before a numeric proposal is accepted.
+The original cited unit remains in evidence. Definition context and
+examples are not evidence. Optional model confidence is not measured accuracy.
+WebIQ discovery passages are not substituted for separately retrieved original
+source content. PDF pilot analysis is bounded to the first five pages, with that
+limitation retained in provenance.
 Only missing definitions, product identity, and selected source excerpts/provenance
 enter the prompt. Model errors never fall back to replay or web.
 

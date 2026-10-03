@@ -37,6 +37,7 @@ class SourceBinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
     reference: str = Field(min_length=1)
     source_id: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
+    owner: str | None = None
     kind: Literal["blob", "sharepoint", "web"]
     products: list[ProductKey] = Field(min_length=1)
     format: Literal["pdf", "xlsx", "web"] = "pdf"
@@ -53,6 +54,13 @@ class SourceBinding(BaseModel):
 
     @model_validator(mode="after")
     def validate_source(self):
+        if self.owner is not None:
+            try:
+                parts = self.owner.split("/")
+                if len(parts) != 2 or any(str(uuid.UUID(part)) != part for part in parts):
+                    raise ValueError
+            except ValueError:
+                raise ValueError("Source owner must be canonical tenantUUID/objectUUID") from None
         if not self.reference.strip():
             raise ValueError("Source reference must not be blank")
         if self.kind == "blob" and (not self.blob or not self.blob.startswith("documents/") or ".." in self.blob.split("/") or not re.fullmatch(r"[a-f0-9]{64}", self.sha256 or "")):
@@ -239,18 +247,18 @@ class BatchService:
     def __init__(self, store):
         self.store = store
 
-    def catalog(self):
+    def catalog(self, actor=None):
         try:
             record, _ = read_json(self.store, "configuration/sources.json")
             sources = [SourceBinding.model_validate(source).model_dump(mode="json") for source in record["sources"]]
             if len({source["reference"] for source in sources}) != len(sources) or len({source["source_id"] for source in sources}) != len(sources):
                 raise ValueError("Source references and IDs must be unique")
-            return sources
+            return [source for source in sources if actor is None or source.get("owner") in {None, actor}]
         except Missing:
             return []
 
     def intake(self, manifest_bytes, attribute_bytes, attribute_reference, actor):
-        catalog = self.catalog()
+        catalog = self.catalog(actor)
         validation = validate_batch(manifest_bytes, attribute_bytes, attribute_reference, catalog)
         batch_id = digest((actor + ":" + attribute_reference + ":" + validation["input_hashes"]["manifest"] + ":" + validation["input_hashes"]["attributes"] + ":" + digest(json.dumps(catalog, sort_keys=True).encode())).encode())
         record = {"id": batch_id, "owner": actor, "created_at": now(), "state": "validated" if validation["valid"] else "invalid", **validation}

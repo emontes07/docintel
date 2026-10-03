@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 async function proxy(request: NextRequest, context: { params: Promise<{ path?: string[] }> }) {
   const { path = [] } = await context.params;
   const route = path.join("/");
-  const allowed = /^(?:|catalog|validate|[a-f0-9]{64}(?:\/(?:submit|export|items(?:\/row-\d+(?:\/reviews)?)?))?)$/;
+  const allowed = /^(?:|catalog|validate|pilot-sources\/(?:finalize|[A-Za-z0-9][A-Za-z0-9._-]{0,119})|[a-f0-9]{64}(?:\/(?:submit|export|items(?:\/row-\d+(?:\/reviews)?)?))?)$/;
   if (!allowed.test(route)) return NextResponse.json({ detail: "Unknown batch route" }, { status: 404 });
   const host = request.headers.get("host") || "";
   const development = process.env.NODE_ENV !== "production" && !process.env.CONTAINER_APP_NAME && !process.env.IDENTITY_ENDPOINT && process.env.DOCINTEL_BATCH_DEV === "true" && /^(localhost|127\.0\.0\.1)(:\d+)?$/.test(host);

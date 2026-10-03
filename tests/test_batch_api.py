@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from backend.batch_api import development_app
 from backend.batch_auth import verify_token
 from tests.test_batch import service, workbooks
+from tests.test_pilot_upload import OWNER, PDF, no_network, pilot
 
 
 def test_routes_are_authenticated_and_do_not_accept_reviewer_spoofing(service, monkeypatch):
@@ -51,6 +52,85 @@ def test_hosted_legacy_routes_and_local_header_are_closed(monkeypatch):
     for path in ["/api/v1/metadata", "/api/v1/gallery", "/static/private.png", "/api/v1/env", "/docs"]:
         assert client.get(path, headers={"x-docintel-development": "1"}).status_code == 404
     assert TestClient(development_app, client=("127.0.0.1", 9999)).get("/api/v1/batches", headers={"x-docintel-development": "1"}).status_code == 503
+
+
+@pytest.fixture
+def upload_api(pilot, monkeypatch):
+    from types import SimpleNamespace
+    from backend.batch import BatchService
+
+    tenant, object_id = OWNER.split("/")
+    frontend = "99999999-9999-4999-8999-999999999999"
+    for name, value in {"DOCINTEL_BATCH_MODE": "hosted", "DOCINTEL_AUTH_TENANT_ID": tenant,
+                        "DOCINTEL_AUTH_AUDIENCE": "batch-api", "DOCINTEL_AUTH_CLIENT_ID": frontend,
+                        "DOCINTEL_REAL_PILOT_ENABLED": "false"}.items():
+        monkeypatch.setenv(name, value)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    claims = {"tid": tenant, "oid": object_id, "azp": frontend, "scp": "Batch.Access",
+              "aud": "batch-api", "iss": f"https://login.microsoftonline.com/{tenant}/v2.0",
+              "iat": datetime.now(timezone.utc), "nbf": datetime.now(timezone.utc),
+              "exp": datetime.now(timezone.utc) + timedelta(minutes=5)}
+    monkeypatch.setattr("backend.batch_auth.keys", lambda _: SimpleNamespace(get_signing_key_from_jwt=lambda _: SimpleNamespace(key=key.public_key())))
+    monkeypatch.setattr("backend.batch_api.service", lambda: BatchService(pilot.store))
+    headers = {"authorization": "Bearer " + jwt.encode(claims, key, algorithm="RS256")}
+    other = {"authorization": "Bearer " + jwt.encode({**claims, "oid": frontend}, key, algorithm="RS256")}
+    return TestClient(development_app), headers, other, pilot
+
+
+def test_approved_upload_routes_require_exact_owner_and_filename(upload_api, monkeypatch):
+    client, headers, other, pilot = upload_api
+    base = "/api/v1/batches/pilot-sources"
+    files = {"document": ("manual.pdf", PDF)}
+    assert client.post(base + "/manual", files=files).status_code == 401
+    assert client.get("/api/v1/batches/catalog", headers=other).json()["source_upload"] is None
+    assert client.post(base + "/manual", headers=other, files=files).status_code == 404
+    assert client.post(base + "/finalize", headers=other, json={}).status_code == 404
+    assert client.post(base + "/unapproved", headers=headers, files=files).status_code == 404
+    assert client.post(base + "/manual", headers=headers, files={"document": ("different.pdf", PDF)}).status_code == 422
+    assert client.post(base + "/manual", headers=headers, files={"document": ("manual.pdf", PDF + b"changed")}).status_code == 422
+    assert client.post(base + "/manual", headers=headers, files=files).status_code == 200
+    assert client.post(base + "/manual", headers=headers, files=files).status_code == 200
+    monkeypatch.setenv("DOCINTEL_PILOT_UPLOAD_ENABLED", "false")
+    assert client.get("/api/v1/batches/catalog", headers=headers).json()["source_upload"] is None
+    assert client.post(base + "/manual", headers=headers, files=files).status_code == 404
+
+
+def test_source_finalize_route_verifies_all_documents_and_preserves_registry(upload_api, monkeypatch):
+    from tests.test_pilot_upload import XLSX
+
+    client, headers, other, pilot = upload_api
+    base = "/api/v1/batches/pilot-sources"
+    catalog = client.get("/api/v1/batches/catalog", headers=headers).json()
+    assert client.post(base + "/finalize", headers=headers, json={}).status_code == 409
+    for document in catalog["source_upload"]:
+        content = XLSX if document["filename"].endswith(".xlsx") else PDF
+        response = client.post(base + "/" + document["source_id"], headers=headers, files={"document": (document["filename"], content)})
+        assert response.status_code == 200, response.json()
+    finalized = client.post(base + "/finalize", headers=headers, json={})
+    assert finalized.status_code == 200 and finalized.json()["status"] == "ready"
+    assert client.post(base + "/finalize", headers=headers, json={}).json() == finalized.json()
+    updated = client.get("/api/v1/batches/catalog", headers=headers).json()["sources"]
+    assert {source["source_id"] for source in updated} >= {source["source_id"] for source in catalog["sources"]}
+    private_ids = {document["source_id"] for document in catalog["source_upload"]}
+    assert private_ids <= {source["source_id"] for source in updated}
+    monkeypatch.setenv("DOCINTEL_PILOT_UPLOAD_ENABLED", "false")
+    other_sources = client.get("/api/v1/batches/catalog", headers=other).json()["sources"]
+    assert not private_ids & {source["source_id"] for source in other_sources}
+
+
+def test_intake_cannot_bind_another_owners_private_sources(service):
+    from backend.batch_store import read_json, write_json
+
+    registry, etag = read_json(service.store, "configuration/sources.json")
+    for source in registry["sources"]:
+        source["owner"] = OWNER
+    write_json(service.store, "configuration/sources.json", registry, version=etag)
+    manifest, attributes = workbooks()
+    assert service.intake(manifest, attributes, "definitions.xlsx", OWNER)["valid"]
+    other = OWNER.split("/")[0] + "/99999999-9999-4999-8999-999999999999"
+    denied = service.intake(manifest, attributes, "definitions.xlsx", other)
+    assert not denied["valid"]
+    assert all(not item["sources"] for item in denied["items"])
 
 
 @pytest.mark.parametrize("blob_reads", [False, True])

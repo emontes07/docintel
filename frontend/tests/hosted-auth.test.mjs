@@ -62,3 +62,43 @@ test("owner-isolation helper verifies a second authenticated identity", async co
   assert.deepEqual(await verifyOtherOwner(page, options), { ownerIsolation: true });
   await assert.rejects(verifyOtherOwner(page, { ...options, expectedOwner: "wrong-owner" }), /owner mismatch/);
 });
+
+test("private source upload proxy preserves authentication, origin and route bounds", async context => {
+  const environment = { NODE_ENV: "production", DOCINTEL_PORTAL_ORIGIN: "https://portal.invalid", DOCINTEL_BATCH_API_URL: "https://backend.invalid/api/v1/batches" };
+  const previous = Object.fromEntries(Object.keys(environment).map(key => [key, process.env[key]]));
+  Object.assign(process.env, environment);
+  let token = { batchAccessToken: "synthetic-token", batchExpiresAt: Date.now() / 1000 + 60 };
+  const routeModule = { exports: {} };
+  const routeSource = readFileSync(new URL("../app/api/batches/[[...path]]/route.ts", import.meta.url), "utf8");
+  const routeCode = ts.transpileModule(routeSource, { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText;
+  const mockRequire = name => name === "next-auth/jwt" ? { getToken: async () => token } : require(name);
+  new Function("require", "module", "exports", routeCode)(mockRequire, routeModule, routeModule.exports);
+  const requests = [];
+  context.mock.method(globalThis, "fetch", async (url, options) => {
+    requests.push({ url, options });
+    return new Response('{"verified":true}', { headers: { "content-type": "application/json" } });
+  });
+  const post = (path, origin = environment.DOCINTEL_PORTAL_ORIGIN) => routeModule.exports.POST(
+    new NextRequest(`${environment.DOCINTEL_PORTAL_ORIGIN}/api/batches/${path.join("/")}`, { method: "POST", headers: { origin }, body: "synthetic-bytes" }),
+    { params: Promise.resolve({ path }) },
+  );
+  try {
+    assert.equal((await post(["pilot-sources", "approved-source"])).status, 200);
+    assert.equal(requests[0].url, "https://backend.invalid/api/v1/batches/pilot-sources/approved-source");
+    assert.equal(requests[0].options.headers.Authorization, "Bearer synthetic-token");
+    assert.equal(requests[0].options.redirect, "error");
+    assert.equal(requests[0].options.body.toString(), "synthetic-bytes");
+    assert.equal((await post(["pilot-sources", "finalize"])).status, 200);
+    assert.equal((await post(["pilot-sources", ".."])).status, 404);
+    assert.equal((await post(["pilot-sources", "approved-source", "extra"])).status, 404);
+    assert.equal((await post(["pilot-sources", "approved-source"], "https://untrusted.invalid")).status, 403);
+    token = null;
+    assert.equal((await post(["pilot-sources", "approved-source"])).status, 401);
+    assert.equal(requests.length, 2);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});

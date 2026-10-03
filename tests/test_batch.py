@@ -260,6 +260,25 @@ def test_intake_enabled_sharepoint_uses_url_and_retrieval_compatible_source_id()
     }).source_id == "Legacy.PDF_1"
 
 
+def test_intake_source_binding_owner_requires_canonical_hosted_identity():
+    from backend.batch import SourceBinding
+    source = {
+        "reference": "synthetic.pdf", "source_id": "synthetic", "kind": "sharepoint",
+        "products": [{"item_id": "001", "vendor": "Synthetic", "mpn": "PART-1", "hierarchy_node": "Valve"}],
+    }
+    owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    assert SourceBinding(**source).owner is None
+    assert SourceBinding(**source, owner=None).owner is None
+    assert SourceBinding(**source, owner=owner).model_dump()["owner"] == owner
+    for invalid in [
+        "", "development:local-unverified", "tenant/object", owner.upper(),
+        owner.replace("-", ""), owner.split("/")[0], owner + "/extra",
+        " " + owner, owner + " ", owner.replace("/", "/{") + "}",
+    ]:
+        with pytest.raises(ValueError):
+            SourceBinding(**source, owner=invalid)
+
+
 @pytest.mark.parametrize("url", ["http://example.invalid", "https://user:password@example.invalid", "https://example.invalid/#fragment", "file:///private.xlsx", "https://example.invalid/a b"])
 def test_intake_web_registration_rejects_nonapproved_url_shapes(url):
     from backend.batch import SourceBinding
