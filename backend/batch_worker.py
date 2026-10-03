@@ -8,16 +8,21 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from urllib.parse import quote, urlsplit
 
 from azure.identity import ManagedIdentityCredential, get_bearer_token_provider
+from azure.core.exceptions import AzureError
 
 from backend.batch import digest, now
 from backend.batch_store import Conflict, Missing, configured_store, read_json, write_json
-from backend.core.docintel import DocumentIntelligenceService, ParsedDocument
+from backend.core.docintel import DocumentIntelligenceError, DocumentIntelligenceService, ParsedDocument
 from backend.core.llm import LLMClient, COGNITIVE_SERVICES_SCOPE
-from backend.extract import run_enrichment
-from backend.models.enrichment import ExtractionResponse, LiveBundle, Manifest, OfflineBundle, OfflineSource, ProductKey, ReviewAnnotation
+from backend.core.websearch import WebSearchError
+from backend.extract import ExecutionConfigurationError, run_enrichment
+from backend.models.enrichment import Evidence, ExtractionResponse, LiveBundle, Manifest, OfflineBundle, OfflineSource, ProductKey, ReviewAnnotation
 from backend.pilot import PARSER_VERSION, QUALIFICATIONS
+from backend.multisource import run_cascade
+from backend.real_pilot import RealPilotGuard
 
 
 class ManagedCompletion:
@@ -68,6 +73,12 @@ class BatchProcessor:
 
     def source(self, binding, product, allow_analysis):
         provenance = {"source_id": binding["source_id"], "kind": binding["kind"], "reference": binding["reference"], "retrieval": "failed", "parsing": "not_attempted"}
+        if binding.get("format", "pdf") != "pdf":
+            provenance.update(error="source_requires_separately_approved_real_pilot", retrieval="not_attempted")
+            return OfflineSource(
+                source_id=binding["source_id"], product=product, error_code="access_denied",
+                source_tier=binding.get("source_tier", "internal_pdf"),
+            ), provenance
         if binding["kind"] == "sharepoint":
             provenance.update(error="sharepoint_download_401", retained_stages=[200, 302, 401], sha256=None)
             return OfflineSource(source_id=binding["source_id"], product=product, error_code="access_denied"), provenance
@@ -167,6 +178,351 @@ class BatchProcessor:
         return result, {"state": "unresolved" if unresolved else "completed", "error": "; ".join(errors), "provenance": provenance}
 
 
+REAL_PROMPT_VERSION = "multisource-qualified-v1"
+
+
+def identity_matches(text, terms):
+    return bool(terms) and all(
+        re.search(rf"(?<![\w./-]){re.escape(term)}(?![\w./-])", text, re.IGNORECASE)
+        for term in terms
+    )
+
+
+class RealBatchProcessor(BatchProcessor):
+    """Explicit approved real pilot; the legacy synthetic path remains unchanged."""
+
+    def __init__(self, store, record, guard):
+        super().__init__(store)
+        self.record = record
+        self.guard = guard
+        self.downloads = {}
+        self.inference_provenance = []
+
+    def reserve_real(self, *args, **kwargs):
+        try:
+            return self.guard.reserve(*args, **kwargs)
+        except (ValueError, Missing) as error:
+            raise ExecutionConfigurationError("Real-pilot authorization or consumption guard stopped execution") from error
+
+    def key(self, item, purpose, version):
+        return self.guard.operation_key(
+            item, tier=purpose, source_version=version, prompt_version=REAL_PROMPT_VERSION,
+        )
+
+    def document_bytes(self, binding, item, provenance):
+        from backend.core.pilot_sources import SourceReference, retrieve_document
+
+        if binding["kind"] == "blob":
+            content, etag = self.store.read_bytes(binding["blob"], max_bytes=10 * 1024 * 1024)
+            if digest(content) != binding["sha256"]:
+                raise ValueError("Approved source content changed")
+            location = "batchblob:///" + binding["blob"]
+            provenance.update(
+                retrieval="succeeded", location=location, etag=etag,
+                sha256=digest(content), origin="approved_copy_not_sharepoint_ingestion",
+            )
+            return content, location
+        cache_id = digest(json.dumps(binding, sort_keys=True).encode())
+        if cache_id not in self.downloads:
+            if not binding.get("enabled"):
+                raise ValueError("SharePoint source disabled pending approved access")
+            self.reserve_real(
+                "retrieval", self.key(item, "retrieval", cache_id), item_key=item["item_key"],
+            )
+            reference = SourceReference(
+                source_id=binding["source_id"], kind="sharepoint",
+                location=binding["url"], expected_sha256=binding["sha256"],
+                drive_id=binding["drive_id"], item_id=binding["item_id"],
+                tenant_id=binding.get("tenant_id"), enabled=True,
+            )
+            self.downloads[cache_id] = retrieve_document(
+                reference, format=binding["format"],
+                credential=ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None),
+            )
+        downloaded = self.downloads[cache_id]
+        provenance["download"] = downloaded.metadata
+        if downloaded.metadata["status"] != "success":
+            provenance["error"] = downloaded.metadata.get("error_code", "retrieval_failed")
+            raise ValueError("Approved source download did not succeed")
+        provenance.update(retrieval="succeeded", sha256=downloaded.metadata["sha256"])
+        return downloaded.content, binding["url"]
+
+    def real_document(self, binding, item, scope, provenance):
+        product = ProductKey.model_validate(item["manifest"]["product"])
+        content, location = self.document_bytes(binding, item, provenance)
+        if binding["format"] == "xlsx":
+            return self.table_source(binding, content, location, product, scope, provenance)
+        if not content.startswith(b"%PDF-"):
+            raise ValueError("Approved PDF bytes are invalid")
+        cache_key = "parses/" + digest((location + binding["sha256"] + PARSER_VERSION + ":pages=1-5").encode()) + ".json"
+        full_cache_key = "parses/" + digest((location + binding["sha256"] + PARSER_VERSION).encode()) + ".json"
+        try:
+            document, origin = self.cached(full_cache_key, binding, location)
+            provenance.update(parsing="cache", parse_origin=origin)
+            cache_key = full_cache_key
+        except Missing:
+            pass
+        with self.store.lease(cache_key):
+            try:
+                document, origin = self.cached(cache_key, binding, location)
+                provenance.update(parsing="cache", parse_origin=origin)
+            except Missing:
+                reservation = self.reserve_real(
+                    "analysis", self.key(item, "analysis", location + binding["sha256"]),
+                    item_key=item["item_key"], analysis_pages=5,
+                )
+                parser = DocumentIntelligenceService(
+                    credential=ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None),
+                )
+                document = parser.extract_pdf_bytes(content, source=location, page_limit=5)
+                page_count = getattr(parser, "last_page_count", None)
+                if page_count is not None:
+                    try:
+                        self.guard.record_usage(reservation["reservation_id"], analysis_pages=page_count)
+                    except (ValueError, Missing) as error:
+                        raise ExecutionConfigurationError("Real-pilot page usage invalidated its reservation") from error
+                if document.cache_key != "sha256:" + binding["sha256"] or document.source != location:
+                    raise ValueError("Parser source/version mismatch")
+                write_json(self.store, cache_key, {
+                    "parser_version": PARSER_VERSION, "origin": "real_pilot_analysis_first_five_pages",
+                    "document": document.model_dump(mode="json"),
+                    "document_sha256": digest(document.model_dump_json().encode()),
+                })
+                provenance.update(parsing="fresh_analysis", reservation=reservation["reservation_id"], analyzed_pages=page_count)
+        provenance["limitation"] = (
+            "Compatible prior parse reused; shared-family values need explicit applicability."
+            if cache_key == full_cache_key else
+            "Only the first five PDF pages are eligible; shared-family values need explicit applicability."
+        )
+        text = document.raw_text + "\n" + "\n".join(paragraph.text for paragraph in document.paragraphs)
+        if not identity_matches(text, scope["identity_terms"]):
+            raise ValueError("Approved product/family identity not established")
+        document = document.model_copy(deep=True)
+        other_mpns = [entry["mpn"] for entry in binding["products"] if entry != product.model_dump()]
+        for paragraph in document.paragraphs:
+            if any(identity_matches(paragraph.text, [mpn]) for mpn in other_mpns) and not identity_matches(paragraph.text, [product.mpn]):
+                paragraph.text = ""
+        for table in document.tables:
+            if any(identity_matches(" ".join(row), [mpn]) for row in table.cells for mpn in [product.mpn, *other_mpns]):
+                table.cells = [
+                    row if identity_matches(" ".join(row), [product.mpn]) or not any(identity_matches(" ".join(row), [mpn]) for mpn in other_mpns)
+                    else [""] * len(row) for row in table.cells
+                ]
+        return OfflineSource(
+            source_id=binding["source_id"], source_tier=binding["source_tier"],
+            product=product, document=document, attribute_ids=scope["attribute_ids"],
+            qualification=scope["qualification"] + " " + provenance["limitation"],
+            provider_retrieved_at=datetime.now(timezone.utc),
+        )
+
+    def table_source(self, binding, content, location, product, scope, provenance):
+        from backend.core.vendor_tables import VendorTableConfig, read_vendor_table
+
+        config = VendorTableConfig.model_validate(binding.get("table"))
+        chunks = read_vendor_table(content, config=config, product=product, source_id=binding["source_id"])
+        if not chunks:
+            raise ValueError("No exact vendor/part row in the approved spreadsheet")
+        observed = datetime.now(timezone.utc)
+        evidence = [
+            Evidence(
+                evidence_id=f"{binding['source_id']}:{binding['sha256']}:{chunk.sheet}:{chunk.row}",
+                source_id=binding["source_id"],
+                source_locator=location + "#sheet=" + quote(chunk.sheet, safe="")
+                + f"&row={chunk.row}&cells=" + ",".join(chunk.cells),
+                source_version="sha256:" + binding["sha256"],
+                source_tier="vendor_table", content_kind="source_excerpt",
+                text=chunk.text, observed_at=observed, provider_retrieved_at=observed,
+                attribute_ids=scope["attribute_ids"], qualification=scope["qualification"]
+                + " Exact part-number row in the explicitly associated vendor workbook; other variants excluded.",
+            )
+            for chunk in chunks
+        ]
+        provenance.update(
+            parsing="vendor_table_rows", matched_rows=[chunk.row for chunk in chunks],
+            sheet=config.sheet, mpn_column=config.mpn_column,
+        )
+        return OfflineSource(
+            source_id=binding["source_id"], product=product, source_tier="vendor_table",
+            excerpts=evidence,
+        )
+
+    def web_sources(self, binding, item, scope, pending, provenance):
+        from backend.core.websearch import WebSearchError, fetch_original_page
+        from backend.core.websearch_webiq import WebIQSearchClient
+
+        product = ProductKey.model_validate(item["manifest"]["product"])
+        host = urlsplit(binding["url"]).hostname
+        if not host:
+            raise ValueError("Approved web host is missing")
+        query = " ".join([*scope["identity_terms"], product.mpn, *pending])
+        key = self.key(item, "search", binding["url"] + ":" + digest(query.encode()))
+        self.reserve_real("search", key, item_key=item["item_key"])
+        discovered = WebIQSearchClient().search(query, allowed_domains=[host], authorized=True)
+        provenance.update(
+            retrieval="discovery_succeeded", discovery_count=len(discovered),
+            discovery_limitations="WebIQ content is unverified discovery only, never attribute evidence.",
+            discovery=[{
+                "location": urlsplit(result.url)._replace(query="", fragment="").geturl(),
+                "retrieved_at": result.retrieved_at.isoformat(),
+                "content_characters": len(getattr(result, "content", "")),
+            } for result in discovered],
+        )
+        # The supplied reference is attempted first; discovered pages stay on its approved host.
+        urls = list(dict.fromkeys([binding["url"], *[result.url for result in discovered]]))[:3]
+        sources = []
+        for url in urls:
+            source_id = binding["source_id"] + "-" + digest(url.encode())[:12]
+            try:
+                self.reserve_real(
+                    "web_retrieval", self.key(item, "web_retrieval", url),
+                    item_key=item["item_key"],
+                )
+                original = fetch_original_page(url, allowed_hosts=[host], authorized=True)
+                if not identity_matches(original.text, scope["identity_terms"]) or not identity_matches(original.text, [product.mpn]):
+                    raise ValueError("Original web source does not establish exact product identity")
+                excerpt = Evidence(
+                    evidence_id=source_id + ":" + original.content_hash,
+                    source_id=source_id, source_locator=original.final_url + "#section=visible-text",
+                    source_version="sha256:" + original.content_hash,
+                    source_tier=binding["source_tier"], content_kind="source_excerpt",
+                    text=original.text, observed_at=datetime.now(timezone.utc),
+                    provider_retrieved_at=original.retrieved_at,
+                    attribute_ids=scope["attribute_ids"], qualification=scope["qualification"]
+                    + " Independently retrieved normalized web text; WebIQ discovery passage was not used as product evidence.",
+                    discovery_method="supplied_reference" if url == binding["url"] else "webiq",
+                )
+                sources.append(OfflineSource(
+                    source_id=source_id, product=product, source_tier=binding["source_tier"],
+                    excerpts=[excerpt],
+                ))
+            except ExecutionConfigurationError:
+                raise
+            except (WebSearchError, ValueError, OSError) as error:
+                code = error.code if isinstance(error, WebSearchError) else "web_source_unavailable_or_inapplicable"
+                provenance.setdefault("page_errors", []).append({"source_id": source_id, "error": code})
+                sources.append(OfflineSource(
+                    source_id=source_id, product=product, source_tier=binding["source_tier"],
+                    error_code="parse_failed",
+                ))
+        provenance.update(parsing="original_web_text", retrieval="succeeded" if any(source.excerpts for source in sources) else "failed")
+        return sources
+
+    def completion(self, item):
+        processor = self
+
+        class Completion:
+            def complete_structured(self, system, user, schema):
+                from backend.core.config import settings
+                from backend.core.llm import LLM_API_VERSION
+
+                if os.environ.get("AOAI_API_VERSION") != LLM_API_VERSION:
+                    raise ValueError("Approved model API version differs from the installed client")
+                version = digest((system + user + schema.model_json_schema().__repr__()).encode())
+                key = processor.key(item, "inference", version)
+                cache_key = "real-inferences/" + key + ".json"
+                try:
+                    stored, _ = read_json(processor.store, cache_key)
+                    processor.inference_provenance.append({"method": "compatible_response_cache", "key": key, "new_model_call": False})
+                    return schema.model_validate(stored["response"])
+                except Missing:
+                    pass
+                input_bound = len(system.encode()) + len(user.encode()) + len(json.dumps(schema.model_json_schema()).encode()) + 4096
+                reservation = processor.reserve_real(
+                    "inference", key, item_key=item["item_key"],
+                    max_input_tokens=input_bound, max_output_tokens=2048,
+                )
+                client = LLMClient(
+                    endpoint=settings.LLM_ENDPOINT or settings.AI_FOUNDRY_ENDPOINT,
+                    token_provider=get_bearer_token_provider(
+                        ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None),
+                        COGNITIVE_SERVICES_SCOPE,
+                    ),
+                )
+                client.sync_client = client.sync_client.with_options(max_retries=0)
+                try:
+                    response = client.complete_structured(system, user, schema, max_retries=1, max_completion_tokens=2048)
+                    if client.last_usage is not None:
+                        try:
+                            processor.guard.record_usage(reservation["reservation_id"], **client.last_usage)
+                        except (ValueError, Missing) as error:
+                            raise ExecutionConfigurationError("Real-pilot measured usage exceeded or invalidated its reservation") from error
+                    processor.inference_provenance.append({
+                        "method": "model", "reservation_id": reservation["reservation_id"],
+                        "usage": client.last_usage, "new_model_call": True,
+                    })
+                    write_json(processor.store, cache_key, {
+                        "response": response.model_dump(mode="json"),
+                        "usage": client.last_usage, "reservation_id": reservation["reservation_id"],
+                    })
+                    return response
+                finally:
+                    client.sync_client.close()
+
+        return Completion()
+
+    def __call__(self, item, mode):
+        if mode != "real_pilot":
+            raise ValueError("Real processor cannot execute another mode")
+        manifest = Manifest.model_validate(item["manifest"])
+        self.inference_provenance = []
+        provenance = []
+
+        def load(tier, pending):
+            sources = []
+            for binding in item["sources"]:
+                if binding["source_tier"] != tier:
+                    continue
+                entry = {
+                    "source_id": binding["source_id"], "reference": binding["reference"],
+                    "source_tier": tier, "retrieval": "not_attempted", "parsing": "not_attempted",
+                }
+                provenance.append(entry)
+                scope = next((scope for scope in binding["applicability"] if scope["product"] == manifest.product.model_dump()), None)
+                if scope is None or not set(scope["attribute_ids"]) & set(pending):
+                    entry["error"] = "no_approved_product_attribute_applicability"
+                    continue
+                try:
+                    if binding["kind"] == "web":
+                        sources.extend(self.web_sources(binding, item, scope, [name for name in pending if name in scope["attribute_ids"]], entry))
+                    else:
+                        sources.append(self.real_document(binding, item, scope, entry))
+                except (Conflict, ExecutionConfigurationError):
+                    raise
+                except (Missing, ValueError, OSError, DocumentIntelligenceError, AzureError, WebSearchError):
+                    entry.update(retrieval="failed", error=entry.get("error") or "source_failed_or_product_inapplicable")
+                    sources.append(OfflineSource(
+                        source_id=binding["source_id"], product=manifest.product,
+                        source_tier=tier, error_code="parse_failed",
+                    ))
+            return sources
+
+        result = run_cascade(manifest, load, self.completion(item))
+        unresolved = result.extraction_error or any(
+            attribute.status not in {"existing", "proposed"} for attribute in result.attributes
+        ) or any(entry.get("error") or entry.get("page_errors") for entry in provenance)
+        coverage = {state: [attribute.attribute_id for attribute in result.attributes if attribute.status == state]
+                    for state in ("existing", "proposed", "conflict", "missing_evidence", "retrieval_failed", "extraction_failed")}
+        cited = {evidence.evidence_id: evidence for evidence in result.evidence}
+        for name, predicate in [
+            ("internally_supported", lambda evidence: evidence.source_tier in {"internal_pdf", "vendor_table"}),
+            ("externally_supported", lambda evidence: evidence.source_tier in {"manufacturer_web", "approved_web"}),
+            ("webiq_discovered_support", lambda evidence: evidence.discovery_method == "webiq"),
+        ]:
+            coverage[name] = [
+                attribute.attribute_id for attribute in result.attributes
+                if attribute.status == "proposed" and any(
+                    predicate(cited[key]) for candidate in attribute.candidates for key in candidate.evidence_ids
+                )
+            ]
+        return result, {
+            "state": "unresolved" if unresolved else "completed",
+            "error": "Inspect source failures, applicability, and unresolved attributes" if unresolved else "",
+            "provenance": provenance, "consumption": self.guard.metadata(),
+            "inference_provenance": self.inference_provenance,
+            "coverage": coverage,
+        }
+
+
 def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None):
     if not 1 <= concurrency <= 4 or not 1 <= item_limit <= 1000:
         raise ValueError("Worker limits: concurrency 1-4; items 1-1000")
@@ -196,6 +552,12 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
             record, version = read_json(store, path)
             if record["state"] not in {"queued", "running"}:
                 return
+            if record["mode"] == "real_pilot":
+                if concurrency != 1 or not 1 <= item_limit <= 4:
+                    raise ValueError("Real pilot requires one thread and at most four items")
+                guard = RealPilotGuard(store, record)
+                guard.before_execution(str(uuid.uuid4()))
+                process = processor or RealBatchProcessor(store, record, guard)
             record["state"] = "running"
             version = write_json(store, path, record, version)
             pending = []
@@ -225,7 +587,7 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                     write_json(store, f"results/{batch_id}/{item['item_key']}.json", result.model_dump(mode="json"))
                     state.update(outcome)
                     state["reviewable_attributes"] = [attribute.attribute_id for attribute in result.attributes if attribute.status != "existing"]
-                except Conflict:
+                except (Conflict, ExecutionConfigurationError):
                     raise
                 except Exception:
                     state.update(state="failed", error="Item execution failed; provider details withheld. No automatic retry")
@@ -253,6 +615,7 @@ def main():
     parser.add_argument("--item-limit", type=int, default=100)
     parser.add_argument("--batch-id")
     parser.add_argument("--synthetic-acceptance", action="store_true")
+    parser.add_argument("--real-pilot", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.max_batches <= 10:
         parser.error("max-batches must be 1-10")
@@ -260,12 +623,18 @@ def main():
         parser.error("batch-id must be a SHA-256 identifier")
     if args.synthetic_acceptance and (not args.batch_id or args.max_batches != 1 or not 1 <= args.item_limit <= 2 or not 1 <= args.concurrency <= 2):
         parser.error("Synthetic acceptance requires an explicit batch-id, one batch, and concurrency/item limits of 1-2")
+    if args.real_pilot and (args.synthetic_acceptance or not args.batch_id or args.max_batches != 1 or args.concurrency != 1 or not 1 <= args.item_limit <= 4):
+        parser.error("Real pilot requires an explicit batch-id, one batch, one thread and at most four items")
     try:
         store = configured_store()
         count = 0
         paths = [f"batches/{args.batch_id}.json"] if args.batch_id else store.keys("batches/")
         for path in paths:
             record, _ = read_json(store, path)
+            if args.real_pilot and record.get("mode") != "real_pilot":
+                raise ValueError("Selected batch is not approved real-pilot mode")
+            if record.get("mode") == "real_pilot" and not args.real_pilot:
+                continue
             if args.synthetic_acceptance:
                 products = [item["manifest"]["product"] for item in record["items"]]
                 expected = [{"item_id": f"{index:03d}", "vendor": "Synthetic", "mpn": f"PART-{index}", "hierarchy_node": "Valve"} for index in (1, 2)]
