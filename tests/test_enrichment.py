@@ -308,7 +308,9 @@ def test_saved_synthetic_live_contracts_are_offline(case, model_boundary):
     create.assert_called_once()
     assert result.model_call_status == "succeeded"
     assert result.extraction_error is None
-    assert [candidate.model_dump() for attribute in result.attributes for candidate in attribute.candidates] == expected["candidates"]
+    assert [candidate.model_dump() for attribute in result.attributes for candidate in attribute.candidates] == [
+        candidate.model_dump() for candidate in response.candidates
+    ]
     assert result.evidence[0].model_dump(include=set(expected["evidence"])) == expected["evidence"]
     assert all(attribute.review is None for attribute in result.attributes)
     validate_response(response, result.manifest, result.evidence)
@@ -349,19 +351,24 @@ def test_explicit_empty_candidates_remains_valid(bundle, model_boundary):
 
 def test_llm_structured_wrapper_used_without_network(bundle, monkeypatch):
     import json
-    from types import SimpleNamespace
+    from openai.types.chat import ChatCompletion
     from backend.core.instructions import product_extraction_system_message
     from backend.core.llm import LLMClient
     from backend.extract import run_offline
 
     client = LLMClient(endpoint="https://example.test", deployment="test", token_provider=lambda: "test")
-    response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-        content=bundle.generated_response.model_dump_json(),
-    ))])
+    response = ChatCompletion(
+        id="synthetic", created=0, model="test", object="chat.completion",
+        choices=[{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": bundle.generated_response.model_dump_json(),
+        }}],
+        usage={"prompt_tokens": 100, "completion_tokens": 30, "total_tokens": 130},
+    )
     create = Mock(return_value=response)
     monkeypatch.setattr(client.sync_client.chat.completions, "create", create)
     result = run_live(bundle, completion=client)
     assert result.attributes[0].status == "proposed"
+    assert client.last_usage == {"input_tokens": 100, "output_tokens": 30}
     call = create.call_args.kwargs
     assert call["response_format"]["json_schema"]["strict"] is True
     assert "EXAMPLE-NOT-EVIDENCE" not in call["messages"][1]["content"]
@@ -378,12 +385,13 @@ def test_llm_structured_wrapper_used_without_network(bundle, monkeypatch):
     assert schema["required"] == ["candidates"]
     assert set(schema["$defs"]["Candidate"]["required"]) == {
         "attribute_id", "value", "unit", "evidence_ids", "origin",
+        "supporting_quote", "qualification", "confidence",
     }
 
 
 @pytest.fixture
 def model_boundary(monkeypatch):
-    from types import SimpleNamespace
+    from openai.types.chat import ChatCompletion
     from backend.core.llm import LLMClient
 
     client = LLMClient(endpoint="https://example.test", deployment="test", token_provider=lambda: "test")
@@ -391,9 +399,12 @@ def model_boundary(monkeypatch):
     monkeypatch.setattr(client.sync_client.chat.completions, "create", create)
 
     def respond(payload):
-        create.return_value = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-            content=payload.model_dump_json(),
-        ))])
+        create.return_value = ChatCompletion(
+            id="synthetic", created=0, model="test", object="chat.completion",
+            choices=[{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": payload.model_dump_json(),
+            }}],
+        )
 
     return client, create, respond
 

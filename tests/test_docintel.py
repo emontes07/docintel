@@ -89,3 +89,19 @@ def test_url_analysis_still_uses_url_request(parser):
     service, client, _, _ = parser
     service._analyze("https://example.test/document.pdf")
     assert client.begin_analyze_document.call_args.kwargs["body"].url_source == "https://example.test/document.pdf"
+
+
+def test_real_pilot_page_and_polling_bounds_reach_sdk(parser):
+    service, client, _, _ = parser
+    service.extract_pdf_bytes(b"%PDF-1.7 synthetic", source="test.pdf", page_limit=5)
+    assert client.begin_analyze_document.call_args.kwargs["pages"] == "1-5"
+    client.begin_analyze_document.return_value.result.assert_called_once_with(timeout=120)
+
+
+@pytest.mark.parametrize("limit", [0, 6, True])
+def test_real_pilot_rejects_unbounded_analysis_before_sdk(parser, limit):
+    service, client, factory, _ = parser
+    with pytest.raises(ValueError, match="one to five"):
+        service.extract_pdf_bytes(b"%PDF-1.7 synthetic", source="test.pdf", page_limit=limit)
+    factory.assert_not_called()
+    client.begin_analyze_document.assert_not_called()

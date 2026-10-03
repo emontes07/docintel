@@ -28,6 +28,10 @@ class AttributeDefinition(Contract):
     unit: str | None = None
     allowed_values: list[AttributeValue] = Field(default_factory=list)
     examples: list[AttributeValue] = Field(default_factory=list)
+    definition_context: str | None = None
+    type_guidance: str | None = None
+    definition_node: str | None = None
+    unit_resolved: bool = True
 
     def validate_value(self, value: AttributeValue, unit: str | None) -> None:
         types = {"string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,)}
@@ -35,6 +39,8 @@ class AttributeDefinition(Contract):
             raise ValueError("Attribute value has the wrong type")
         if isinstance(value, str) and not value.strip():
             raise ValueError("Attribute value must not be blank")
+        if not self.unit_resolved:
+            raise ValueError("Attribute unit guidance requires an explicit mapping")
         if unit != self.unit:
             raise ValueError("Attribute unit does not match its definition")
         if self.allowed_values and value not in self.allowed_values:
@@ -70,6 +76,9 @@ class Evidence(Contract):
     observed_at: AwareDatetime
     provider_retrieved_at: AwareDatetime | None = None
     source_published_at: AwareDatetime | None = None
+    attribute_ids: list[str] | None = None
+    qualification: str | None = None
+    discovery_method: Literal["supplied_reference", "webiq"] | None = None
 
 
 class OfflineSource(Contract):
@@ -79,13 +88,22 @@ class OfflineSource(Contract):
     error_code: Literal["not_found", "access_denied", "timeout", "parse_failed"] | None = None
     provider_retrieved_at: AwareDatetime | None = None
     source_published_at: AwareDatetime | None = None
+    source_tier: SourceTier = "internal_pdf"
+    excerpts: list[Evidence] | None = None
+    attribute_ids: list[str] | None = None
+    qualification: str | None = None
 
     @model_validator(mode="after")
     def require_document_or_error(self) -> Self:
-        if (self.document is None) == (self.error_code is None):
-            raise ValueError("A source must contain a parsed document or a retrieval error")
+        if sum(value is not None for value in (self.document, self.excerpts, self.error_code)) != 1:
+            raise ValueError("A source must contain a parsed document, excerpts, or a retrieval error")
         if self.document is not None and not self.document.cache_key:
             raise ValueError("Parsed documents require a source version/cache key")
+        if self.excerpts is not None and any(
+            item.source_id != self.source_id or item.source_tier != self.source_tier
+            for item in self.excerpts
+        ):
+            raise ValueError("Excerpt source and tier must match the supplied source")
         return self
 
 
@@ -95,6 +113,9 @@ class Candidate(Contract):
     unit: str | None = None
     evidence_ids: list[str] = Field(min_length=1)
     origin: Literal["model_generated"] = "model_generated"
+    supporting_quote: str | None = None
+    qualification: str | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class ExtractionResponse(Contract):

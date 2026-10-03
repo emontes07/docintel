@@ -122,6 +122,7 @@ class LLMClient:
         self.endpoint = endpoint or settings.LLM_ENDPOINT or settings.AI_FOUNDRY_ENDPOINT
         self.deployment = deployment or settings.LLM_DEPLOYMENT
         self.timeout = timeout
+        self.last_usage: dict[str, int] | None = None
 
         if token_provider is None:
             token_provider = get_bearer_token_provider(
@@ -161,6 +162,7 @@ class LLMClient:
         response_format = _response_format(schema, strict)
         last_content: Optional[str] = None
         last_error: Any = None
+        self.last_usage = None
 
         for attempt in range(max_retries):
             if attempt:
@@ -175,6 +177,11 @@ class LLMClient:
                 response_format=response_format,
                 **kwargs,
             )
+            if response.usage is not None:
+                self.last_usage = {
+                    "input_tokens": response.usage.prompt_tokens,
+                    "output_tokens": response.usage.completion_tokens,
+                }
             last_content = response.choices[0].message.content
             result = _parse(schema, last_content)
             if isinstance(result, BaseModel):

@@ -88,6 +88,7 @@ class DocumentIntelligenceService:
         )
         self._credential = credential
         self._blob_service: Optional[BlobServiceClient] = None
+        self.last_page_count: int | None = None
 
     # ── configuration / clients ──────────────────────────────────────────
 
@@ -203,7 +204,7 @@ class DocumentIntelligenceService:
         self._write_cache(key, parsed)
         return parsed
 
-    def extract_pdf_bytes(self, content: bytes, *, source: str) -> ParsedDocument:
+    def extract_pdf_bytes(self, content: bytes, *, source: str, page_limit: int | None = None) -> ParsedDocument:
         """Analyze PDF bytes once without Blob access; retain a content-based version."""
         self._require_config()
         if not isinstance(content, bytes) or not content.startswith(b"%PDF-"):
@@ -211,10 +212,16 @@ class DocumentIntelligenceService:
         if not source.strip():
             raise ValueError("An original source location is required")
         version = f"sha256:{hashlib.sha256(content).hexdigest()}"
-        result = self._analyze(content)
+        self.last_page_count = None
+        if page_limit is not None and (type(page_limit) is not int or not 1 <= page_limit <= 5):
+            raise ValueError("Bounded PDF analysis supports one to five pages")
+        result = self._analyze(content, page_limit=page_limit) if page_limit is not None else self._analyze(content)
+        pages = getattr(result, "pages", None)
+        if isinstance(pages, list):
+            self.last_page_count = len(pages)
         return self._to_parsed_document(result, source=source, cache_key=version)
 
-    def _analyze(self, source_url: str | bytes) -> Any:
+    def _analyze(self, source_url: str | bytes, *, page_limit: int | None = None) -> Any:
         # Imported lazily to keep application import independent of the SDK.
         try:
             from azure.ai.documentintelligence import DocumentIntelligenceClient
@@ -235,8 +242,9 @@ class DocumentIntelligenceService:
                 endpoint=self.endpoint, credential=self._get_credential(),
                 retry_total=0,
             ) as client:
-                poller = client.begin_analyze_document(LAYOUT_MODEL_ID, body=body)
-                return poller.result()
+                options = {"pages": f"1-{page_limit}"} if page_limit is not None else {}
+                poller = client.begin_analyze_document(LAYOUT_MODEL_ID, body=body, **options)
+                return poller.result(timeout=120) if page_limit is not None else poller.result()
         except Exception as exc:
             raise DocumentIntelligenceError("Layout analysis failed") from exc
 
