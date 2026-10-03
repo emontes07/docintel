@@ -357,9 +357,13 @@ class RealBatchProcessor(BatchProcessor):
         query = " ".join([*scope["identity_terms"], product.mpn, *pending])
         key = self.key(item, "search", binding["url"] + ":" + digest(query.encode()))
         self.reserve_real("search", key, item_key=item["item_key"])
-        discovered = WebIQSearchClient().search(query, allowed_domains=[host], authorized=True)
+        try:
+            discovered = WebIQSearchClient().search(query, allowed_domains=[host], authorized=True)
+        except WebSearchError as error:
+            discovered = []
+            provenance.update(error="web_discovery_failed", discovery_error=error.code)
         provenance.update(
-            retrieval="discovery_succeeded", discovery_count=len(discovered),
+            retrieval="discovery_failed" if provenance.get("discovery_error") else "discovery_succeeded", discovery_count=len(discovered),
             discovery_limitations="WebIQ content is unverified discovery only, never attribute evidence.",
             discovery=[{
                 "location": urlsplit(result.url)._replace(query="", fragment="").geturl(),

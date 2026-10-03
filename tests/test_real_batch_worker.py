@@ -349,3 +349,20 @@ def test_identity_terms_do_not_match_part_number_prefixes():
     assert identity_matches("Synthetic PART-001; Body Material: brass", ["Synthetic", "PART-001"])
     assert not identity_matches("Synthetic PART-001-A", ["Synthetic", "PART-001"])
     assert not identity_matches("Synthetic PART-0010", ["Synthetic", "PART-001"])
+
+
+def test_discovery_failure_keeps_independently_supported_reference(configured, monkeypatch):
+    from backend.core.websearch import WebSearchError
+
+    store, record, approval = configured
+    analyses, queries, pages, calls = install_services(monkeypatch)
+    monkeypatch.setattr("backend.core.websearch_webiq.WebIQSearchClient.search",
+                        Mock(side_effect=WebSearchError("Synthetic failure", code="provider_error")))
+    run_batch(store, record["id"], concurrency=1, item_limit=1)
+    detail = BatchService(store).detail(record["id"], "row-2", record["owner"])
+    assert set(detail["coverage"]["internally_supported"]) == {"Body Material"}
+    assert detail["coverage"]["externally_supported"] == ["Outlet"]
+    assert detail["coverage"]["webiq_discovered_support"] == []
+    assert detail["provenance"][1]["discovery_error"] == "provider_error"
+    assert detail["state"] == "unresolved"
+    assert len(pages) == 1 and len(calls) == 2
