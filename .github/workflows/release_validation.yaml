@@ -30,7 +30,7 @@ jobs:
           paths = subprocess.check_output(['git', 'diff', '--name-only', os.environ['BASE'], os.environ['HEAD']], text=True).splitlines()
           allowed = {'scripts/release.py', 'tests/test_release.py', '.github/workflows/release_validation.yaml'}
           helper_only = bool(paths) and set(paths) <= allowed
-            frontend_only = bool(paths) and set(paths) <= allowed | {'frontend/Dockerfile', 'frontend/replace-env.mjs', 'scripts/frontend_smoke.py'}
+          frontend_only = bool(paths) and set(paths) <= (allowed | {'frontend/Dockerfile', 'frontend/replace-env.mjs', 'scripts/frontend_smoke.py'})
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'helper_only={str(helper_only).lower()}\n')
               output.write(f'frontend_only={str(frontend_only).lower()}\n')
