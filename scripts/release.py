@@ -340,6 +340,62 @@ print({marker!r})
 '''
 
 
+def console_code(arguments, code, marker, timeout=120):
+    import pty
+    import selectors
+    import time
+    master, slave = pty.openpty()
+    process = subprocess.Popen(arguments, stdin=slave, stdout=slave, stderr=slave, env={**os.environ, "PYTHON_BASIC_REPL": "1"})
+    os.close(slave)
+    os.set_blocking(master, False)
+    output = b""
+    sent = False
+    offset = 0
+    deadline = time.monotonic() + timeout
+    encoded = base64.b64encode(code.encode()).decode()
+    payload = f"exec(__import__('base64').b64decode('{encoded}'));exit()\n".encode()
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(master, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                events = selector.select(max(0, deadline - time.monotonic()))
+                if not events:
+                    break
+                for _, mask in events:
+                    if mask & selectors.EVENT_WRITE:
+                        try:
+                            offset += os.write(master, payload[offset:offset + 1024])
+                        except BlockingIOError:
+                            pass
+                        if offset == len(payload):
+                            selector.modify(master, selectors.EVENT_READ)
+                    if mask & selectors.EVENT_READ:
+                        try:
+                            chunk = os.read(master, 65536)
+                        except BlockingIOError:
+                            continue
+                        except OSError:
+                            raise ValueError("Remote console did not confirm the expected marker") from None
+                        if not chunk:
+                            raise ValueError("Remote console did not confirm the expected marker")
+                        output = (output + chunk)[-262144:]
+                        if not sent and b">>> " in output:
+                            selector.modify(master, selectors.EVENT_READ | selectors.EVENT_WRITE)
+                            sent = True
+                        if marker in output.decode(errors="replace").splitlines():
+                            return output
+        raise ValueError("Remote console did not confirm the expected marker; inspect state before retrying")
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
 def seed_via_backend(config, fixture, files, work):
     backend = app(config, config["backend"])
     properties = backend["properties"]
@@ -347,9 +403,8 @@ def seed_via_backend(config, fixture, files, work):
     require([container["image"] for container in safe_containers(backend)] == [image(config, "backend")], "Seed backend differs from published release")
     payload = {name.removeprefix("seed/"): {"sha256": digest, "content": base64.b64encode((fixture / name).read_bytes()).decode()} for name, digest in files.items() if name.startswith("seed/")}
     require(sum(len(entry["content"]) for entry in payload.values()) <= 16384, "Synthetic seed exceeds remote execution bound")
-    encoded = base64.b64encode(remote_seed_code(config, payload).encode()).decode()
-    output = command(["az", "containerapp", "exec", "--subscription", config["subscription"], "-g", config["group"], "-n", config["backend"], "--revision", properties["latestReadyRevisionName"], "--command", f"/app/.venv/bin/python -c exec(__import__('base64').b64decode('{encoded}'))"])
     marker = "DOCINTEL_SYNTHETIC_SEED_OK:" + fingerprint(payload)
+    output = console_code(["az", "containerapp", "exec", "--subscription", config["subscription"], "-g", config["group"], "-n", config["backend"], "--revision", properties["latestReadyRevisionName"], "--command", "/usr/bin/env PYTHON_BASIC_REPL=1 /app/.venv/bin/python -q", "--only-show-errors"], remote_seed_code(config, payload), marker)
     require(marker in output.decode().splitlines(), "Private seed did not confirm all hashes; inspect partial state, never blindly retry")
     save(work / "seed.json", {"backend_image": image(config, "backend"), "revision": properties["latestReadyRevisionName"], "files": {name: entry["sha256"] for name, entry in payload.items()}})
 

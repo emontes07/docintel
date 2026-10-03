@@ -113,6 +113,16 @@ def test_deploy_and_rollback_use_write_projection(tmp_path, monkeypatch, contain
         assert all(call[:3] == ("containerapp", "ingress", "disable") for call in calls[1:3])
 
 
+def test_console_transport_handles_long_code_and_remote_error():
+    import sys
+    marker = "SYNTHETIC_CONSOLE_VALIDATED"
+    code = "value=" + repr("synthetic" * 2000) + "\nassert len(value)==18000\nprint(" + repr(marker) + ")"
+    output = release.console_code([sys.executable, "-q"], code, marker, timeout=10)
+    assert marker in output.decode().splitlines()
+    with pytest.raises(ValueError, match="did not confirm"):
+        release.console_code([sys.executable, "-q"], "raise ValueError('synthetic failure')", marker, timeout=2)
+
+
 def test_literal_secrets_are_never_captured():
     resource = {"properties": {"template": {"containers": [{"env": [{"name": "AUTH_SECRET", "value": "synthetic-private"}]}]}}}
     with pytest.raises(ValueError, match="secret reference"):
@@ -383,18 +393,18 @@ def test_private_seed_requires_explicit_remote_confirmation(tmp_path, monkeypatc
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"synthetic")
         files["seed/" + name] = hashlib.sha256(b"synthetic").hexdigest()
-    monkeypatch.setattr(release, "command", lambda *args, **kwargs: b"remote process failed but CLI exited zero")
+    monkeypatch.setattr(release, "console_code", lambda *args, **kwargs: b"remote process failed but CLI exited zero")
     with pytest.raises(ValueError, match="did not confirm"):
         release.seed_via_backend(config, fixture, files, tmp_path)
     assert not (tmp_path / "seed.json").exists()
-    def command(arguments):
+    def console(arguments, code, marker):
         assert arguments[arguments.index("--revision") + 1] == "ready"
-        remote = arguments[-1].split(" -c ", 1)[1]
-        encoded = remote.split("b64decode('", 1)[1].split("'", 1)[0]
-        code = base64.b64decode(encoded).decode()
-        marker = code.split("print('", 1)[1].split("'", 1)[0]
+        assert len(arguments[arguments.index("--command") + 1]) < 100
+        assert "PYTHON_BASIC_REPL=1" in arguments[arguments.index("--command") + 1]
+        assert f"print({marker!r})" in code
+        assert "overwrite=False" in code
         return (marker + "\r\n").encode()
-    monkeypatch.setattr(release, "command", command)
+    monkeypatch.setattr(release, "console_code", console)
     release.seed_via_backend(config, fixture, files, tmp_path)
     assert len(json.loads((tmp_path / "seed.json").read_text())["files"]) == 3
     resource["properties"]["template"]["containers"][0]["image"] = "wrong"
