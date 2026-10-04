@@ -254,13 +254,70 @@ def test_restrictive_context_preserves_private_permissions(tmp_path):
     assert (tmp_path / "context-modes.json").stat().st_mode & 0o777 == 0o600
 
 
+@pytest.fixture
+def publication_transport(monkeypatch):
+    def install(work, config, status="Succeeded", *, cpu=2, digest_mismatch=False):
+        calls, requests, archives = [], {}, []
+
+        def upload(location, archive, timeout):
+            import tarfile
+            assert 0 < timeout <= 120
+            assert archive.stat().st_mode & 0o777 == 0o600
+            with tarfile.open(archive) as contents:
+                archives.append(contents.getnames())
+            return location["relativePath"]
+
+        def azure(*arguments, timeout=None):
+            assert 0 < timeout <= 60
+            calls.append(arguments)
+            if arguments[:2] == ("acr", "repository"):
+                return {"digest": "sha256:" + ("d" if digest_mismatch else "c") * 64}
+            assert arguments[0] == "rest"
+            method = arguments[arguments.index("--method") + 1]
+            url = arguments[arguments.index("--url") + 1]
+            assert url.endswith("?api-version=2019-04-01")
+            assert f"/registries/{config['registry']}/" in url
+            if "/listBuildSourceUploadUrl?" in url:
+                assert method == "POST"
+                assert list(work.glob("*-publication*attempt.json"))
+                return {"relativePath": "source/20300203/synthetic.tar.gz", "uploadUrl": "never-used"}
+            if "/scheduleRun?" in url:
+                assert method == "POST"
+                body_path = Path(arguments[arguments.index("--body") + 1].removeprefix("@"))
+                body = release.private_json(body_path)
+                stem = body_path.name.removesuffix("-request.json")
+                assert release.private_json(work / (stem + "-submission.json"))["request_sha256"] == hashlib.sha256(body_path.read_bytes()).hexdigest()
+                attempt = release.private_json(work / (stem + "-attempt.json"))
+                assert attempt["cpu"] == body["agentConfiguration"]["cpu"] == 2
+                assert attempt["timeout_seconds"] == body["timeout"] == 900
+                assert arguments[arguments.index("--headers") + 1] == "x-docintel-publication-attempt-id=" + attempt["attempt_id"]
+                run_id = "synthetic-" + str(len(requests) + 1)
+                requests[run_id] = body
+                if status == "Unknown":
+                    raise ValueError("Synthetic unknown build outcome")
+                return {"properties": {"runId": run_id, "status": "Queued"}}
+            assert method == "GET" and "/runs/" in url
+            run_id = url.split("/runs/")[1].split("?")[0]
+            body = requests[run_id]
+            assert list(work.glob("*-publication*queued.json"))
+            repository, tag = body["imageNames"][0].split(":")
+            return {"properties": {
+                "runId": run_id, "status": status, "agentConfiguration": {"cpu": cpu},
+                "outputImages": [{"registry": config["registry"] + ".azurecr.io", "repository": repository, "tag": tag, "digest": "sha256:" + "c" * 64}],
+            }}
+        monkeypatch.setattr(release, "upload_publication_context", upload)
+        monkeypatch.setattr(release, "azure", azure)
+        return calls, requests, archives
+    return install
+
+
 @pytest.mark.parametrize("defect", [None, "smoke", "mode", "backend", "failed_build", "unknown_build"])
 @pytest.mark.parametrize("kind", ["frontend", "backend"])
-def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path, monkeypatch, defect, kind):
+def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path, monkeypatch, publication_transport, defect, kind):
     retained = "frontend" if kind == "backend" else "backend"
     previous = tmp_path / "previous"
     work = tmp_path / "replacement"
-    config = {"registry": "synthetic", "subscription": "synthetic", retained + "_image": "synthetic.azurecr.io/docintel/" + retained + "@sha256:" + "b" * 64}
+    config = {"registry": "synthetic", "subscription": "synthetic", "group": "synthetic", retained + "_image": "synthetic.azurecr.io/docintel/" + retained + "@sha256:" + "b" * 64}
     previous_images = {"revision": "b" * 40, retained: config[retained + "_image"]}
     release.save(previous / "source.json", {"revision": "b" * 40, "files": {}})
     release.save(previous / "images.json", previous_images)
@@ -277,22 +334,8 @@ def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path,
     release.save(work / (kind + "-smoke.json"), {"revision": source["revision"], "passed": defect != "smoke", "context_sha256": release.fingerprint(inventory), "modes_sha256": release.fingerprint(modes)})
     monkeypatch.setattr(release, "verify_source", lambda path: json.loads((path / "source.json").read_text()))
     monkeypatch.setattr(release, "command", lambda args, **kwargs: b"lock" if "show" in args else b"a" * 40)
-    calls = []
-    def azure(*arguments):
-        calls.append(arguments)
-        if arguments[:2] == ("acr", "build"):
-            assert arguments[arguments.index("--timeout") + 1] == "900"
-            assert arguments[arguments.index("--cpu") + 1] == "2"
-            attempt = release.private_json(work / f"{kind}-publication-attempt.json")
-            assert attempt["cpu"] == 2 and attempt["timeout_seconds"] == 900
-            assert arguments[arguments.index("--image") + 1].startswith("docintel/" + kind + ":")
-            assert arguments[arguments.index("--file") + 1] == str(context / kind / "Dockerfile")
-            assert arguments[-1] == str(context if kind == "backend" else context / "frontend")
-            if defect == "unknown_build":
-                raise ValueError("Synthetic unknown build outcome")
-            return {"status": "Failed" if defect == "failed_build" else "Succeeded", "runId": "synthetic-run"}
-        return {"digest": "sha256:" + "c" * 64}
-    monkeypatch.setattr(release, "azure", azure)
+    status = {"failed_build": "Failed", "unknown_build": "Unknown"}.get(defect, "Succeeded")
+    calls, requests, archives = publication_transport(work, config, status)
     if defect == "mode":
         (context / kind / "Dockerfile").chmod(0o400)
     if defect == "backend":
@@ -300,13 +343,15 @@ def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path,
     if defect:
         with pytest.raises(ValueError):
             release.publish_component(config, work, previous, kind)
-        assert len(calls) == (1 if defect in ("failed_build", "unknown_build") else 0)
+        assert len(requests) == (1 if defect in ("failed_build", "unknown_build") else 0)
     else:
         release.publish_component(config, work, previous, kind)
         receipt = json.loads((work / "images.json").read_text())
         assert receipt[retained] == previous_images[retained]
         assert receipt["preserved_" + retained]["revision"] == "b" * 40
         release.require_release_images({**config, kind + "_image": receipt[kind]}, work)
+        assert receipt["tool_revision"] == "a" * 40
+        assert len(archives) == 1 and ("backend/Dockerfile" if kind == "backend" else "Dockerfile") in archives[0]
     if defect in (None, "failed_build", "unknown_build"):
         count = len(calls)
         attempt_before = (work / f"{kind}-publication-attempt.json").read_bytes()
@@ -353,9 +398,9 @@ def test_packaging_requires_new_access_evidence_before_any_command(tmp_path, mon
 
 
 @pytest.mark.parametrize("build_status", ["Succeeded", "Failed", "Unknown"])
-def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_path, monkeypatch, build_status):
+def test_publication_uses_verified_contexts_and_bounded_arm_builds(tmp_path, monkeypatch, publication_transport, build_status):
     from argparse import Namespace
-    config = {"registry": "synthetic", "subscription": "subscription"}
+    config = {"registry": "synthetic", "subscription": "subscription", "group": "synthetic"}
     source = {"revision": "a" * 40, "files": {}}
     for relative in ("backend/Dockerfile", "frontend/Dockerfile"):
         path = tmp_path / "context" / relative
@@ -364,23 +409,13 @@ def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_p
         source["files"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     release.save(tmp_path / "source.json", source)
     release.save(tmp_path / "context.json", source["files"])
+    release.save(tmp_path / "context-modes.json", {str(path.relative_to(tmp_path / "context")): path.stat().st_mode & 0o777 for path in (tmp_path / "context").rglob("*")})
     release.save(tmp_path / "clean-checks.json", {"revision": source["revision"], "lock_sha256": hashlib.sha256(b"lock").hexdigest()})
     monkeypatch.setattr(release, "load_config", lambda _: config)
     monkeypatch.setattr(release, "verify_source", lambda _: source)
     monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
-    monkeypatch.setattr(release, "command", lambda *args, **kwargs: b"lock")
-    builds = []
-    def azure(*args):
-        if args[:2] == ("acr", "build"):
-            builds.append(args)
-            kind = "backend" if len(builds) == 1 else "frontend"
-            attempt = release.private_json(tmp_path / f"{kind}-publication-attempt.json")
-            assert attempt["component"] == kind and attempt["cpu"] == 2 and attempt["timeout_seconds"] == 900
-            if build_status == "Unknown":
-                raise ValueError("Synthetic unknown build outcome")
-            return {"status": build_status, "runId": "run-" + str(len(builds))}
-        return {"digest": "sha256:" + "b" * 64}
-    monkeypatch.setattr(release, "azure", azure)
+    monkeypatch.setattr(release, "command", lambda args, **kwargs: b"lock" if "show" in args else b"f" * 40)
+    calls, builds, archives = publication_transport(tmp_path, config, build_status)
     options = Namespace(action="publish", work=tmp_path, config=None, approve="publish")
     if build_status in ("Failed", "Unknown"):
         with pytest.raises(ValueError, match="did not succeed|unknown"):
@@ -390,13 +425,14 @@ def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_p
     else:
         release.run(options)
         assert len(builds) == 2
-        assert json.loads((tmp_path / "images.json").read_text())["frontend_run_id"] == "run-2"
-    for arguments in builds:
-        dockerfile = Path(arguments[arguments.index("--file") + 1])
-        assert dockerfile.is_absolute() and dockerfile.is_file()
-        assert dockerfile.is_relative_to(Path(arguments[-1]))
-        assert arguments[arguments.index("--timeout") + 1] == "900"
-        assert arguments[arguments.index("--cpu") + 1] == "2"
+        receipt = json.loads((tmp_path / "images.json").read_text())
+        assert receipt["frontend_run_id"] == "synthetic-2"
+        assert receipt["revision"] == "a" * 40 and receipt["tool_revision"] == "f" * 40
+    for body, archived in zip(builds.values(), archives):
+        assert body["dockerFilePath"] in archived
+        assert body["timeout"] == 900 and body["agentConfiguration"] == {"cpu": 2}
+        assert body["sourceLocation"] == "source/20300203/synthetic.tar.gz"
+    assert not list(tmp_path.glob("*-context.tar.gz"))
     count = len(builds)
     attempts = {path.name: path.read_bytes() for path in tmp_path.glob("*-publication-attempt.json")}
     with pytest.raises(ValueError, match="already attempted"):
@@ -440,6 +476,497 @@ def test_publication_does_not_reset_or_migrate_existing_records(tmp_path, legacy
     with pytest.raises(ValueError, match="already attempted"):
         release.require_unused_publication(tmp_path, ("backend", "frontend"))
     assert (tmp_path / legacy).read_bytes() == before
+
+
+@pytest.fixture
+def publication_case(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2030, 2, 3, 10, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(release, "datetime", Clock)
+    config = {
+        "registry": "synthetic", "subscription": "subscription", "group": "synthetic",
+        "pilot_operator_ids": ["11111111-1111-4111-8111-111111111111"],
+        "publication_deadline": "2030-02-03T13:00:00Z",
+        "frontend_image": "synthetic.azurecr.io/docintel/frontend@sha256:" + "b" * 64,
+    }
+    context = tmp_path / "context"
+    for relative in ("backend/Dockerfile", "backend/main.py", "frontend/Dockerfile", "frontend/public/app.txt", "uv.lock"):
+        path = context / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("lock" if relative == "uv.lock" else "synthetic")
+    inventory = {str(path.relative_to(context)): hashlib.sha256(path.read_bytes()).hexdigest() for path in context.rglob("*") if path.is_file()}
+    modes = {str(path.relative_to(context)): path.stat().st_mode & 0o777 for path in context.rglob("*")}
+    source = {"revision": "a" * 40, "files": inventory}
+    release.save(tmp_path / "source.json", source)
+    release.save(tmp_path / "context.json", inventory)
+    release.save(tmp_path / "context-modes.json", modes)
+    release.save(tmp_path / "clean-checks.json", {"revision": source["revision"], "lock_sha256": hashlib.sha256(b"lock").hexdigest()})
+    release.save(tmp_path / "backend-smoke.json", {"revision": source["revision"], "passed": True, "context_sha256": release.fingerprint(inventory), "modes_sha256": release.fingerprint(modes)})
+    monkeypatch.setattr(release, "command", lambda args, **kwargs: b"lock" if "show" in args else b"f" * 40)
+    monkeypatch.setattr(release, "verify_source", lambda path: release.private_json(path / "source.json"))
+    monkeypatch.setattr(release, "load_config", lambda _: config)
+    monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
+    return config, source
+
+
+@pytest.fixture
+def publication_replacement(tmp_path, publication_case):
+    config, source = publication_case
+    original = tmp_path / "backend-publication-attempt.json"
+    release.save(original, {"revision": source["revision"], "component": "backend", "cpu": 2, "timeout_seconds": 900, "status": "attempted"})
+    return {
+        "schema_version": 1, "approved": True, "id": "22222222-2222-4222-8222-222222222222",
+        "approved_by": config["pilot_operator_ids"][0], "target": release.fingerprint(config),
+        "work": str(tmp_path.resolve()), "revision": source["revision"], "component": "backend",
+        "original_attempt": str(original.resolve()), "original_attempt_sha256": hashlib.sha256(original.read_bytes()).hexdigest(),
+        "original_failure": "unsupported_acr_build_cpu_argument", "additional_attempts": 1,
+        "cpu": 2, "timeout_seconds": 900, "expires_at": "2030-02-03T13:00:00Z",
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("schema_version", True), ("approved", False), ("component", "frontend"),
+    ("additional_attempts", 2), ("additional_attempts", True), ("cpu", 4), ("timeout_seconds", 901),
+    ("approved_by", "33333333-3333-4333-8333-333333333333"), ("id", "not-a-uuid"),
+    ("target", "0" * 64), ("work", "/another/work"), ("revision", "b" * 40),
+    ("original_attempt", "/another/attempt.json"), ("original_attempt_sha256", "0" * 64),
+    ("original_failure", "unknown_remote_run"), ("expires_at", "2030-02-03T09:59:00Z"),
+    ("expires_at", "2030-02-03T13:00:01Z"), ("expires_at", "2030-02-03T12:00:00"),
+    ("extra", "forbidden"),
+])
+def test_publication_replacement_rejects_scope_drift(tmp_path, publication_case, publication_replacement, field, value):
+    config, source = publication_case
+    changed = {**publication_replacement, field: value}
+    before = (tmp_path / "backend-publication-attempt.json").read_bytes()
+    with pytest.raises(ValueError):
+        release.reserve_publication_attempt(tmp_path, "backend", source["revision"], replacement=changed, config=config)
+    assert (tmp_path / "backend-publication-attempt.json").read_bytes() == before
+    assert not (tmp_path / "backend-publication-replacement-attempt.json").exists()
+
+
+@pytest.mark.parametrize("deadline", [
+    "missing", None, False, 123, "", "invalid",
+    "2030-02-03T13:00:00", "2030-02-03T09:59:59Z", "2030-02-03T12:59:59Z",
+])
+def test_publication_replacement_requires_valid_active_private_target_deadline(tmp_path, publication_case, publication_replacement, deadline):
+    config, source = publication_case
+    target = {**config, "publication_deadline": deadline}
+    if deadline == "missing":
+        target.pop("publication_deadline")
+    approval = {**publication_replacement, "target": release.fingerprint(target)}
+    with pytest.raises(ValueError, match="publication_deadline"):
+        release.reserve_publication_attempt(tmp_path, "backend", source["revision"], replacement=approval, config=target)
+    assert not (tmp_path / "backend-publication-replacement-attempt.json").exists()
+
+
+@pytest.mark.parametrize("deadline", ["missing", "2030-02-03T13:00:00Z", "2030-02-03T08:00:00-05:00", None, False, "", "invalid", "2030-02-03T13:00:00"])
+def test_load_config_validates_optional_private_publication_deadline(tmp_path, deadline):
+    config = {field: "synthetic" for field in ("group", "environment", "registry", "storage", "frontend", "backend", "job", "container", "auth_secret_ref", "entra_secret_ref")}
+    config.update({
+        "subscription": "11111111-1111-4111-8111-111111111111",
+        "tenant": "22222222-2222-4222-8222-222222222222",
+        "frontend_origin": "https://frontend.invalid", "backend_origin": "https://backend.invalid",
+    })
+    if deadline != "missing":
+        config["publication_deadline"] = deadline
+    path = tmp_path / "target.json"
+    release.save(path, config)
+    if deadline in ("missing", "2030-02-03T13:00:00Z", "2030-02-03T08:00:00-05:00"):
+        assert release.load_config(path) == config
+    else:
+        with pytest.raises(ValueError, match="publication_deadline"):
+            release.load_config(path)
+
+
+@pytest.mark.parametrize("evidence", ["backend-publication-result.json", "backend-publication-queued.json", "backend-publication-request.json", "backend-publication-submission.json"])
+def test_publication_replacement_rejects_remote_evidence(tmp_path, publication_case, publication_replacement, evidence):
+    config, source = publication_case
+    release.save(tmp_path / evidence, {})
+    with pytest.raises(ValueError, match="remote-submission"):
+        release.reserve_publication_attempt(tmp_path, "backend", source["revision"], replacement=publication_replacement, config=config)
+
+
+def test_publication_replacement_is_atomic_and_id_changes_do_not_renew(tmp_path, publication_case, publication_replacement):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    config, source = publication_case
+    barrier = threading.Barrier(4)
+    original = (tmp_path / "backend-publication-attempt.json").read_bytes()
+
+    def reserve(index):
+        candidate = {**publication_replacement, "id": str(release.uuid.uuid4())}
+        barrier.wait()
+        try:
+            return release.reserve_publication_attempt(tmp_path, "backend", source["revision"], replacement=candidate, config=config)
+        except ValueError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert sum(path is not None for path in pool.map(reserve, range(4))) == 1
+    receipt = (tmp_path / "backend-publication-replacement-attempt.json").read_bytes()
+    for replacement in (None, publication_replacement, {**publication_replacement, "id": str(release.uuid.uuid4())}):
+        with pytest.raises(ValueError, match="already attempted"):
+            release.reserve_publication_attempt(tmp_path, "backend", source["revision"], replacement=replacement, config=config)
+    release.reserve_publication_attempt(tmp_path, "frontend", source["revision"])
+    assert (tmp_path / "backend-publication-attempt.json").read_bytes() == original
+    assert (tmp_path / "backend-publication-replacement-attempt.json").read_bytes() == receipt
+
+
+@pytest.mark.parametrize("first_path", ["publish", "publish-backend"])
+@pytest.mark.parametrize("status", ["Succeeded", "Failed", "Unknown"])
+def test_publication_replacement_shared_by_full_and_component_paths(tmp_path, publication_case, publication_replacement, publication_transport, first_path, status):
+    from argparse import Namespace
+    config, source = publication_case
+    previous = tmp_path / "previous"
+    release.save(previous / "source.json", {**source, "revision": "b" * 40})
+    release.save(previous / "images.json", {"revision": "b" * 40, "frontend": config["frontend_image"]})
+    path = tmp_path / "replacement-approval.json"
+    release.save(path, publication_replacement)
+    calls, requests, _ = publication_transport(tmp_path, config, status)
+    options = Namespace(action=first_path, approve=first_path, work=tmp_path, config=None, previous_work=previous, publication_replacement_approval=path)
+    original = (tmp_path / "backend-publication-attempt.json").read_bytes()
+    if status == "Succeeded":
+        release.run(options)
+        assert len(requests) == (2 if first_path == "publish" else 1)
+    else:
+        with pytest.raises(ValueError, match="did not succeed|unknown"):
+            release.run(options)
+        assert len(requests) == 1
+    count = len(calls)
+    for next_action in ("publish", "publish-backend"):
+        options.action = options.approve = next_action
+        with pytest.raises(ValueError, match="already attempted"):
+            release.run(options)
+    assert len(calls) == count
+    assert (tmp_path / "backend-publication-attempt.json").read_bytes() == original
+    assert not (tmp_path / "backend-publication-result.json").exists()
+    assert (tmp_path / "backend-publication-replacement-attempt.json").exists()
+    if first_path == "publish" and status == "Succeeded":
+        assert (tmp_path / "frontend-publication-attempt.json").exists()
+
+
+@pytest.mark.parametrize("defect", ["cpu", "digest", "empty_202", "output", "run_id", "expired_poll", "request_error"])
+def test_publication_never_reschedules_on_unknown_or_invalid_run(tmp_path, monkeypatch, publication_case, publication_transport, defect):
+    config, source = publication_case
+    calls, requests, _ = publication_transport(tmp_path, config, "Running" if defect == "expired_poll" else "Succeeded", cpu=4 if defect == "cpu" else 2, digest_mismatch=defect == "digest")
+    transport = release.azure
+
+    def azure(*args, **kwargs):
+        response = transport(*args, **kwargs)
+        if "/scheduleRun?" in " ".join(args):
+            if defect == "empty_202":
+                return None
+            if defect == "request_error":
+                raise ValueError("Unknown submission outcome")
+        if "/runs/" in " ".join(args):
+            if defect == "output":
+                response["properties"]["outputImages"][0]["tag"] = "different"
+            if defect == "run_id":
+                response["properties"]["runId"] = "different"
+        return response
+
+    monkeypatch.setattr(release, "azure", azure)
+    clock = [0]
+    monkeypatch.setattr(release.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(release.time, "sleep", lambda _: clock.__setitem__(0, 1300))
+    with pytest.raises(ValueError):
+        release.build_publication(config, tmp_path, "backend", source["revision"])
+    assert len(requests) == 1
+    count = len(calls)
+    with pytest.raises(ValueError, match="already attempted"):
+        release.build_publication(config, tmp_path, "backend", source["revision"])
+    assert len(calls) == count
+    assert not list(tmp_path.glob("*-context.tar.gz"))
+    assert (tmp_path / "backend-publication-submission.json").exists()
+    assert (tmp_path / "backend-publication-queued.json").exists() == (defect not in {"empty_202", "request_error"})
+
+
+@pytest.mark.parametrize("kind", ["backend", "frontend"])
+def test_publication_replacement_requires_full_remaining_build_window(tmp_path, publication_case, publication_replacement, publication_transport, kind):
+    config, source = publication_case
+    publication_replacement["expires_at"] = "2030-02-03T10:14:59Z"
+    calls, requests, _ = publication_transport(tmp_path, config)
+    with pytest.raises(ValueError, match="Insufficient approved time"):
+        release.build_publication(config, tmp_path, kind, source["revision"], replacement=publication_replacement)
+    assert not calls and not requests
+    stem = "backend-publication-replacement" if kind == "backend" else "frontend-publication"
+    assert (tmp_path / (stem + "-attempt.json")).exists()
+
+
+@pytest.mark.parametrize("kind", ["backend", "frontend"])
+@pytest.mark.parametrize("stage", ["list", "upload", "queue", "final_queue"])
+def test_publication_rechecks_full_window_before_every_upload_and_queue(tmp_path, monkeypatch, publication_case, publication_replacement, publication_transport, kind, stage):
+    from datetime import datetime, timezone
+
+    config, source = publication_case
+    publication_replacement["expires_at"] = "2030-02-03T10:15:01Z"
+    now = [datetime(2030, 2, 3, 10, tzinfo=timezone.utc)]
+    monkeypatch.setattr(release.datetime, "now", classmethod(lambda cls, tz=None: now[0]))
+    calls, requests, _ = publication_transport(tmp_path, config)
+    archive, azure, upload, save_once = release.archive_publication_context, release.azure, release.upload_publication_context, release.save_once
+    uploads = []
+
+    def advance():
+        now[0] = datetime(2030, 2, 3, 10, 0, 2, tzinfo=timezone.utc)
+
+    def archive_context(*args):
+        result = archive(*args)
+        if stage == "list":
+            advance()
+        return result
+
+    def request(*args, **kwargs):
+        result = azure(*args, **kwargs)
+        if stage == "upload" and "/listBuildSourceUploadUrl?" in " ".join(args):
+            advance()
+        return result
+
+    def upload_context(*args):
+        uploads.append(args)
+        result = upload(*args)
+        if stage == "queue":
+            advance()
+        return result
+
+    def save_receipt(path, data):
+        save_once(path, data)
+        if stage == "final_queue" and path.name.endswith("-submission.json"):
+            advance()
+
+    monkeypatch.setattr(release, "archive_publication_context", archive_context)
+    monkeypatch.setattr(release, "azure", request)
+    monkeypatch.setattr(release, "upload_publication_context", upload_context)
+    monkeypatch.setattr(release, "save_once", save_receipt)
+    with pytest.raises(ValueError, match="Insufficient approved time"):
+        release.build_publication(config, tmp_path, kind, source["revision"], replacement=publication_replacement)
+    assert not requests
+    assert len(calls) == (0 if stage == "list" else 1)
+    assert len(uploads) == (1 if stage in {"queue", "final_queue"} else 0)
+
+
+def test_publication_frontend_cannot_upload_after_backend_uses_remaining_window(tmp_path, monkeypatch, publication_case, publication_replacement, publication_transport):
+    from argparse import Namespace
+    from datetime import datetime, timezone
+
+    config, _ = publication_case
+    publication_replacement["expires_at"] = "2030-02-03T10:15:01Z"
+    now = [datetime(2030, 2, 3, 10, tzinfo=timezone.utc)]
+    monkeypatch.setattr(release.datetime, "now", classmethod(lambda cls, tz=None: now[0]))
+    path = tmp_path / "replacement-approval.json"
+    release.save(path, publication_replacement)
+    calls, requests, archives = publication_transport(tmp_path, config)
+    azure = release.azure
+
+    def request(*args, **kwargs):
+        result = azure(*args, **kwargs)
+        if args[:2] == ("acr", "repository"):
+            now[0] = datetime(2030, 2, 3, 10, 0, 2, tzinfo=timezone.utc)
+        return result
+
+    monkeypatch.setattr(release, "azure", request)
+    with pytest.raises(ValueError, match="Insufficient approved time"):
+        release.run(Namespace(action="publish", approve="publish", work=tmp_path, config=None, publication_replacement_approval=path))
+    assert len(requests) == len(archives) == 1
+    assert sum("/listBuildSourceUploadUrl?" in " ".join(call) for call in calls) == 1
+    assert not (tmp_path / "frontend-publication-queued.json").exists()
+    assert (tmp_path / "backend-publication-replacement-result.json").exists()
+
+
+@pytest.mark.parametrize("defect", ["bytes", "permissions", "symlink", "evidence"])
+def test_publication_archive_rejects_drift_and_private_evidence(tmp_path, publication_case, publication_transport, defect):
+    config, source = publication_case
+    context = tmp_path / "context"
+    target = context / "backend/main.py"
+    if defect == "bytes":
+        target.write_text("changed")
+    elif defect == "permissions":
+        target.chmod(0o400)
+    elif defect == "symlink":
+        target.unlink()
+        target.symlink_to(context / "backend/Dockerfile")
+    else:
+        target = context / "backend/private.pdf"
+        target.write_bytes(b"private evidence")
+        release.save(tmp_path / "context.json", {str(path.relative_to(context)): hashlib.sha256(path.read_bytes()).hexdigest() for path in context.rglob("*") if path.is_file()})
+        release.save(tmp_path / "context-modes.json", {str(path.relative_to(context)): path.stat().st_mode & 0o777 for path in context.rglob("*")})
+    calls, _, _ = publication_transport(tmp_path, config)
+    with pytest.raises(ValueError):
+        release.build_publication(config, tmp_path, "backend", source["revision"])
+    assert not calls
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_publication_blob_put_never_exposes_sas_or_retries(tmp_path, monkeypatch, failure, capsys):
+    from types import SimpleNamespace
+    url = "https://registryaccount.blob.core.windows.net/context/source/20300203/source.tar.gz?sig=PRIVATE-SAS"
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        assert "PRIVATE-SAS" not in " ".join(args)
+        assert b"PRIVATE-SAS" in kwargs["input"]
+        assert args[:2] == ["curl", "--disable"]
+        assert args[args.index("--retry") + 1] == "0"
+        assert args[args.index("--max-redirs") + 1] == "0"
+        assert args[args.index("--header") + 1] == "x-ms-blob-type: BlockBlob"
+        assert kwargs["timeout"] == 30
+        return SimpleNamespace(returncode=1 if failure else 0, stdout=b"403 PRIVATE-SAS" if failure else b"201", stderr=b"PRIVATE-SAS")
+
+    monkeypatch.setattr(release.subprocess, "run", run)
+    location = {"relativePath": "source/20300203/source.tar.gz", "uploadUrl": url}
+    if failure:
+        with pytest.raises(ValueError, match="details withheld") as error:
+            release.upload_publication_context(location, tmp_path / "source.tar.gz", 30)
+        assert "PRIVATE-SAS" not in str(error.value)
+    else:
+        assert release.upload_publication_context(location, tmp_path / "source.tar.gz", 30) == location["relativePath"]
+    assert len(calls) == 1 and not capsys.readouterr().out
+
+
+@pytest.mark.parametrize("url", ["http://registryaccount.blob.core.windows.net/source/20300203/source.tar.gz?sig=private", "https://untrusted.invalid/source/20300203/source.tar.gz?sig=private", "https://registryaccount.blob.core.windows.net/different.tar.gz?sig=private"])
+def test_publication_upload_rejects_redirect_or_unbound_destination(tmp_path, monkeypatch, url):
+    monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: pytest.fail("Upload attempted"))
+    with pytest.raises(ValueError, match="destination"):
+        release.upload_publication_context({"relativePath": "source/20300203/source.tar.gz", "uploadUrl": url}, tmp_path / "archive", 30)
+
+
+@pytest.fixture
+def isolated_azure_cli(tmp_path, monkeypatch):
+    import os
+    import shutil
+
+    executable = shutil.which("az")
+    if executable is None:
+        pytest.skip("The installed Azure CLI is required for the release-host contract test")
+    for name in list(os.environ):
+        if name.upper().startswith(("AZURE_", "ARM_", "MSI_", "IDENTITY_", "IMDS_")):
+            monkeypatch.delenv(name)
+    for name, directory in (("HOME", "home"), ("AZURE_CONFIG_DIR", "azure-config"), ("AZURE_EXTENSION_DIR", "azure-extensions")):
+        path = tmp_path / directory
+        path.mkdir(mode=0o700)
+        monkeypatch.setenv(name, str(path))
+    for name, value in {
+        "AZURE_CORE_COLLECT_TELEMETRY": "no", "AZURE_CORE_CHECK_VERSION": "false",
+        "AZURE_EXTENSION_USE_DYNAMIC_INSTALL": "no", "AZURE_CORE_NO_COLOR": "true",
+        "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost",
+    }.items():
+        monkeypatch.setenv(name, value)
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
+    return executable
+
+
+def test_publication_contract_with_installed_real_azure_cli(isolated_azure_cli):
+    """Offline contract check, not a mock of the unsupported `acr build --cpu`."""
+    import ast
+    import shutil
+    import subprocess
+    import sys
+
+    site = Path("/usr/local/Cellar/azure-cli/2.77.0/libexec/lib/python3.13/site-packages")
+    build = site / "azure/cli/command_modules/acr/build.py"
+    if not build.is_file() or not shutil.which("az"):
+        pytest.skip("Azure CLI 2.77.0 contract is checked on the installed release host")
+    tree = ast.parse(build.read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "acr_build")
+    assert "cpu" not in {argument.arg for argument in function.args.args}
+    constructor = next(node for node in ast.walk(function) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "DockerBuildRequest")
+    assert "agent_configuration" not in {keyword.arg for keyword in constructor.keywords}
+    help_result = subprocess.run(["az", "rest", "--help"], capture_output=True, timeout=60, check=True)
+    for argument in ("--method", "--url", "--body", "--headers", "--only-show-errors", "--output"):
+        assert argument.encode() in help_result.stdout
+    raw = ast.parse((site / "azure/cli/core/util.py").read_text())
+    send = next(node for node in raw.body if isinstance(node, ast.FunctionDef) and node.name == "send_raw_request")
+    assert sum(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "send" for node in ast.walk(send)) == 1
+    assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "mount" for node in ast.walk(send))
+    body = release.publication_request("backend", "a" * 40, "source/20300203/source.tar.gz")
+    code = (
+        "import json,sys; sys.path.insert(0,sys.argv[1]); "
+        "from azure.mgmt.containerregistry.v2019_06_01_preview.models import DockerBuildRequest; "
+        "body=json.loads(sys.argv[2]); model=DockerBuildRequest.deserialize(body); "
+        "actual=model.serialize(); assert all(actual[k]==v for k,v in body.items()); "
+        "assert model.agent_configuration.cpu==2 and model.timeout==900; print('verified')"
+    )
+    result = subprocess.run([sys.executable, "-B", "-c", code, str(site), json.dumps(body)], capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout.strip() == b"verified"
+
+
+def test_publication_real_azure_cli_sends_exact_arm_requests_over_loopback(tmp_path, monkeypatch, isolated_azure_cli):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    requests = []
+    path = "/subscriptions/00000000-0000-4000-8000-000000000000/resourceGroups/synthetic/providers/Microsoft.ContainerRegistry/registries/synthetic/scheduleRun?api-version=2019-04-01"
+    queued = {"properties": {"runId": "local-contract-only", "status": "Queued", "agentConfiguration": {"cpu": 2}}}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            requests.append((self.path, dict(self.headers), body))
+            payload = json.dumps(queued).encode()
+            self.send_response(200 if self.path == path else 400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        url = f"http://127.0.0.1:{server.server_port}"
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            monkeypatch.setenv(name, url)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for kind in ("backend", "frontend"):
+                body = release.publication_request(kind, "a" * 40, "source/20300203/loopback.tar.gz")
+                request_path = tmp_path / "private request files" / (kind + "-request.json")
+                release.save(request_path, body)
+                request_id = str(release.uuid.uuid4())
+                # Real production subprocess/parser, with only a loopback URL and
+                # explicit no-auth flag substituted; no CLI/transport mocking.
+                result = release.azure(
+                    "rest", "--method", "POST", "--url", url + path,
+                    "--body", "@" + str(request_path),
+                    "--headers", "x-docintel-publication-attempt-id=" + request_id,
+                    "--skip-authorization-header", timeout=60,
+                )
+                assert result == queued
+                assert len(requests) == (1 if kind == "backend" else 2)
+                received_path, headers, received_body = requests[-1]
+                assert received_path == path
+                normalized = {key.lower(): value for key, value in headers.items()}
+                assert "authorization" not in normalized
+                assert normalized["x-docintel-publication-attempt-id"] == request_id
+                assert str(release.uuid.UUID(normalized["x-ms-client-request-id"])) == normalized["x-ms-client-request-id"]
+                assert normalized["content-type"].startswith("application/json")
+                assert json.loads(received_body) == body
+                assert json.loads(received_body)["agentConfiguration"] == {"cpu": 2}
+                assert json.loads(received_body)["timeout"] == 900
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+    assert not list((tmp_path / "azure-config").glob("*token*"))
+
+
+def test_publication_paths_do_not_construct_acr_build_commands():
+    import ast
+
+    tree = ast.parse(Path(release.__file__).read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "azure":
+            leading = [argument.value if isinstance(argument, ast.Constant) else None for argument in node.args[:2]]
+            assert leading != ["acr", "build"]
 
 
 @pytest.mark.parametrize("nonempty", [False, True])

@@ -14,7 +14,9 @@ from pathlib import Path
 import re
 import subprocess
 import tarfile
+import time
 import tomllib
+from urllib.parse import urlsplit
 import uuid
 import zlib
 
@@ -28,6 +30,7 @@ PILOT_CONFIGURATION_KEYS = {"upload": "configuration/pilot-source-upload.json", 
 PILOT_ENVIRONMENT_KEYS = {"AZURE_CLIENT_ID", "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "LLM_ENDPOINT", "LLM_DEPLOYMENT", "AOAI_API_VERSION", "WEBSEARCH_PROVIDER", "WEBIQ_ENDPOINT", "AI_FOUNDRY_PROJECT_ENDPOINT", "BING_CONNECTION_ID", "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_INDEX_NAME"}
 PILOT_EXTERNAL_ENVIRONMENT_KEYS = {"WEBSEARCH_PROVIDER", "WEBIQ_ENDPOINT", "AI_FOUNDRY_PROJECT_ENDPOINT", "BING_CONNECTION_ID", "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_INDEX_NAME"}
 PILOT_LIMITS = {"products": 4, "executions": 2, "analysis": 2, "inference": 16, "search": 8, "web_retrieval": 12, "retrieval": 4, "analysis_pages": 10, "input_tokens": 200000, "output_tokens": 32768}
+PUBLICATION_API_VERSION = "2019-04-01"
 
 
 def require(condition, message):
@@ -39,14 +42,17 @@ def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def command(arguments, *, cwd=None, env=None):
-    completed = subprocess.run(arguments, cwd=cwd, env=env, capture_output=True)
+def command(arguments, *, cwd=None, env=None, timeout=None):
+    try:
+        completed = subprocess.run(arguments, cwd=cwd, env=env, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ValueError("Command timed out; outcome unknown, do not repeat a submitted operation") from None
     require(completed.returncode == 0, f"Command failed: {arguments[0]} {arguments[1]}; output withheld to protect private configuration")
     return completed.stdout
 
 
-def azure(*arguments):
-    output = command(["az", *arguments, "--only-show-errors", "-o", "json"])
+def azure(*arguments, timeout=None):
+    output = command(["az", *arguments, "--only-show-errors", "-o", "json"], timeout=timeout)
     return json.loads(output) if output.strip() else None
 
 
@@ -604,12 +610,14 @@ def load_config(path):
     path = private_path(path)
     require(path.stat().st_mode & 0o077 == 0, "Target configuration must be owner-only (mode 600)")
     config = json.loads(path.read_text())
-    allowed = {"subscription", "tenant", "group", "environment", "registry", "storage", "frontend", "backend", "job", "container", "frontend_origin", "backend_origin", "api_client_id", "api_principal_id", "pilot_operator_ids", "frontend_client_id", "frontend_image", "backend_image", "auth_secret_ref", "entra_secret_ref", "baseline_authenticated"}
+    allowed = {"subscription", "tenant", "group", "environment", "registry", "storage", "frontend", "backend", "job", "container", "frontend_origin", "backend_origin", "api_client_id", "api_principal_id", "pilot_operator_ids", "publication_deadline", "frontend_client_id", "frontend_image", "backend_image", "auth_secret_ref", "entra_secret_ref", "baseline_authenticated"}
     require(set(config) <= allowed, "Unknown/private-secret fields are forbidden in release configuration")
     for field in ("subscription", "tenant"):
         require(str(uuid.UUID(config[field])) == config[field], f"Invalid {field}")
     if "api_principal_id" in config:
         require(str(uuid.UUID(config["api_principal_id"])) == config["api_principal_id"], "Invalid API managed-identity principal ID")
+    if "publication_deadline" in config:
+        publication_deadline(config)
     for field in ("group", "environment", "registry", "storage", "frontend", "backend", "job", "container", "auth_secret_ref", "entra_secret_ref"):
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{1,89}", config[field]), f"Invalid resource/reference name: {field}")
     for field in ("frontend_origin", "backend_origin"):
@@ -834,25 +842,217 @@ def publish_frontend(config, work, previous_work):
     publish_component(config, work, previous_work, "frontend")
 
 
-def require_unused_publication(work, kinds):
+def publication_deadline(config):
+    value = config.get("publication_deadline")
+    require(isinstance(value, str), "Private target publication_deadline is required for replacement")
+    try:
+        deadline = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("Private target publication_deadline must be a timezone-aware ISO timestamp") from None
+    require(deadline.tzinfo is not None, "Private target publication_deadline must be a timezone-aware ISO timestamp")
+    return deadline
+
+
+def validate_publication_replacement(approval, config, work, revision):
+    fields = {"schema_version", "approved", "id", "approved_by", "target", "work", "revision", "component", "original_attempt", "original_attempt_sha256", "original_failure", "additional_attempts", "cpu", "timeout_seconds", "expires_at"}
+    require(isinstance(approval, dict) and set(approval) == fields, "Publication replacement approval schema mismatch")
+    for name, value in (("schema_version", 1), ("additional_attempts", 1), ("cpu", 2), ("timeout_seconds", 900)):
+        require(type(approval[name]) is int and approval[name] == value, "Replacement approval may authorize only one two-CPU, 900-second attempt")
+    require(approval["approved"] is True and approval["component"] == "backend", "Only an explicitly approved backend replacement is supported")
+    for name in ("id", "approved_by"):
+        require(isinstance(approval[name], str) and str(uuid.UUID(approval[name])) == approval[name], "Canonical replacement approval/operator UUID required")
+    approved_operator(config, approval)
+    require(approval["target"] == fingerprint(config) and approval["work"] == str(work.resolve()), "Replacement target/work mismatch")
+    require(re.fullmatch(r"[0-9a-f]{40}", revision) and approval["revision"] == revision, "Replacement source revision mismatch")
+    end = datetime.fromisoformat(approval["expires_at"])
+    deadline = publication_deadline(config)
+    now = datetime.now(timezone.utc)
+    require(deadline > now and end.tzinfo is not None and now < end <= deadline, "Replacement approval expired or exceeds the private target publication_deadline")
+    original = work / "backend-publication-attempt.json"
+    require(approval["original_attempt"] == str(original.resolve()), "Replacement original attempt path mismatch")
+    record = private_json(original)
+    require(approval["original_attempt_sha256"] == hashlib.sha256(original.read_bytes()).hexdigest(), "Replacement original attempt hash mismatch")
+    require(record == {"revision": revision, "component": "backend", "cpu": 2, "timeout_seconds": 900, "status": "attempted"}, "Only the original CLI-rejected attempt may be replaced")
+    require(approval["original_failure"] == "unsupported_acr_build_cpu_argument", "Explicit pre-submission CLI failure attestation required")
+    require(not any((work / name).exists() for name in ("backend-publication-result.json", "backend-publication-queued.json", "backend-publication-request.json", "backend-publication-submission.json")), "Original attempt has remote-submission evidence; replacement refused")
+    return approval
+
+
+def require_unused_publication(work, kinds, replacement=None):
     require(not (work / "images.json").exists() and not (work / "publication-progress.json").exists(), "Publication already attempted or accepted; no automatic retry")
     for kind in kinds:
         require(kind in {"backend", "frontend"}, "Unsupported publication component")
-        require(not (work / f"{kind}-publication-attempt.json").exists() and not (work / f"{kind}-publication-result.json").exists(), "Component publication already attempted; no automatic retry")
+        replacing = kind == "backend" and replacement is not None
+        stem = kind + "-publication" + ("-replacement" if replacing else "")
+        if kind == "backend":
+            require(not (work / "backend-publication-replacement-attempt.json").exists(), "Component publication already attempted; no automatic retry")
+        require(not (work / f"{stem}-attempt.json").exists() and not (work / f"{stem}-result.json").exists(), "Component publication already attempted; no automatic retry")
 
 
-def reserve_publication_attempt(work, kind, revision):
+def reserve_publication_attempt(work, kind, revision, *, replacement=None, config=None):
     require(kind in {"backend", "frontend"}, "Unsupported publication component")
-    require(not (work / f"{kind}-publication-result.json").exists(), "Component publication already attempted; no automatic retry")
-    save_once(work / f"{kind}-publication-attempt.json", {
+    replacing = kind == "backend" and replacement is not None
+    stem = kind + "-publication" + ("-replacement" if replacing else "")
+    if replacement is not None:
+        validate_publication_replacement(replacement, config, work, revision)
+    if kind == "backend" and not replacing:
+        require(not (work / "backend-publication-replacement-attempt.json").exists(), "Component publication already attempted; no automatic retry")
+    require(not (work / f"{stem}-result.json").exists(), "Component publication already attempted; no automatic retry")
+    record = {
         "revision": revision, "component": kind, "cpu": 2,
         "timeout_seconds": 900, "status": "attempted",
-    })
+        "attempt_id": str(uuid.uuid4()),
+    }
+    if replacement is not None:
+        record.update({"replacement_approval": replacement, "replacement_approval_sha256": fingerprint(replacement)})
+    path = work / f"{stem}-attempt.json"
+    save_once(path, record)
+    return path
 
 
-def publish_component(config, work, previous_work, kind):
+def publication_request(kind, revision, source_location):
+    require(kind in {"backend", "frontend"} and re.fullmatch(r"[0-9a-f]{40}", revision), "Exact publication component/source required")
+    require(isinstance(source_location, str) and re.fullmatch(r"source/[A-Za-z0-9/_-]+\.tar\.gz", source_location) and ".." not in source_location, "Invalid registry build-source relative path")
+    return {
+        "type": "DockerBuildRequest", "imageNames": [f"docintel/{kind}:{revision}"],
+        "isPushEnabled": True, "isArchiveEnabled": False,
+        "sourceLocation": source_location,
+        "dockerFilePath": "backend/Dockerfile" if kind == "backend" else "Dockerfile",
+        "platform": {"os": "Linux", "architecture": "amd64"},
+        "agentConfiguration": {"cpu": 2}, "timeout": 900,
+    }
+
+
+def archive_publication_context(work, kind, destination):
+    context = work / "context"
+    inventory = private_json(work / "context.json", max_bytes=4 * 1024 * 1024)
+    modes = private_json(work / "context-modes.json", max_bytes=4 * 1024 * 1024)
+    entries = sorted(context.rglob("*"))
+    require(all(not path.is_symlink() and (path.is_file() or path.is_dir()) for path in entries), "Build context links/special files are forbidden")
+    require(inventory == {str(path.relative_to(context)): hashlib.sha256(path.read_bytes()).hexdigest() for path in entries if path.is_file()}, "Build context drift")
+    require(modes == {str(path.relative_to(context)): path.stat().st_mode & 0o777 for path in entries}, "Build context permission drift")
+    build_root = context if kind == "backend" else context / "frontend"
+    dockerfile = build_root / ("backend/Dockerfile" if kind == "backend" else "Dockerfile")
+    require(dockerfile.is_file(), "Verified Dockerfile is missing")
+    for path in entries:
+        relative = path.relative_to(context)
+        require(relative.parts[0] in {"backend", "frontend", "pyproject.toml", "uv.lock", ".dockerignore"}, "Uncurated build context")
+        require(not any(part in {".git", ".azure", ".venv", "node_modules", "__pycache__"} or part.startswith(".env") for part in relative.parts), "Private/runtime files are forbidden in build context")
+        require(path.suffix.lower() not in {".pdf", ".xlsx", ".xlsm", ".db", ".sqlite", ".pem", ".key", ".pfx", ".p12", ".log"}, "Evidence/secrets are forbidden in build context")
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            with tarfile.open(fileobj=output, mode="w:gz") as archive:
+                for path in entries:
+                    if path != build_root and path.is_relative_to(build_root):
+                        archive.add(path, arcname=path.relative_to(build_root).as_posix(), recursive=False)
+    except BaseException:
+        destination.unlink()
+        raise
+    return fingerprint(inventory)
+
+
+def upload_publication_context(upload, archive, timeout):
+    require(isinstance(upload, dict), "Registry did not return a build-source upload location")
+    source = upload.get("relativePath")
+    publication_request("backend", "0" * 40, source)
+    url = upload.get("uploadUrl")
+    require(isinstance(url, str) and not any(ord(char) < 32 for char in url), "Invalid registry upload URL")
+    parts = urlsplit(url)
+    require(parts.scheme == "https" and parts.hostname is not None and re.fullmatch(r"[a-z0-9]+\.blob\.core\.windows\.net", parts.hostname) and parts.port in (None, 443) and not parts.username and not parts.password and not parts.fragment and parts.query and parts.path.endswith("/" + source), "Invalid registry upload destination")
+    # The SAS travels only over stdin, never argv, receipts, or diagnostic output.
+    try:
+        result = subprocess.run([
+            "curl", "--disable", "--silent", "--show-error", "--fail",
+            "--proto", "=https", "--retry", "0", "--max-redirs", "0",
+            "--request", "PUT", "--header", "x-ms-blob-type: BlockBlob",
+            "--upload-file", str(archive), "--max-time", str(timeout),
+            "--write-out", "%{http_code}", "--config", "-",
+        ], input=("url = " + json.dumps(url) + "\n").encode(), capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ValueError("Private build-source upload failed or timed out; details withheld, no automatic retry") from None
+    require(result.returncode == 0 and result.stdout == b"201", "Private build-source upload failed; details withheld, no automatic retry")
+    return source
+
+
+def build_publication(config, work, kind, revision, *, replacement=None):
+    attempt = reserve_publication_attempt(work, kind, revision, replacement=replacement, config=config)
+    stem = attempt.name.removesuffix("-attempt.json")
+    expires = datetime.fromisoformat(replacement["expires_at"]) if replacement is not None else None
+    deadline = time.monotonic() + min(1200, (expires - datetime.now(timezone.utc)).total_seconds() if expires else 1200)
+    resource = f"https://management.azure.com/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.ContainerRegistry/registries/{config['registry']}"
+    archive = work / (stem + "-context.tar.gz")
+    archive_created = False
+
+    def remaining(maximum=60):
+        seconds = deadline - time.monotonic()
+        if expires is not None:
+            seconds = min(seconds, (expires - datetime.now(timezone.utc)).total_seconds())
+        require(seconds > 0, "Publication observation deadline reached; outcome unknown, never resubmit")
+        return min(maximum, seconds)
+
+    def rest(method, suffix, *arguments):
+        if method == "POST" and expires is not None:
+            require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no next upload/queue action")
+        return azure("rest", "--method", method, "--url", resource + suffix + "?api-version=" + PUBLICATION_API_VERSION, *arguments, timeout=remaining())
+
+    try:
+        context_hash = archive_publication_context(work, kind, archive)
+        archive_created = True
+        tool_revision = command(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()
+        require(re.fullmatch(r"[0-9a-f]{40}", tool_revision), "Publication helper revision is invalid")
+        upload = rest("POST", "/listBuildSourceUploadUrl")
+        if expires is not None:
+            require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no next upload/queue action")
+        source = upload_publication_context(upload, archive, remaining(120))
+        body = publication_request(kind, revision, source)
+        body_path = work / (stem + "-request.json")
+        save_once(body_path, body)
+        submission = {
+            "target": fingerprint(config), "source_revision": revision,
+            "tool_revision": tool_revision, "tool_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "attempt_sha256": hashlib.sha256(attempt.read_bytes()).hexdigest(),
+            "request_sha256": hashlib.sha256(body_path.read_bytes()).hexdigest(),
+            "context_sha256": context_hash, "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "api_version": PUBLICATION_API_VERSION, "cpu": 2, "timeout_seconds": 900,
+            "expires_at": expires.isoformat() if expires else None,
+        }
+        require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no run submitted")
+        save_once(work / (stem + "-submission.json"), submission)
+        attempt_id = private_json(attempt)["attempt_id"]
+        queued = rest("POST", "/scheduleRun", "--body", "@" + str(body_path), "--headers", "x-docintel-publication-attempt-id=" + attempt_id)
+        properties = queued.get("properties", {}) if isinstance(queued, dict) else {}
+        run_id = properties.get("runId")
+        require(isinstance(run_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run_id), "ACR submission outcome unknown (no run ID); inspect existing runs, never resubmit")
+        save_once(work / (stem + "-queued.json"), {**submission, "runId": run_id, "attempt_id": attempt_id})
+        while True:
+            observed = rest("GET", "/runs/" + run_id)
+            properties = observed.get("properties", {}) if isinstance(observed, dict) else {}
+            require(properties.get("runId") == run_id, "ACR run identity mismatch; never resubmit")
+            actual_cpu = properties.get("agentConfiguration", {}).get("cpu")
+            require(type(actual_cpu) is int and actual_cpu == 2, "ACR actual CPU is not two; stop and inspect the consumed run")
+            status = properties.get("status")
+            require(status in {"Queued", "Started", "Running", "Succeeded", "Failed", "Canceled", "Error", "Timeout"}, "Unknown ACR run status; never resubmit")
+            if status not in {"Queued", "Started", "Running"}:
+                result = {name: properties.get(name) for name in ("runId", "status", "startTime", "finishTime", "agentConfiguration", "outputImages")}
+                save_once(work / (stem + "-result.json"), result)
+                require(status == "Succeeded", "ACR build did not succeed; no automatic retry")
+                outputs = properties.get("outputImages", [])
+                require(isinstance(outputs, list) and len(outputs) == 1, "ACR output-image evidence missing or unexpected")
+                output = outputs[0]
+                require(output.get("registry") == config["registry"] + ".azurecr.io" and output.get("repository") == "docintel/" + kind and output.get("tag") == revision and re.fullmatch(r"sha256:[a-f0-9]{64}", output.get("digest", "")), "ACR run output-image binding mismatch")
+                digest = azure("acr", "repository", "show", "--subscription", config["subscription"], "--name", config["registry"], "--image", f"docintel/{kind}:{revision}", timeout=remaining())["digest"]
+                require(digest == output["digest"], "Published image digest differs from the successful run")
+                return {**result, "digest": digest, "tool_revision": tool_revision, "tool_sha256": submission["tool_sha256"]}
+            time.sleep(min(5, remaining()))
+    finally:
+        if archive_created:
+            archive.unlink()
+
+
+def publish_component(config, work, previous_work, kind, *, replacement=None):
     require(kind in {"backend", "frontend"}, "Unsupported publication component")
-    require_unused_publication(work, [kind])
+    require_unused_publication(work, [kind], replacement)
     retained = "frontend" if kind == "backend" else "backend"
     source = verify_source(work)
     previous = private_path(previous_work)
@@ -873,15 +1073,10 @@ def publish_component(config, work, previous_work, kind):
     require(checks["revision"] == smoke["revision"] == source["revision"], "Validation source mismatch")
     require(checks["lock_sha256"] == hashlib.sha256(command(["git", "show", source["revision"] + ":uv.lock"], cwd=ROOT)).hexdigest(), "Committed lock mismatch")
     require(smoke["passed"] is True and smoke["context_sha256"] == fingerprint(inventory) and smoke["modes_sha256"] == fingerprint(modes), "Runtime/context validation required")
-    require_unused_publication(work, [kind])
-    tag = "docintel/" + kind + ":" + source["revision"]
-    build_directory = context if kind == "backend" else context / "frontend"
-    reserve_publication_attempt(work, kind, source["revision"])
-    result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--cpu", "2", "--timeout", "900", "--no-logs", "--file", str(context / kind / "Dockerfile"), "--image", tag, str(build_directory))
-    save(work / (kind + "-publication-result.json"), {name: result.get(name) for name in ("runId", "status", "startTime", "finishTime")})
-    require(result.get("status") == "Succeeded", "ACR build failed; no automatic retry")
-    digest = azure("acr", "repository", "show", "--name", config["registry"], "--image", tag)["digest"]
-    published = {"revision": source["revision"], kind: config["registry"] + ".azurecr.io/docintel/" + kind + "@" + digest, kind + "_run_id": result["runId"], retained: previous_images[retained], "preserved_" + retained: {"work": str(previous), "revision": previous_source["revision"], "receipt_sha256": fingerprint(previous_images)}, "tool_revision": command(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
+    require_unused_publication(work, [kind], replacement)
+    result = build_publication(config, work, kind, source["revision"], replacement=replacement)
+    digest = result["digest"]
+    published = {"revision": source["revision"], kind: config["registry"] + ".azurecr.io/docintel/" + kind + "@" + digest, kind + "_run_id": result["runId"], retained: previous_images[retained], "preserved_" + retained: {"work": str(previous), "revision": previous_source["revision"], "receipt_sha256": fingerprint(previous_images)}, "tool_revision": result["tool_revision"], "tool_sha256": result["tool_sha256"]}
     image({**config, kind + "_image": published[kind]}, kind)
     save(work / "images.json", published)
 
@@ -1019,6 +1214,11 @@ def run(options):
         return
     if options.action in OPERATIONS:
         require(options.approve == options.action, "Explicit approval for this operation is required")
+    replacement = None
+    replacement_path = getattr(options, "publication_replacement_approval", None)
+    if replacement_path is not None:
+        require(options.action in {"publish", "publish-backend", "publish-frontend"}, "Publication replacement approval is valid only for publication")
+        replacement = validate_publication_replacement(private_json(replacement_path, max_bytes=16384), config, work, verify_source(work)["revision"])
     approval = None
     if options.action in {"pilot-start", "pilot-enable"}:
         approval = load_pilot_approval(getattr(options, "pilot_approval", None), options.batch_id)
@@ -1049,9 +1249,9 @@ def run(options):
     elif options.action == "pilot-disable":
         pilot_disable(config, work)
     elif options.action == "publish-frontend":
-        publish_frontend(config, work, options.previous_work)
+        publish_component(config, work, options.previous_work, "frontend", replacement=replacement)
     elif options.action == "publish-backend":
-        publish_component(config, work, options.previous_work, "backend")
+        publish_component(config, work, options.previous_work, "backend", replacement=replacement)
     elif options.action == "update-worker":
         update_worker_image(config, work)
     elif options.action == "capture":
@@ -1079,19 +1279,15 @@ def run(options):
         actual = {str(path.relative_to(work / "context")): hashlib.sha256(path.read_bytes()).hexdigest() for path in (work / "context").rglob("*") if path.is_file()}
         require(inventory == actual, "Build context drift")
         require(all(source["files"].get(relative) == digest for relative, digest in actual.items()), "Context differs from reviewed committed source")
-        require_unused_publication(work, ("backend", "frontend"))
+        require_unused_publication(work, ("backend", "frontend"), replacement)
         published = {"revision": source["revision"]}
         for kind in ("backend", "frontend"):
-            context = work / "context" if kind == "backend" else work / "context/frontend"
-            dockerfile = context / ("backend/Dockerfile" if kind == "backend" else "Dockerfile")
-            tag = f"docintel/{kind}:{source['revision']}"
-            reserve_publication_attempt(work, kind, source["revision"])
-            result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--cpu", "2", "--timeout", "900", "--no-logs", "--file", str(dockerfile), "--image", tag, str(context))
-            save(work / (kind + "-publication-result.json"), {name: result.get(name) for name in ("runId", "status", "startTime", "finishTime")})
-            require(result.get("status") == "Succeeded", "ACR build did not succeed; inspect the run before another attempt")
-            digest = azure("acr", "repository", "show", "--name", config["registry"], "--image", tag)["digest"]
+            result = build_publication(config, work, kind, source["revision"], replacement=replacement)
+            digest = result["digest"]
             published[kind] = config["registry"] + f".azurecr.io/docintel/{kind}@" + digest
             published[kind + "_run_id"] = result["runId"]
+            published["tool_revision"] = result["tool_revision"]
+            published["tool_sha256"] = result["tool_sha256"]
             save(work / "publication-progress.json", published)
         save(work / "images.json", published)
     elif options.action in {"what-if", "provision"}:
@@ -1182,6 +1378,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["plan", "stage", "package", "package-backend", "context", "identity-check", "capture", "publish", "publish-frontend", "publish-backend", "update-worker", "what-if", "provision", "seed", "deploy", "start", "stop", "rollback", "pilot-enable", "pilot-start", "pilot-disable", "pilot-upload-enable", "pilot-upload-disable", "pilot-configure"])
     parser.add_argument("--previous-work", type=Path)
+    parser.add_argument("--publication-replacement-approval", type=Path, help="Owner-only, single-use authorization replacing the exact CLI-rejected backend attempt; never resets original records")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--revision")
