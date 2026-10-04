@@ -1966,11 +1966,13 @@ def test_pilot_acceptance_requires_matching_https_ingress(pilot_release, field, 
 
 def test_backend_runtime_command_is_accepted_by_installed_fastapi_cli():
     from fastapi_cli.cli import app
+    from rich.text import Text
     from typer.testing import CliRunner
 
     result = CliRunner().invoke(app, [*release.BACKEND_ARGUMENTS, "--help"])
     assert result.exit_code == 0, result.output
-    assert "--port" in result.output and "--host" in result.output
+    output = Text.from_ansi(result.output).plain
+    assert "--port" in output and "--host" in output
 
 
 @pytest.mark.parametrize("defect", ["active", "retry", "timeout", "replicas", "container", "image", "identity", "storage"])
