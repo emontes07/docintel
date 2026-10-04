@@ -161,10 +161,54 @@ python3.13 scripts/release.py publish --config "$CFG" --work "$WORK" --approve p
 The tool builds the root/backend and frontend contexts separately in the approved
 registry, records immutable digests and requires the committed lock/source hashes
 to match clean checks. It never uses the inherited registry or mutable `latest`.
-Each ACR build explicitly requests **two CPUs** (`--cpu 2`) and a **900-second**
-timeout (`--timeout 900`). Absolute Dockerfile paths point into the
-verified context; only successful builds produce digest/run-ID receipts. A failure
-stops publication without automatically repeating either build.
+Each ACR build explicitly requests **two CPUs** and a **900-second** timeout in
+the ARM `DockerBuildRequest`: `agentConfiguration: {"cpu": 2}`, `timeout: 900`.
+Azure CLI **2.77.0 does not support `az acr build --cpu`**; the release helper
+does not call that command, rely on historical defaults, upgrade the CLI, or
+modify its SDK. It uses the existing registry's ARM API **2019-04-01**:
+
+1. Create the immutable local attempt record and archive only the verified,
+   curated context. Reject links, private evidence, secrets, or permission drift.
+2. `az rest --method POST --url "$REGISTRY_ARM_ID/listBuildSourceUploadUrl?api-version=2019-04-01"`.
+3. PUT that archive as `BlockBlob` to the returned `uploadUrl`; put only the
+   returned `relativePath` in `sourceLocation`. The short-lived SAS stays in
+   process memory/stdin, never command arguments, receipts, or printed errors.
+   No redirects or upload retries are enabled.
+4. Save the exact request and its source/helper/context/archive hashes, then
+   `az rest --method POST --url "$REGISTRY_ARM_ID/scheduleRun?api-version=2019-04-01" --body "@$REQUEST"`.
+   A separate `x-docintel-publication-attempt-id` header carries the immutable
+   local attempt ID; it is not an ARM idempotency key. CLI 2.77.0 generates its own
+   `x-ms-client-request-id`, so the helper does not claim to persist that value.
+   The request uses `type: DockerBuildRequest`, one exact revision-tagged image,
+   `isPushEnabled: true`, `isArchiveEnabled: false`, Linux/amd64, and the above
+   explicit CPU/timeout. The relative Dockerfile is `backend/Dockerfile` for the
+   root context or `Dockerfile` for the frontend context.
+5. Immediately preserve the returned run ID. Poll only that run with read-only
+   GETs for at most twenty minutes, shortened by any replacement approval expiry.
+   Verify actual `agentConfiguration.cpu == 2`, successful status, one exact
+   output image, and agreement between its digest and the repository lookup.
+
+Subprocesses are time-bounded and there is exactly one `scheduleRun` invocation
+per attempt, with no application retry. Empty/unknown submission responses
+(including HTTP 202 without a run ID), failed runs, missing CPU evidence, digest
+mismatches, and observation timeouts all stop without resubmission. A local
+observation timeout does not prove the remote run stopped; inspect the consumed
+run read-only. The request's 900-second service timeout remains in force.
+Only verified successful builds produce accepted image receipts. This route uses
+the same existing ACR build/upload services and identity as the CLI; it creates no
+new registry, task resource, agent pool, role assignment, or service. If existing
+permissions are insufficient, stop—this tool never grants more.
+
+The schema and examples are the official
+[2019-04-01 RegistryTasks specification](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/containerregistry/resource-manager/Microsoft.ContainerRegistry/RegistryTasks/stable/2019-04-01/containerregistry_build.json).
+An offline release-host regression checks the installed CLI's real command
+contract and SDK serialization in addition to transport simulations. It also
+executes the installed `az rest` with the production arguments against a
+loopback-only HTTP stub, using isolated `AZURE_CONFIG_DIR`, disabled telemetry,
+and `--skip-authorization-header`. The stub verifies both component request bodies,
+including CPU/timeout, and absence of an Authorization header. This proves real
+CLI parsing/serialization, not Azure authorization or successful remote execution.
+
 Full and component publication share atomic, create-once
 `backend-publication-attempt.json` / `frontend-publication-attempt.json` records
 in the same prescribed private `$WORK`. Each record is persisted before its ACR
@@ -175,6 +219,72 @@ This enforcement is **work-directory scoped**. A different directory is not rene
 approval; never discard receipts or switch directories to evade a consumed
 allowance. Review an unknown outcome without repeating the paid request.
 Record those digests in the private target configuration before baseline capture.
+
+#### One Explicit Replacement For The CLI-Rejected Backend Attempt
+
+The separately authorized recovery retains the consumed original backend attempt.
+It permits exactly **one additional backend attempt**, plus the still-unused
+original frontend attempt, in the **same prescribed private work directory**.
+It does not increase the approved $10 ceiling, two-CPU/900-second per-build
+bounds, worker allowance, or service scope. Do not stage a new work directory or
+replace the already reviewed source/check/context receipts to retry publication.
+
+Supply an independently reviewed, owner-only JSON file using
+`--publication-replacement-approval`. The private target must also contain
+`publication_deadline`, a timezone-aware ISO timestamp representing the separately
+approved absolute deadline. Missing, malformed, timezone-naive, or expired target
+deadlines fail replacement closed. Do not publish the actual deadline or incident
+source revision in repository files. Adding this target field changes
+`fingerprint(config)`; bind the replacement approval to that exact updated private
+target. Its exact required fields are:
+
+| Field | Required value/binding |
+| --- | --- |
+| `schema_version` | Integer `1` |
+| `approved` | Literal `true`, only after actual approval |
+| `id`, `approved_by` | Canonical UUIDs; approver already in target `pilot_operator_ids` |
+| `target` | Existing `fingerprint(config)` of the exact private target JSON |
+| `work` | Canonical absolute path of the original prescribed work directory |
+| `revision` | Exact full 40-character source commit from the original attempt and `source.json` |
+| `component` | `"backend"` |
+| `original_attempt` | Canonical absolute path to that work's `backend-publication-attempt.json` |
+| `original_attempt_sha256` | SHA-256 of the original attempt's **unchanged raw file bytes**, not reserialized JSON |
+| `original_failure` | `"unsupported_acr_build_cpu_argument"`; operator attests this pre-submission failure after reviewing remote state |
+| `additional_attempts` | Integer `1` |
+| `cpu`, `timeout_seconds` | Integers `2`, `900` |
+| `expires_at` | Active timezone-aware ISO timestamp, no later than the private target's active `publication_deadline` |
+
+No extra fields are accepted. An original queued/request/submission/result
+receipt disqualifies this narrow pre-submission recovery. The tool cannot infer
+absence of a remote run merely from absence of a receipt; the approver must
+independently verify the incident. A full 900 seconds must remain before **each**
+upload-URL request, context upload, and run submission, including an immediate
+recheck after persisting the submission receipt. The same expiry bounds both the
+backend replacement and original frontend in the full publication. If backend
+processing leaves less than 900 seconds, frontend publication stops before
+requesting an upload URL or uploading its context; there is no implicit extension.
+
+```sh
+python3.13 scripts/release.py publish \
+  --config "$CFG" --work "$WORK" --approve publish \
+  --publication-replacement-approval "$REPLACEMENT_APPROVAL"
+```
+
+The component actions accept the same option and retain their existing
+`--previous-work`/preserved-image checks; the option never grants another frontend
+attempt. The backend replacement always consumes the single fixed
+`backend-publication-replacement-attempt.json`, even after failure, unknown
+outcome, concurrency, or an edited approval UUID. The original record is neither
+deleted, reset, nor migrated. Request/submission/queued/result files use the
+corresponding `backend-publication-replacement-*` prefix; the frontend retains
+its original `frontend-publication-*` prefix. Changing approval IDs, component
+paths, or full-versus-component commands cannot renew either slot.
+
+`source_revision` records the exact prior reviewed, staged/CI-validated source;
+`tool_revision` and
+`tool_sha256` separately record the executing fixed helper. The helper's new
+revision does not silently replace the older reviewed image source. Existing
+validation and publication receipts remain untouched.
 
 ### Provisioning And Deployment
 
