@@ -829,6 +829,96 @@ def test_publication_blob_put_never_exposes_sas_or_retries(tmp_path, monkeypatch
     assert len(calls) == 1 and not capsys.readouterr().out
 
 
+@pytest.mark.parametrize("source", [
+    "opaque-object", "context.zip", "folder/build.tgz", "another/container/blob.bundle",
+    "e84a913d-3b50-41df-8564-271662992195", "names.with.dots/archive..part",
+    "unicode/évidence package", "escaped/context%20package",
+])
+def test_publication_accepts_safe_opaque_relative_paths_without_prefix_or_extension(tmp_path, monkeypatch, source):
+    """Representative synthetic strings, not recovered provider response values."""
+    from types import SimpleNamespace
+    from urllib.parse import quote
+    calls = []
+    monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(returncode=0, stdout=b"201"))
+    blob_path = quote(source, safe="/%")
+    location = {"relativePath": source, "uploadUrl": "https://registryaccount.blob.core.windows.net/container/" + blob_path + "?sig=SYNTHETIC"}
+    assert release.upload_publication_context(location, tmp_path / "context.tar.gz", 30) == source
+    assert len(calls) == 1
+    for kind in ("backend", "frontend"):
+        assert release.publication_request(kind, "a" * 40, source)["sourceLocation"] == source
+
+
+@pytest.mark.parametrize("source", [
+    None, 123, [], "", "/absolute", "//host/path", "https://host.invalid/blob",
+    "../blob", "path/../blob", "path/./blob", "path//blob", "path/", "path\\blob",
+    "path?sig=PRIVATE", "path#fragment", "path\nblob", "path\x7fblob", "x" * 4097,
+    "%2e%2e/blob", "path/%2fblob", "path/%5cblob", "%252e%252e/blob", "path/%GG",
+    "https%3a/host/blob", "path/%0ablob",
+])
+def test_publication_rejects_unsafe_relative_paths_without_disclosing_values(tmp_path, monkeypatch, source):
+    monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: pytest.fail("Upload attempted"))
+    location = {"relativePath": source, "uploadUrl": "https://registryaccount.blob.core.windows.net/container/blob?sig=PRIVATE-SAS"}
+    with pytest.raises(ValueError, match="safe metadata") as error:
+        release.upload_publication_context(location, tmp_path / "archive", 30)
+    assert "PRIVATE" not in str(error.value)
+    with pytest.raises(ValueError):
+        release.publication_request("backend", "a" * 40, source)
+
+
+@pytest.mark.parametrize("suffix", [
+    "/container/prefixblob?sig=PRIVATE-SAS", "/container/blob/extra?sig=PRIVATE-SAS",
+    "/container/%2e%2e/blob?sig=PRIVATE-SAS", "/container/path%2fblob?sig=PRIVATE-SAS",
+    "/container/blob?sig=", "/container/blob?sig=one&sig=PRIVATE-SAS",
+    "/container/blob?other=PRIVATE-SAS",
+])
+def test_publication_requires_exact_blob_path_binding_and_sas(tmp_path, monkeypatch, suffix):
+    monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: pytest.fail("Upload attempted"))
+    with pytest.raises(ValueError, match="destination") as error:
+        release.upload_publication_context({"relativePath": "blob", "uploadUrl": "https://registryaccount.blob.core.windows.net" + suffix}, tmp_path / "archive", 30)
+    assert "PRIVATE-SAS" not in str(error.value)
+
+
+@pytest.mark.parametrize("upload", [
+    None, [], {"relativePath": 123, "uploadUrl": False},
+    {"relativePath": "confidential-marker/../blob", "uploadUrl": "https://registryaccount.blob.core.windows.net/container/blob?sig=PRIVATE-SAS"},
+    {"relativePath": "blob", "uploadUrl": "https://registryaccount.blob.core.windows.net:PRIVATE-SAS/container/blob?sig=PRIVATE-SAS"},
+    {"relativePath": "blob", "uploadUrl": "https://[PRIVATE-SAS/container/blob?sig=PRIVATE-SAS"},
+])
+def test_publication_provider_diagnostics_are_safe_and_persist_before_rejection(tmp_path, monkeypatch, publication_case, upload):
+    config, source = publication_case
+    calls = []
+    run = release.subprocess.run
+
+    def offline_run(arguments, **kwargs):
+        assert arguments[0] != "curl", "Upload attempted"
+        return run(arguments, **kwargs)
+
+    def azure(*arguments, **kwargs):
+        assert "/listBuildSourceUploadUrl?" in " ".join(arguments)
+        calls.append(arguments)
+        return upload
+
+    monkeypatch.setattr(release.subprocess, "run", offline_run)
+    monkeypatch.setattr(release, "azure", azure)
+    with pytest.raises(ValueError, match="safe metadata") as error:
+        release.build_publication(config, tmp_path, "backend", source["revision"])
+    record = release.private_json(tmp_path / "backend-publication-upload-metadata.json")
+    assert record == release.publication_upload_metadata(upload)
+    diagnostics = json.dumps(record) + str(error.value)
+    assert "PRIVATE-SAS" not in diagnostics and "confidential-marker" not in diagnostics
+    assert "https://" not in diagnostics and "?sig=" not in diagnostics
+    assert record["response_type"] == type(upload).__name__
+    if isinstance(upload, dict) and isinstance(upload["relativePath"], str):
+        assert record["relative_path"]["sha256"] == hashlib.sha256(upload["relativePath"].encode()).hexdigest()
+        assert record["relative_path"]["bytes"] == len(upload["relativePath"].encode())
+    assert len(calls) == 1
+    assert (tmp_path / "backend-publication-attempt.json").exists()
+    assert not (tmp_path / "backend-publication-submission.json").exists()
+    with pytest.raises(ValueError, match="already attempted"):
+        release.build_publication(config, tmp_path, "backend", source["revision"])
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("url", ["http://registryaccount.blob.core.windows.net/source/20300203/source.tar.gz?sig=private", "https://untrusted.invalid/source/20300203/source.tar.gz?sig=private", "https://registryaccount.blob.core.windows.net/different.tar.gz?sig=private"])
 def test_publication_upload_rejects_redirect_or_unbound_destination(tmp_path, monkeypatch, url):
     monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: pytest.fail("Upload attempted"))
@@ -885,10 +975,20 @@ def test_publication_contract_with_installed_real_azure_cli(isolated_azure_cli):
     send = next(node for node in raw.body if isinstance(node, ast.FunctionDef) and node.name == "send_raw_request")
     assert sum(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "send" for node in ast.walk(send)) == 1
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "mount" for node in ast.walk(send))
-    body = release.publication_request("backend", "a" * 40, "source/20300203/source.tar.gz")
+    archive_tree = ast.parse((site / "azure/cli/command_modules/acr/_archive_utils.py").read_text())
+    upload = next(node for node in archive_tree.body if isinstance(node, ast.FunctionDef) and node.name == "upload_source_code")
+    assignments = [node for node in ast.walk(upload) if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "relative_path" for target in node.targets)]
+    assert len(assignments) == 2
+    assert any(isinstance(node.value, ast.Attribute) and node.value.attr == "relative_path" for node in assignments)
+    assert any(isinstance(node, ast.Return) and isinstance(node.value, ast.Name) and node.value.id == "relative_path" for node in ast.walk(upload))
+    body = release.publication_request("backend", "a" * 40, "opaque-object")
     code = (
         "import json,sys; sys.path.insert(0,sys.argv[1]); "
-        "from azure.mgmt.containerregistry.v2019_06_01_preview.models import DockerBuildRequest; "
+        "from azure.mgmt.containerregistry.v2019_06_01_preview.models import DockerBuildRequest, SourceUploadDefinition; "
+        "assert SourceUploadDefinition._attribute_map == {'upload_url': {'key': 'uploadUrl', 'type': 'str'}, 'relative_path': {'key': 'relativePath', 'type': 'str'}}; "
+        "assert not SourceUploadDefinition._validation.get('relative_path'); "
+        "upload=SourceUploadDefinition.deserialize({'relativePath':'opaque-object','uploadUrl':'https://synthetic.invalid/blob'}); "
+        "assert upload.relative_path=='opaque-object' and upload.serialize()['relativePath']=='opaque-object'; "
         "body=json.loads(sys.argv[2]); model=DockerBuildRequest.deserialize(body); "
         "actual=model.serialize(); assert all(actual[k]==v for k,v in body.items()); "
         "assert model.agent_configuration.cpu==2 and model.timeout==900; print('verified')"
@@ -928,7 +1028,7 @@ def test_publication_real_azure_cli_sends_exact_arm_requests_over_loopback(tmp_p
         thread.start()
         try:
             for kind in ("backend", "frontend"):
-                body = release.publication_request(kind, "a" * 40, "source/20300203/loopback.tar.gz")
+                body = release.publication_request(kind, "a" * 40, "opaque-object" if kind == "backend" else "nested path/frontend.bundle")
                 request_path = tmp_path / "private request files" / (kind + "-request.json")
                 release.save(request_path, body)
                 request_id = str(release.uuid.uuid4())

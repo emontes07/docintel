@@ -16,7 +16,7 @@ import subprocess
 import tarfile
 import time
 import tomllib
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 import uuid
 import zlib
 
@@ -910,9 +910,45 @@ def reserve_publication_attempt(work, kind, revision, *, replacement=None, confi
     return path
 
 
+def publication_source_path(value):
+    require(isinstance(value, str) and 0 < len(value.encode("utf-8")) <= 4096, "Invalid registry build-source relative path")
+    require(not any(char in value for char in "\\?#") and not re.search(r"%(?![0-9A-Fa-f]{2})", value), "Invalid registry build-source relative path")
+    segments = tuple(unquote(segment, encoding="utf-8", errors="strict") for segment in value.split("/"))
+    require(all(segment not in {"", ".", ".."} and not any(char in segment for char in "/\\%") and not any(ord(char) < 32 or ord(char) == 127 for char in segment) for segment in segments) and ":" not in segments[0], "Invalid registry build-source relative path")
+    return segments
+
+
+def publication_upload_metadata(upload):
+    def describe(value):
+        result = {"type": type(value).__name__}
+        if isinstance(value, str):
+            raw = value.encode("utf-8", errors="surrogatepass")
+            result.update({"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(), "segments": value.count("/") + 1,
+                           "leading_slash": value.startswith("/"), "has_backslash": "\\" in value,
+                           "has_percent": "%" in value, "has_query_or_fragment": "?" in value or "#" in value,
+                           "has_controls": any(ord(char) < 32 or ord(char) == 127 for char in value)})
+        return result
+
+    source = upload.get("relativePath") if isinstance(upload, dict) else None
+    url = upload.get("uploadUrl") if isinstance(upload, dict) else None
+    result = {"response_type": type(upload).__name__, "relative_path": describe(source), "upload_url": {"type": type(url).__name__}}
+    if isinstance(url, str):
+        result["upload_url"]["bytes"] = len(url.encode("utf-8", errors="surrogatepass"))
+        try:
+            parts = urlsplit(url)
+            result["upload_url"].update({
+                "https": parts.scheme == "https", "has_query": bool(parts.query),
+                "trusted_blob_host": bool(re.fullmatch(r"[a-z0-9]+\.blob\.core\.windows\.net", parts.hostname or "")),
+                "path": describe(parts.path),
+            })
+        except ValueError:
+            result["upload_url"]["parseable"] = False
+    return result
+
+
 def publication_request(kind, revision, source_location):
     require(kind in {"backend", "frontend"} and re.fullmatch(r"[0-9a-f]{40}", revision), "Exact publication component/source required")
-    require(isinstance(source_location, str) and re.fullmatch(r"source/[A-Za-z0-9/_-]+\.tar\.gz", source_location) and ".." not in source_location, "Invalid registry build-source relative path")
+    publication_source_path(source_location)
     return {
         "type": "DockerBuildRequest", "imageNames": [f"docintel/{kind}:{revision}"],
         "isPushEnabled": True, "isArchiveEnabled": False,
@@ -953,13 +989,18 @@ def archive_publication_context(work, kind, destination):
 
 
 def upload_publication_context(upload, archive, timeout):
-    require(isinstance(upload, dict), "Registry did not return a build-source upload location")
-    source = upload.get("relativePath")
-    publication_request("backend", "0" * 40, source)
-    url = upload.get("uploadUrl")
-    require(isinstance(url, str) and not any(ord(char) < 32 for char in url), "Invalid registry upload URL")
-    parts = urlsplit(url)
-    require(parts.scheme == "https" and parts.hostname is not None and re.fullmatch(r"[a-z0-9]+\.blob\.core\.windows\.net", parts.hostname) and parts.port in (None, 443) and not parts.username and not parts.password and not parts.fragment and parts.query and parts.path.endswith("/" + source), "Invalid registry upload destination")
+    try:
+        require(isinstance(upload, dict), "Invalid registry upload response")
+        source, url = upload.get("relativePath"), upload.get("uploadUrl")
+        source_segments = publication_source_path(source)
+        require(isinstance(url, str) and len(url.encode("utf-8")) <= 16384 and not any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url), "Invalid registry upload URL")
+        parts = urlsplit(url)
+        require(parts.scheme == "https" and parts.hostname is not None and re.fullmatch(r"[a-z0-9]+\.blob\.core\.windows\.net", parts.hostname) and parts.port in (None, 443) and not parts.username and not parts.password and not parts.fragment and parts.path.startswith("/"), "Invalid registry upload destination")
+        blob_segments = publication_source_path(parts.path[1:])
+        signatures = parse_qs(parts.query, keep_blank_values=True, max_num_fields=32).get("sig", [])
+        require(len(signatures) == 1 and bool(signatures[0]) and len(blob_segments) >= 2 and blob_segments[-len(source_segments):] == source_segments, "Invalid registry upload destination binding")
+    except (ValueError, TypeError):
+        raise ValueError("Invalid registry upload destination or relative path; safe metadata: " + json.dumps(publication_upload_metadata(upload), sort_keys=True)) from None
     # The SAS travels only over stdin, never argv, receipts, or diagnostic output.
     try:
         result = subprocess.run([
@@ -1002,6 +1043,7 @@ def build_publication(config, work, kind, revision, *, replacement=None):
         tool_revision = command(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()
         require(re.fullmatch(r"[0-9a-f]{40}", tool_revision), "Publication helper revision is invalid")
         upload = rest("POST", "/listBuildSourceUploadUrl")
+        save_once(work / (stem + "-upload-metadata.json"), publication_upload_metadata(upload))
         if expires is not None:
             require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no next upload/queue action")
         source = upload_publication_context(upload, archive, remaining(120))
