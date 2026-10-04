@@ -29,7 +29,13 @@ def no_network(monkeypatch):
 
 @pytest.fixture
 def configured(tmp_path, monkeypatch):
-    store = SQLiteStore(tmp_path / "private")
+    # Keep synthetic fixture files in the runner's selected scratch directory;
+    # production SQLiteStore placement restrictions remain unchanged.
+    store = SQLiteStore.__new__(SQLiteStore)
+    store.path = tmp_path / "batches.sqlite3"
+    with store.connect() as connection:
+        connection.execute("CREATE TABLE records (key TEXT PRIMARY KEY, value BLOB NOT NULL, version TEXT NOT NULL)")
+    store.path.chmod(0o600)
     product = ProductKey(item_id="001", vendor="Synthetic", mpn="PART-001", hierarchy_node="Valves")
     names = ["Body Material", "Outlet", "Unsupported"]
     pdf = b"%PDF-1.7 synthetic\n%%EOF"
@@ -91,6 +97,37 @@ def configured(tmp_path, monkeypatch):
     write_json(store, f"batches/{record['id']}.json", record)
     store.write_bytes("documents/synthetic.pdf", pdf)
     return store, record, approval
+
+
+def internal_only(configured, monkeypatch):
+    from backend.real_pilot import EXTERNAL_ENVIRONMENT_KEYS, EXTERNAL_OPERATIONS, INTERNAL_PRICE_KEYS
+    from backend.core.config import settings
+
+    store, _, approval = configured
+    approval["execution_scope"] = "internal_only"
+    approval["customer_processing_approved"] = True
+    for operation in EXTERNAL_OPERATIONS:
+        approval["limits"][operation] = 0
+    approval["environment"] = {
+        name: value for name, value in approval["environment"].items()
+        if name not in EXTERNAL_ENVIRONMENT_KEYS
+    }
+    approval["unit_prices_usd"] = {
+        name: value for name, value in approval["unit_prices_usd"].items()
+        if name in INTERNAL_PRICE_KEYS
+    }
+    _, version = read_json(store, "configuration/real-pilot-approval.json")
+    write_json(store, "configuration/real-pilot-approval.json", approval, version)
+    monkeypatch.setenv("DOCINTEL_REAL_PILOT_EXECUTION_SCOPE", "internal_only")
+    monkeypatch.delenv("WEBIQ_API_KEY", raising=False)
+    monkeypatch.delenv("WEBIQ_ENDPOINT", raising=False)
+    monkeypatch.setattr(settings, "WEBIQ_API_KEY", None)
+    monkeypatch.setattr(settings, "WEBIQ_ENDPOINT", None)
+    external = Mock(side_effect=AssertionError("Internal-only mode must never construct or call external providers"))
+    monkeypatch.setattr("backend.core.websearch_webiq.WebIQSearchClient", external)
+    monkeypatch.setattr("backend.core.websearch.fetch_original_page", external)
+    monkeypatch.setattr("backend.core.pilot_sources.retrieve_document", external)
+    return external
 
 
 def install_services(monkeypatch):
@@ -188,18 +225,24 @@ def test_real_worker_merges_internal_and_web_with_durable_no_repeat(configured, 
     assert export["Evidence"][0]["Source tier"] == "internal_pdf"
 
 
-def test_real_worker_default_off_never_calls_service(configured, monkeypatch):
+@pytest.mark.parametrize("execution_scope", ["full", "internal_only"])
+def test_real_worker_default_off_never_calls_service(configured, monkeypatch, execution_scope):
     store, record, _ = configured
     install_services(monkeypatch)
+    if execution_scope == "internal_only":
+        internal_only(configured, monkeypatch)
     monkeypatch.delenv("DOCINTEL_REAL_PILOT_ENABLED")
     with pytest.raises(ValueError):
         run_batch(store, record["id"], concurrency=1, item_limit=1)
     assert not store.keys("items/")
 
 
-def test_real_worker_budget_failure_stops_before_later_paid_work(configured, monkeypatch):
+@pytest.mark.parametrize("execution_scope", ["full", "internal_only"])
+def test_real_worker_budget_failure_stops_before_later_paid_work(configured, monkeypatch, execution_scope):
     store, record, approval = configured
     analyses, queries, _, calls = install_services(monkeypatch)
+    if execution_scope == "internal_only":
+        internal_only(configured, monkeypatch)
     approval["limits"]["analysis"] = 0
     _, version = read_json(store, "configuration/real-pilot-approval.json")
     write_json(store, "configuration/real-pilot-approval.json", approval, version)
@@ -265,7 +308,9 @@ def test_new_optional_contract_fields_do_not_change_legacy_machine_hash(configur
     assert BatchService(store).detail(record["id"], "row-2", record["owner"])["machine_sha256"] == digest(legacy_json.encode())
 
 
-def test_vendor_rows_supplement_pdf_before_web_without_variant_leakage(configured, monkeypatch):
+@pytest.mark.parametrize("execution_scope", ["full", "internal_only"])
+@pytest.mark.parametrize("pdf_identity_matches", [True, False])
+def test_vendor_rows_supplement_pdf_before_web_without_variant_leakage(configured, monkeypatch, execution_scope, pdf_identity_matches):
     store, record, approval = configured
     from backend.workbooks import write_workbook
     table = write_workbook({"Catalog": [
@@ -295,6 +340,19 @@ def test_vendor_rows_supplement_pdf_before_web_without_variant_leakage(configure
     _, queries, _, calls = install_services(monkeypatch)
     import backend.batch_worker as worker
     original_llm = worker.LLMClient
+    if not pdf_identity_matches:
+        class UnmatchedDrawing:
+            def __init__(self, **kwargs):
+                pass
+
+            def extract_pdf_bytes(self, content, *, source, page_limit):
+                return ParsedDocument(
+                    source=source, cache_key="sha256:" + hashlib.sha256(content).hexdigest(),
+                    parsed_at=datetime.now(timezone.utc), raw_text="Drawing without approved identity",
+                    paragraphs=[ParsedParagraph(text="Unidentified product diagram", page_number=1)],
+                )
+
+        monkeypatch.setattr(worker, "DocumentIntelligenceService", UnmatchedDrawing)
 
     class TableLLM(original_llm):
         def complete_structured(self, system, user, schema, **kwargs):
@@ -310,13 +368,134 @@ def test_vendor_rows_supplement_pdf_before_web_without_variant_leakage(configure
             return super().complete_structured(system, user, schema, **kwargs)
 
     monkeypatch.setattr(worker, "LLMClient", TableLLM)
+    external = internal_only(configured, monkeypatch) if execution_scope == "internal_only" else None
     run_batch(store, record["id"], concurrency=1, item_limit=1)
     detail = BatchService(store).detail(record["id"], "row-2", record["owner"])
     assert detail["machine_result"]["attributes"][-1]["status"] == "proposed"
     evidence = next(entry for entry in detail["machine_result"]["evidence"] if entry["source_tier"] == "vendor_table")
     assert "sheet=Catalog&row=3&cells=A3,B3" in evidence["source_locator"]
-    assert "Inlet" not in queries[0]
-    assert detail["coverage"]["internally_supported"] == ["Body Material", "Inlet"]
+    if external is None:
+        assert "Inlet" not in queries[0]
+    else:
+        external.assert_not_called()
+        assert not queries and len(calls) == (2 if pdf_identity_matches else 1)
+        assert detail["consumption"]["execution_scope"] == "internal_only"
+        assert detail["coverage"]["externally_supported"] == []
+        assert detail["coverage"]["webiq_discovered_support"] == []
+        assert detail["machine_result"]["attributes"][1]["status"] == ("missing_evidence" if pdf_identity_matches else "retrieval_failed")
+        from backend.workbooks import read_workbook
+        exported = read_workbook(BatchService(store).export(record["id"], record["owner"]))
+        assert "internal_only" in exported["Provenance"][0]["Source provenance"]
+        assert "internal_only" in exported["Provenance"][0]["Consumption reservations and usage"]
+        assert {entry["Source tier"] for entry in exported["Evidence"]} == ({"internal_pdf", "vendor_table"} if pdf_identity_matches else {"vendor_table"})
+    assert detail["coverage"]["internally_supported"] == (["Body Material", "Inlet"] if pdf_identity_matches else ["Inlet"])
+    if not pdf_identity_matches:
+        assert detail["machine_result"]["attributes"][0]["status"] == "retrieval_failed"
+
+
+def test_internal_only_skips_enabled_sharepoint_and_web_metadata_without_reservations(configured, monkeypatch):
+    store, record, approval = configured
+    analyses, queries, pages, calls = install_services(monkeypatch)
+    item = record["items"][0]
+    remote = {
+        **item["sources"][0], "source_id": "remote", "reference": "https://tenant.sharepoint.com/file.pdf",
+        "kind": "sharepoint", "url": "https://tenant.sharepoint.com/file.pdf",
+        "enabled": True, "drive_id": "approved-drive", "item_id": "approved-item",
+        "tenant_id": "11111111-1111-4111-8111-111111111111",
+    }
+    remote.pop("blob")
+    item["sources"].append(remote)
+    item["manifest"]["source_ids"].append("remote")
+    approval["batch_sha256"] = binding_digest(record)
+    _, version = read_json(store, f"batches/{record['id']}.json")
+    write_json(store, f"batches/{record['id']}.json", record, version)
+    external = internal_only(configured, monkeypatch)
+    run_batch(store, record["id"], concurrency=1, item_limit=1)
+    external.assert_not_called()
+    assert len(analyses) == len(calls) == 1
+    assert not queries and not pages
+    detail = BatchService(store).detail(record["id"], item["item_key"], record["owner"])
+    assert detail["state"] == "unresolved"
+    assert [entry["status"] for entry in detail["machine_result"]["attributes"]] == ["proposed", "missing_evidence", "missing_evidence"]
+    skipped = {entry["source_id"]: entry for entry in detail["provenance"] if entry.get("skip_reason")}
+    assert set(skipped) == {"web", "remote"}
+    assert all(entry["retrieval"] == "not_attempted" for entry in skipped.values())
+    assert all(detail["consumption"]["attempted"][name] == 0 for name in ("search", "web_retrieval", "retrieval"))
+    assert detail["machine_result"]["manifest"]["source_ids"] == item["manifest"]["source_ids"]
+
+
+def test_internal_only_defensive_provider_entry_points_fail_before_clients(configured, monkeypatch):
+    from backend.extract import ExecutionConfigurationError
+    store, record, _ = configured
+    install_services(monkeypatch)
+    external = internal_only(configured, monkeypatch)
+    guard = RealPilotGuard(store, record)
+    guard.before_execution("explicit-internal")
+    processor = RealBatchProcessor(store, record, guard)
+    item = record["items"][0]
+    binding = item["sources"][1]
+    with pytest.raises(ExecutionConfigurationError, match="excluded"):
+        processor.web_sources(binding, item, {}, [], {})
+    with pytest.raises(ExecutionConfigurationError, match="copies only"):
+        processor.document_bytes(binding, item, {})
+    external.assert_not_called()
+    assert sum(guard.metadata()["attempted"].values()) == 0
+
+
+@pytest.mark.parametrize("deployment", ["gpt-5", "gpt-5.1", "gpt-5-chat", "synthetic"])
+def test_real_pilot_gpt5_minimal_effort_keeps_cap_and_other_model_defaults(configured, monkeypatch, deployment):
+    from backend.core.config import settings
+
+    store, record, approval = configured
+    _, _, _, calls = install_services(monkeypatch)
+    monkeypatch.setattr(settings, "LLM_DEPLOYMENT", deployment)
+    approval["environment"]["LLM_DEPLOYMENT"] = deployment
+    external = internal_only(configured, monkeypatch)
+    run_batch(store, record["id"], concurrency=1, item_limit=1)
+    external.assert_not_called()
+    assert len(calls) == 1
+    expected = {"max_retries": 1, "max_completion_tokens": 2048}
+    if deployment == "gpt-5":
+        expected["reasoning_effort"] = "minimal"
+    assert calls[0][1] == expected
+    detail = BatchService(store).detail(record["id"], "row-2", record["owner"])
+    recorded = detail["inference_provenance"][0]["request_parameters"]
+    assert recorded == {name: value for name, value in expected.items() if name != "max_retries"}
+    assert detail["consumption"]["reserved"]["output_tokens"] == 2048
+
+
+@pytest.mark.parametrize("deployment", ["gpt-5", "synthetic"])
+def test_gpt5_request_parameters_are_bound_to_cache_identity(configured, monkeypatch, deployment):
+    from backend.batch import digest
+    from backend.core.config import settings
+
+    store, record, approval = configured
+    _, _, _, calls = install_services(monkeypatch)
+    monkeypatch.setattr(settings, "LLM_DEPLOYMENT", deployment)
+    approval["environment"]["LLM_DEPLOYMENT"] = deployment
+    internal_only(configured, monkeypatch)
+    guard = RealPilotGuard(store, record)
+    guard.before_execution("cache-identity-test")
+    processor = RealBatchProcessor(store, record, guard)
+    item = record["items"][0]
+    system, user = "synthetic", '{"attributes":[],"evidence":[]}'
+    old_version = digest((system + user + ExtractionResponse.model_json_schema().__repr__()).encode())
+    old_key = "real-inferences/" + processor.key(item, "inference", old_version) + ".json"
+    write_json(store, old_key, {"response": {"candidates": []}})
+    completion = processor.completion(item)
+    completion.complete_structured(system, user, ExtractionResponse)
+    completion.complete_structured(system, user, ExtractionResponse)
+    assert len(calls) == (1 if deployment == "gpt-5" else 0)
+    assert processor.inference_provenance[-1]["method"] == "compatible_response_cache"
+    cached = [path for path in store.keys("real-inferences/") if path != old_key]
+    if deployment == "gpt-5":
+        assert len(cached) == 1
+        assert read_json(store, cached[0])[0]["request_parameters"] == {
+            "max_completion_tokens": 2048, "reasoning_effort": "minimal",
+        }
+        assert guard.metadata()["attempted"]["inference"] == 1
+    else:
+        assert not cached and guard.metadata()["attempted"]["inference"] == 0
 
 
 def test_webiq_contribution_requires_independent_original_evidence(configured, monkeypatch):

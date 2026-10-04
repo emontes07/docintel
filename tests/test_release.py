@@ -716,17 +716,73 @@ def enable_test_pilot(state):
     release.pilot_enable(state.config, state.approval, state.work)
 
 
+def internal_release_approval(state):
+    state.approval["execution_scope"] = "internal_only"
+    state.approval["customer_processing_approved"] = True
+    for name in ("search", "web_retrieval", "retrieval"):
+        state.approval["limits"][name] = 0
+    state.approval["environment"] = {
+        name: value for name, value in state.approval["environment"].items()
+        if name not in release.PILOT_EXTERNAL_ENVIRONMENT_KEYS
+    }
+    state.approval["unit_prices_usd"] = {
+        name: value for name, value in state.approval["unit_prices_usd"].items()
+        if name in {"analysis_page", "input_token", "output_token"}
+    }
+    release.save(state.approval_path, state.approval)
+
+
 def test_pilot_approval_matches_guard_schema_and_denies_unknown_secrets(pilot_release):
-    from backend.real_pilot import HARD_LIMITS, ENVIRONMENT_KEYS
+    from backend.real_pilot import HARD_LIMITS, ENVIRONMENT_KEYS, EXTERNAL_ENVIRONMENT_KEYS
     state = pilot_release
     assert release.PILOT_LIMITS == HARD_LIMITS
     assert release.PILOT_ENVIRONMENT_KEYS == ENVIRONMENT_KEYS
+    assert release.PILOT_EXTERNAL_ENVIRONMENT_KEYS == EXTERNAL_ENVIRONMENT_KEYS
     assert release.load_pilot_approval(state.approval_path, state.approval["batch_id"]) == state.approval
     state.approval["environment"]["WEBIQ_API_KEY"] = "never-allowed"
     release.save(state.approval_path, state.approval)
     with pytest.raises(ValueError, match="Unsupported"):
         release.load_pilot_approval(state.approval_path, state.approval["batch_id"])
     assert not state.calls
+
+
+def test_pilot_internal_only_approval_requires_no_web_prices_or_environment(pilot_release):
+    state = pilot_release
+    internal_release_approval(state)
+    assert release.load_pilot_approval(state.approval_path, state.approval["batch_id"]) == state.approval
+    assert state.approval["customer_processing_approved"] is True
+    assert set(state.approval["unit_prices_usd"]) == {"analysis_page", "input_token", "output_token"}
+    assert not set(state.approval["environment"]) & release.PILOT_EXTERNAL_ENVIRONMENT_KEYS
+
+
+@pytest.mark.parametrize("defect", ["search", "web_retrieval", "retrieval", "scope", "environment", "price"])
+def test_pilot_internal_only_packet_rejects_external_authority(pilot_release, defect):
+    state = pilot_release
+    internal_release_approval(state)
+    if defect in ("search", "web_retrieval", "retrieval"):
+        state.approval["limits"][defect] = 1
+    elif defect == "scope":
+        state.approval["execution_scope"] = "internal"
+    elif defect == "environment":
+        state.approval["environment"]["WEBIQ_ENDPOINT"] = "https://unverified.invalid"
+    else:
+        del state.approval["unit_prices_usd"]["analysis_page"]
+    release.save(state.approval_path, state.approval)
+    with pytest.raises(ValueError):
+        release.load_pilot_approval(state.approval_path, state.approval["batch_id"])
+    assert not state.calls
+
+
+@pytest.mark.parametrize("scope", ["full", "internal_only"])
+def test_pilot_packet_requires_customer_consent_in_every_scope(pilot_release, scope):
+    state = pilot_release
+    if scope == "internal_only":
+        internal_release_approval(state)
+    state.approval["customer_processing_approved"] = False
+    release.save(state.approval_path, state.approval)
+    with pytest.raises(ValueError, match="customer processing"):
+        release.load_pilot_approval(state.approval_path, state.approval["batch_id"])
+    assert not state.calls and not state.console_calls
 
 
 @pytest.mark.parametrize("defect", ["draft", "batch", "expired", "limits", "price", "permissions"])
@@ -919,8 +975,16 @@ def test_pilot_remote_preflight_executes_without_writes(pilot_release, monkeypat
         assert marker in capsys.readouterr().out
 
 
-def test_pilot_start_has_exact_cli_settings_and_bounded_immutable_attempts(pilot_release):
+@pytest.mark.parametrize("execution_scope", ["full", "internal_only"])
+def test_pilot_start_has_exact_cli_settings_and_bounded_immutable_attempts(pilot_release, execution_scope):
     state = pilot_release
+    if execution_scope == "internal_only":
+        internal_release_approval(state)
+        release.merge_environment(state.job["properties"]["template"]["containers"][0], {
+            "WEBIQ_ENDPOINT": "https://unverified.invalid", "WEBSEARCH_PROVIDER": "unverified",
+            "AZURE_SEARCH_ENDPOINT": "https://unverified.invalid",
+            "DOCINTEL_REAL_PILOT_EXECUTION_SCOPE": "full",
+        })
     enable_test_pilot(state)
     baseline = copy.deepcopy(state.job)
     for number in (1, 2):
@@ -933,7 +997,11 @@ def test_pilot_start_has_exact_cli_settings_and_bounded_immutable_attempts(pilot
         for name, value in {**state.approval["environment"], **release.pilot_values(state.approval)}.items():
             assert environment[name] == {"name": name, "value": value}
         assert environment["DOCINTEL_BATCH_LIVE_ENABLED"]["value"] == "false"
-        assert environment["WEBIQ_API_KEY"]["secretRef"] == "existing-web-key"
+        assert environment["DOCINTEL_REAL_PILOT_EXECUTION_SCOPE"]["value"] == execution_scope
+        if execution_scope == "full":
+            assert environment["WEBIQ_API_KEY"]["secretRef"] == "existing-web-key"
+        else:
+            assert not set(environment) & (release.PILOT_EXTERNAL_ENVIRONMENT_KEYS | {"WEBIQ_API_KEY"})
         attempt = release.private_json(state.work / f"pilot-execution-attempt-{number}.json")
         assert attempt["attempt"] == number
         assert attempt["execution_sha256"] == release.fingerprint(template)
@@ -942,6 +1010,15 @@ def test_pilot_start_has_exact_cli_settings_and_bounded_immutable_attempts(pilot
     with pytest.raises(ValueError, match="allowance exhausted"):
         release.pilot_start(state.config, state.approval, state.work, 2)
     assert len([call for call in state.calls if call[:3] == ("containerapp", "job", "start")]) == 2
+
+
+def test_release_scope_change_cannot_reset_bound_approval(pilot_release):
+    state = pilot_release
+    enable_test_pilot(state)
+    internal_release_approval(state)
+    with pytest.raises(ValueError, match="cannot reset"):
+        release.pilot_start(state.config, state.approval, state.work, 1)
+    assert not any(call[:3] == ("containerapp", "job", "start") for call in state.calls)
 
 
 @pytest.mark.parametrize("limit", [0, 5, True])
@@ -1269,10 +1346,13 @@ def test_pilot_configure_registry_drift_fails_before_any_metadata_write(upload_r
 
 
 @pytest.mark.parametrize("batch_exists", [True, False])
-def test_pilot_configure_final_metadata_validates_intake_before_append(pilot_release, monkeypatch, capsys, batch_exists):
+@pytest.mark.parametrize("execution_scope", ["full", "internal_only"])
+def test_pilot_configure_final_metadata_validates_intake_before_append(pilot_release, monkeypatch, capsys, batch_exists, execution_scope):
     from backend.batch_store import Missing
     from backend.real_pilot import binding_digest
     state = pilot_release
+    if execution_scope == "internal_only":
+        internal_release_approval(state)
     batch = {
         "id": state.approval["batch_id"], "owner": state.approval["owner"],
         "valid": True, "product_count": 1, "attribute_reference": "synthetic.xlsx",

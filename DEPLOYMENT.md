@@ -408,6 +408,69 @@ ten total reserved pages; inference sixteen, searches eight, original-page
 retrievals twelve and internal retrievals four, within approved token/spend bounds.
 Actual usage is separate from conservative reservations and is never billing data.
 
+#### Explicit Internal-Only Approval Scope
+
+An independently approved internal-only fallback uses the same `real_pilot` batch
+mode and CLI, with **`execution_scope: "internal_only"` in the immutable approval**.
+Omitting this optional field retains the existing `"full"` behavior; it never
+selects fallback automatically based on a failed web request or missing credential.
+Any focused WebIQ entitlement check is a separate operator decision, not something
+the worker runs to choose its scope.
+
+For internal-only approval:
+
+* Set `limits.search`, `limits.web_retrieval` and `limits.retrieval` to **zero**.
+  The last field governs remote Graph/SharePoint retrieval; this fallback uses
+  only approved, hash-checked Blob PDF/XLSX copies.
+* `unit_prices_usd` contains exactly `analysis_page`, `input_token` and
+  `output_token`, with the same required positive conservative decimal-string
+  rates. No web/search price or WebIQ entitlement is required.
+* Omit `WEBSEARCH_PROVIDER`, `WEBIQ_ENDPOINT`, `AI_FOUNDRY_PROJECT_ENDPOINT`,
+  `BING_CONNECTION_ID`, `AZURE_SEARCH_ENDPOINT` and `AZURE_SEARCH_INDEX_NAME`
+  from the approved environment. Do not include credentials.
+  `customer_processing_approved` **must remain `true` in every scope**, including
+  internal-only: approved customer-data handling and DI/model prerequisites are
+  never bypassed. This common consent flag does **not** assert WebIQ entitlement
+  or authorize external calls when the scope/budgets prohibit them.
+* Retain the same DI/LLM endpoints/deployment/API-version, operator/owner/source
+  hashes, identity, expiry, page/token/spend and execution-budget guards.
+
+`pilot-start` sets `DOCINTEL_REAL_PILOT_EXECUTION_SCOPE` in the execution override
+and removes inherited web-service settings and the WebIQ key/reference from that
+override only. It does not modify the persistent job template or API settings.
+The server approval remains authoritative; a supplied runtime scope that disagrees
+with it is rejected.
+
+The worker skips all web and remote SharePoint bindings without constructing WebIQ,
+searching, fetching original pages or reserving prohibited calls. Website references
+remain bound input metadata, never evidence. PDF/vendor-row citations and unresolved
+attributes are retained truthfully; skipped-source provenance and consumption
+metadata include the scope and flow into the existing export's Provenance sheet.
+No frontend/API mode widening or new synthetic execution is involved.
+
+The entire scope-bearing approval remains hash-bound to the existing singleton
+ledger and local release binding. Changing scope, ID or batch after binding cannot
+reset allowance or automatically convert an already-used full approval. An existing
+incompatible approval/configuration is a stop condition, not permission to overwrite
+it or create a new work directory.
+
+For the real-pilot deployment named exactly `gpt-5` (whose original
+`2025-08-07` snapshot the operator must verify), the worker explicitly requests
+`reasoning_effort="minimal"` without increasing `max_completion_tokens=2048`.
+[Microsoft's reasoning-model documentation](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning)
+and the [original GPT-5 model reference](https://developers.openai.com/api/docs/models/gpt-5)
+confirm this support. The explicit request parameters are recorded in inference
+provenance/cache records and affect that deployment's cache identity. Generic
+clients, synthetic processing and other deployment defaults remain unchanged.
+The cap still includes reasoning and visible output, so minimal effort is not a
+guarantee of a usable response; an empty/invalid response remains a counted,
+non-retried failed attempt.
+
+The existing PDF request still selects `pages="1-5"` with a 120-second polling
+bound. Offline SDK tests verify those arguments, not server handling when a PDF
+has fewer pages. No undocumented out-of-range acceptance is assumed and no
+automatic alternate-page retry is authorized.
+
 After explicit completion/stop, restore only the three API settings, even if the
 approval has expired:
 

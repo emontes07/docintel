@@ -4,10 +4,15 @@ The private ``configuration/real-pilot-approval.json`` record has exactly these
 fields (no credentials, prices guessed by code, or client-supplied approvals):
 
 * schema_version: 1; approved: true; id: canonical UUID
+* execution_scope: optional "full" (default) or "internal_only"; hash-bound with
+  the complete approval. Internal-only permits approved Blob PDF/XLSX copies,
+  requires search/web_retrieval/retrieval limits of zero, and omits web settings
+  and search/web_retrieval prices. Website references remain metadata only.
 * approved_by: operator UUID present in server DOCINTEL_REAL_PILOT_OPERATOR_IDS
 * not_before, expires_at: timezone-aware ISO timestamps, at most 1200s apart
 * batch_id, owner, batch_sha256: exact intake identity and binding_digest(record)
-* customer_processing_approved: explicit boolean; required for web operations
+* customer_processing_approved: must be true in every scope; authorizes only the
+  approved customer-data handling/services, not WebIQ entitlement
 * identities: api_principal_id and worker_principal_id (canonical UUIDs; they may
   differ). At execution, DOCINTEL_REAL_PILOT_WORKER_PRINCIPAL_ID must match the
   worker principal independently provisioned by the deployment administrator.
@@ -72,6 +77,12 @@ HARD_LIMITS = {
 }
 OPERATIONS = ("analysis", "inference", "search", "web_retrieval", "retrieval")
 PRICE_KEYS = {"analysis_page", "input_token", "output_token", "search", "web_retrieval"}
+EXTERNAL_OPERATIONS = {"search", "web_retrieval", "retrieval"}
+INTERNAL_PRICE_KEYS = PRICE_KEYS - {"search", "web_retrieval"}
+EXTERNAL_ENVIRONMENT_KEYS = {
+    "WEBSEARCH_PROVIDER", "WEBIQ_ENDPOINT", "AI_FOUNDRY_PROJECT_ENDPOINT",
+    "BING_CONNECTION_ID", "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_INDEX_NAME",
+}
 ENVIRONMENT_KEYS = {
     "AZURE_CLIENT_ID",
     "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT",
@@ -90,6 +101,13 @@ APPROVAL_FIELDS = {
     "batch_id", "owner", "batch_sha256", "customer_processing_approved",
     "identities", "environment", "limits", "unit_prices_usd",
 }
+
+
+def approval_scope(approval):
+    scope = approval.get("execution_scope", "full")
+    if scope not in ("full", "internal_only"):
+        raise ValueError("Real-pilot execution_scope must be full or internal_only")
+    return scope
 
 
 def _sha256(value):
@@ -181,6 +199,10 @@ class RealPilotGuard:
         self._approval = copy.deepcopy(approval)
         self._check_existing_binding(approval)
 
+    @property
+    def execution_scope(self):
+        return approval_scope(self._approval)
+
     def _invalidate_existing(self, reason):
         with self.store.lease(BUDGET_KEY):
             try:
@@ -205,8 +227,10 @@ class RealPilotGuard:
         return approval
 
     def _validate_approval(self, approval, *, verify_runtime):
-        if not isinstance(approval, dict) or set(approval) != APPROVAL_FIELDS:
+        if (not isinstance(approval, dict) or not APPROVAL_FIELDS <= set(approval)
+                or not set(approval) <= APPROVAL_FIELDS | {"execution_scope"}):
             raise ValueError("Real-pilot approval schema mismatch")
+        scope = approval_scope(approval)
         if type(approval["schema_version"]) is not int or approval["schema_version"] != 1 or approval["approved"] is not True:
             raise ValueError("Explicit real-pilot approval is required")
         _uuid(approval["id"], "approval ID")
@@ -217,8 +241,8 @@ class RealPilotGuard:
         start, end = _timestamp(approval["not_before"]), _timestamp(approval["expires_at"])
         if not 0 < (end - start).total_seconds() <= 1200 or not start <= _now() < end:
             raise ValueError("Real-pilot approval is not active or exceeds 1200 seconds")
-        if type(approval["customer_processing_approved"]) is not bool:
-            raise ValueError("Explicit customer processing authorization is required")
+        if approval["customer_processing_approved"] is not True:
+            raise ValueError("Explicit customer processing approval is required in every scope")
         limits = approval["limits"]
         if not isinstance(limits, dict) or set(limits) != set(HARD_LIMITS) | {"spend_microdollars"}:
             raise ValueError("Real-pilot limits schema mismatch")
@@ -226,8 +250,11 @@ class RealPilotGuard:
             _integer(limits[name], name, maximum=ceiling)
         for name in ("products", "executions", "spend_microdollars"):
             _integer(limits[name], name, minimum=1)
+        if scope == "internal_only" and any(limits[name] != 0 for name in EXTERNAL_OPERATIONS):
+            raise ValueError("Internal-only approval requires zero search, web_retrieval and retrieval budgets")
         prices = approval["unit_prices_usd"]
-        if not isinstance(prices, dict) or set(prices) != PRICE_KEYS:
+        required_prices = INTERNAL_PRICE_KEYS if scope == "internal_only" else PRICE_KEYS
+        if not isinstance(prices, dict) or set(prices) != required_prices:
             raise ValueError("All conservative upper-bound unit prices are required")
         for price in prices.values():
             _price(price)
@@ -280,6 +307,11 @@ class RealPilotGuard:
         expected = approval["environment"]
         if not isinstance(expected, dict) or not set(expected) <= ENVIRONMENT_KEYS:
             raise ValueError("Real-pilot environment contains unsupported settings")
+        scope = approval_scope(approval)
+        if scope == "internal_only" and set(expected) & EXTERNAL_ENVIRONMENT_KEYS:
+            raise ValueError("Internal-only approval must omit external service environment settings")
+        if verify_runtime and os.environ.get("DOCINTEL_REAL_PILOT_EXECUTION_SCOPE", scope) != scope:
+            raise ValueError("Real-pilot runtime execution scope mismatch")
         required = {"AZURE_CLIENT_ID"}
         limits = approval["limits"]
         if limits["analysis"]:
@@ -347,6 +379,7 @@ class RealPilotGuard:
         if ledger is None:
             ledger = {
                 "schema_version": 1, "approval_id": self.approval_id,
+                "execution_scope": self.execution_scope,
                 "approval_sha256": self.approval_sha256,
                 "approved_by": approval["approved_by"], "batch_id": self.batch["id"],
                 "identities": copy.deepcopy(approval["identities"]),
@@ -430,12 +463,12 @@ class RealPilotGuard:
         key = _sha256({"operation": operation, "operation_key": operation_key})
         with self._mutex, self.store.lease(BUDGET_KEY):
             approval, ledger, version = self._fresh_ledger()
+            if approval_scope(approval) == "internal_only" and operation in EXTERNAL_OPERATIONS:
+                raise ValueError("External operations are forbidden by internal-only approval")
             if self._execution_id not in ledger["executions"]:
                 raise Conflict("Real-pilot worker execution is not reserved")
             if key in ledger["reservations"]:
                 raise Conflict("Real-pilot operation already attempted; no automatic retry")
-            if operation in ("search", "web_retrieval") and not approval["customer_processing_approved"]:
-                raise ValueError("Web operations require separate customer processing approval")
             limits = approval["limits"]
             if ledger["attempted"][operation] >= limits[operation]:
                 raise ValueError("Real-pilot operation budget exhausted")
@@ -505,6 +538,7 @@ class RealPilotGuard:
             "actual_billed_microdollars", "cost_basis",
         )}
         output["execution_count"] = len(ledger["executions"])
+        output["execution_scope"] = ledger.get("execution_scope", "full")
         output["unknown_usage_reservations"] = sum(
             reservation["actual_usage"] is None for reservation in ledger["reservations"].values()
         )

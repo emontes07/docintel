@@ -26,6 +26,7 @@ PILOT_API_SETTINGS = {"DOCINTEL_REAL_PILOT_ENABLED", "DOCINTEL_REAL_PILOT_OPERAT
 PILOT_UPLOAD_SETTINGS = {"DOCINTEL_PILOT_UPLOAD_ENABLED", "DOCINTEL_REAL_PILOT_OPERATOR_IDS"}
 PILOT_CONFIGURATION_KEYS = {"upload": "configuration/pilot-source-upload.json", "real": "configuration/real-pilot-approval.json"}
 PILOT_ENVIRONMENT_KEYS = {"AZURE_CLIENT_ID", "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "LLM_ENDPOINT", "LLM_DEPLOYMENT", "AOAI_API_VERSION", "WEBSEARCH_PROVIDER", "WEBIQ_ENDPOINT", "AI_FOUNDRY_PROJECT_ENDPOINT", "BING_CONNECTION_ID", "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_INDEX_NAME"}
+PILOT_EXTERNAL_ENVIRONMENT_KEYS = {"WEBSEARCH_PROVIDER", "WEBIQ_ENDPOINT", "AI_FOUNDRY_PROJECT_ENDPOINT", "BING_CONNECTION_ID", "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_INDEX_NAME"}
 PILOT_LIMITS = {"products": 4, "executions": 2, "analysis": 2, "inference": 16, "search": 8, "web_retrieval": 12, "retrieval": 4, "analysis_pages": 10, "input_tokens": 200000, "output_tokens": 32768}
 
 
@@ -136,7 +137,9 @@ def pilot_window(approval):
 def load_pilot_approval(path, batch_id):
     approval = private_json(path, max_bytes=65536)
     fields = {"schema_version", "approved", "id", "approved_by", "not_before", "expires_at", "batch_id", "owner", "batch_sha256", "customer_processing_approved", "identities", "environment", "limits", "unit_prices_usd"}
-    require(isinstance(approval, dict) and set(approval) == fields, "Pilot approval schema mismatch")
+    require(isinstance(approval, dict) and fields <= set(approval) <= fields | {"execution_scope"}, "Pilot approval schema mismatch")
+    scope = approval.get("execution_scope", "full")
+    require(scope in ("full", "internal_only"), "Pilot execution_scope must be full or internal_only")
     require(type(approval["schema_version"]) is int and approval["schema_version"] == 1 and approval["approved"] is True, "An explicitly approved real-pilot packet is required")
     require(re.fullmatch(r"[a-f0-9]{64}", batch_id or "") and approval["batch_id"] == batch_id, "Exact approved batch ID required")
     require(isinstance(approval["owner"], str) and approval["owner"] and re.fullmatch(r"[a-f0-9]{64}", approval["batch_sha256"]), "Pilot owner and input binding required")
@@ -144,19 +147,26 @@ def load_pilot_approval(path, batch_id):
     for value in (approval["id"], approval["approved_by"], *approval["identities"].values()):
         require(isinstance(value, str) and str(uuid.UUID(value)) == value, "Canonical approval/operator/principal UUID required")
     pilot_window(approval)
-    require(type(approval["customer_processing_approved"]) is bool, "Explicit customer processing decision required")
+    require(approval["customer_processing_approved"] is True, "Explicit customer processing approval is required in every scope")
     require(set(approval["limits"]) == set(PILOT_LIMITS) | {"spend_microdollars"}, "Pilot limit schema mismatch")
     for name, maximum in PILOT_LIMITS.items():
         value = approval["limits"][name]
         require(type(value) is int and 0 <= value <= maximum, "Pilot limit exceeds its finite ceiling")
     for name in ("products", "executions", "spend_microdollars"):
         require(type(approval["limits"][name]) is int and approval["limits"][name] > 0, "Positive explicit pilot allowance required")
+    if scope == "internal_only":
+        require(all(approval["limits"][name] == 0 for name in ("search", "web_retrieval", "retrieval")), "Internal-only approval requires zero external operation budgets")
     prices = approval["unit_prices_usd"]
-    require(set(prices) == {"analysis_page", "input_token", "output_token", "search", "web_retrieval"}, "Complete per-unit upper-bound prices required")
+    price_keys = {"analysis_page", "input_token", "output_token"}
+    if scope == "full":
+        price_keys.update(("search", "web_retrieval"))
+    require(set(prices) == price_keys, "Complete per-unit upper-bound prices required")
     for value in prices.values():
         require(isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]{0,8})(?:\.[0-9]{1,18})?", value) and Decimal(value) > 0, "Positive explicit decimal-string unit prices required")
     environment = approval["environment"]
     require(set(environment) <= PILOT_ENVIRONMENT_KEYS and "AZURE_CLIENT_ID" in environment, "Unsupported or missing worker environment binding")
+    if scope == "internal_only":
+        require(not set(environment) & PILOT_EXTERNAL_ENVIRONMENT_KEYS, "Internal-only approval must omit external service environment settings")
     require(all(isinstance(value, str) for value in environment.values()), "Worker settings must be strings, never credential objects")
     if environment["AZURE_CLIENT_ID"]:
         require(str(uuid.UUID(environment["AZURE_CLIENT_ID"])) == environment["AZURE_CLIENT_ID"], "Canonical managed identity client ID required")
@@ -547,7 +557,14 @@ def pilot_start(config, approval, work, item_limit):
         container = template["containers"][0]
         container["command"] = ["/app/.venv/bin/python"]
         container["args"] = ["-m", "backend.batch_worker", "--real-pilot", "--batch-id", approval["batch_id"], "--concurrency", "1", "--max-batches", "1", "--item-limit", str(item_limit)]
-        merge_environment(container, {**approval["environment"], **pilot_values(approval)})
+        scope = approval.get("execution_scope", "full")
+        if scope == "internal_only":
+            container["env"] = [entry for entry in container.get("env", [])
+                                if entry["name"] not in PILOT_EXTERNAL_ENVIRONMENT_KEYS | {"WEBIQ_API_KEY"}]
+        merge_environment(container, {
+            **approval["environment"], **pilot_values(approval),
+            "DOCINTEL_REAL_PILOT_EXECUTION_SCOPE": scope,
+        })
         template["containers"] = writable_containers(template["containers"])
         pilot_window(approval)
         fresh_job, running = active_executions(config)

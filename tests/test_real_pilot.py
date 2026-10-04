@@ -147,6 +147,129 @@ def reserve_inference(guard, version="source-v1", **kwargs):
     )
 
 
+def approve_internal_only(pilot):
+    store, _, original, _ = pilot
+    approval = copy.deepcopy(original)
+    approval["execution_scope"] = "internal_only"
+    approval["customer_processing_approved"] = True
+    for name in real_pilot.EXTERNAL_OPERATIONS:
+        approval["limits"][name] = 0
+    approval["environment"] = {
+        name: value for name, value in approval["environment"].items()
+        if name not in real_pilot.EXTERNAL_ENVIRONMENT_KEYS
+    }
+    approval["unit_prices_usd"] = {
+        name: value for name, value in approval["unit_prices_usd"].items()
+        if name in real_pilot.INTERNAL_PRICE_KEYS
+    }
+    replace(store, APPROVAL_KEY, approval)
+    return approval
+
+
+def test_internal_only_needs_no_web_settings_credentials_prices_or_entitlement(pilot, monkeypatch):
+    approval = approve_internal_only(pilot)
+    for name in ("WEBIQ_API_KEY", "WEBIQ_ENDPOINT", "WEBSEARCH_PROVIDER"):
+        monkeypatch.delenv(name, raising=False)
+    pilot[3]["WEBIQ_ENDPOINT"] = "unverified"
+    pilot[3]["WEBSEARCH_PROVIDER"] = "unavailable"
+    guard = start(pilot)
+    reservation = reserve_inference(guard)
+    guard.record_usage(reservation["reservation_id"], input_tokens=50, output_tokens=5)
+    assert guard.execution_scope == guard.metadata()["execution_scope"] == "internal_only"
+    assert guard.metadata()["reserved"]["microdollars"] == 140
+    assert approval["customer_processing_approved"] is True
+    assert set(approval["unit_prices_usd"]) == {"analysis_page", "input_token", "output_token"}
+
+
+@pytest.mark.parametrize("operation", ["search", "web_retrieval", "retrieval"])
+def test_internal_only_requires_zero_external_budgets_and_rejects_external_calls(pilot, operation):
+    approval = approve_internal_only(pilot)
+    approval["limits"][operation] = 1
+    replace(pilot[0], APPROVAL_KEY, approval)
+    with pytest.raises(ValueError, match="zero"):
+        RealPilotGuard(pilot[0], pilot[1])
+    approval["limits"][operation] = 0
+    replace(pilot[0], APPROVAL_KEY, approval)
+    guard = start(pilot)
+    with pytest.raises(ValueError, match="forbidden"):
+        guard.reserve(operation, key(guard), item_key="row-2")
+    assert guard.metadata()["attempted"][operation] == 0
+    assert guard.metadata()["reserved"]["microdollars"] == 0
+
+
+@pytest.mark.parametrize("scope", [None, "", "internal", "FULL", True])
+def test_scope_is_explicit_and_validated(pilot, scope):
+    pilot[2]["execution_scope"] = scope
+    replace(pilot[0], APPROVAL_KEY, pilot[2])
+    with pytest.raises(ValueError, match="execution_scope"):
+        RealPilotGuard(pilot[0], pilot[1])
+
+
+def test_omitted_scope_retains_full_approval_and_legacy_ledger_semantics(pilot):
+    guard = start(pilot)
+    assert guard.execution_scope == guard.metadata()["execution_scope"] == "full"
+    reservation = guard.reserve("search", key(guard), item_key="row-2")
+    assert reservation["reserved_microdollars"] == 10000
+    ledger, _ = read_json(pilot[0], BUDGET_KEY)
+    del ledger["execution_scope"]
+    replace(pilot[0], BUDGET_KEY, ledger)
+    assert RealPilotGuard(pilot[0], pilot[1]).metadata()["execution_scope"] == "full"
+
+
+@pytest.mark.parametrize("setting", sorted(real_pilot.EXTERNAL_ENVIRONMENT_KEYS))
+def test_internal_only_rejects_external_configuration_in_approval(pilot, setting):
+    approval = approve_internal_only(pilot)
+    approval["environment"][setting] = "unverified"
+    replace(pilot[0], APPROVAL_KEY, approval)
+    with pytest.raises(ValueError, match="omit external"):
+        RealPilotGuard(pilot[0], pilot[1])
+
+
+def test_internal_only_rechecks_runtime_scope_before_services(pilot, monkeypatch):
+    approve_internal_only(pilot)
+    monkeypatch.setenv("DOCINTEL_REAL_PILOT_EXECUTION_SCOPE", "internal_only")
+    guard = start(pilot)
+    monkeypatch.setenv("DOCINTEL_REAL_PILOT_EXECUTION_SCOPE", "full")
+    with pytest.raises(ValueError, match="scope mismatch"):
+        reserve_inference(guard)
+    assert guard.metadata()["invalidated"]
+    assert guard.metadata()["attempted"]["inference"] == 0
+
+
+@pytest.mark.parametrize("change", ["scope", "id", "batch"])
+def test_internal_scope_cannot_reset_durable_allowance(pilot, change):
+    store, record, original, _ = pilot
+    approval = approve_internal_only(pilot)
+    guard = start(pilot)
+    reserve_inference(guard)
+    candidate = copy.deepcopy(record)
+    if change == "scope":
+        approval = copy.deepcopy(original)
+        approval["execution_scope"] = "full"
+    elif change == "id":
+        approval["id"] = "99999999-9999-4999-8999-999999999999"
+    else:
+        candidate["id"] = "f" * 64
+        approval["batch_id"] = candidate["id"]
+        approval["batch_sha256"] = binding_digest(candidate)
+        write_json(store, f"batches/{candidate['id']}.json", candidate)
+    replace(store, APPROVAL_KEY, approval)
+    with pytest.raises(ValueError, match="changed"):
+        RealPilotGuard(store, candidate)
+    assert guard.metadata()["invalidated"]
+    assert guard.metadata()["attempted"]["inference"] == 1
+
+
+def test_used_full_approval_cannot_reopen_as_internal_only(pilot):
+    guard = start(pilot)
+    reserve_inference(guard)
+    approve_internal_only(pilot)
+    with pytest.raises(ValueError, match="changed"):
+        RealPilotGuard(pilot[0], pilot[1])
+    assert guard.metadata()["invalidated"]
+    assert guard.metadata()["attempted"]["inference"] == 1
+
+
 @pytest.mark.parametrize("enabled", [None, "", "false", "TRUE", "1"])
 def test_default_off_and_only_explicit_true(pilot, monkeypatch, enabled):
     if enabled is None:
@@ -271,6 +394,19 @@ def test_api_preflight_does_not_require_worker_runtime_identity(pilot, monkeypat
     pilot[3]["AZURE_CLIENT_ID"] = "88888888-8888-4888-8888-888888888888"
     monkeypatch.delenv("DOCINTEL_REAL_PILOT_WORKER_PRINCIPAL_ID")
     RealPilotGuard(pilot[0], pilot[1])
+    assert BUDGET_KEY not in pilot[0].records
+
+
+@pytest.mark.parametrize("scope", ["full", "internal_only"])
+def test_api_preflight_never_reads_worker_endpoints_or_credentials(pilot, monkeypatch, scope):
+    if scope == "internal_only":
+        approve_internal_only(pilot)
+    for name in ("AZURE_CLIENT_ID", "DOCINTEL_REAL_PILOT_WORKER_PRINCIPAL_ID", "WEBIQ_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LLM_ENDPOINT", "https://api-legacy-endpoint.invalid")
+    monkeypatch.setattr(real_pilot, "current_environment", lambda: pytest.fail("API preflight read worker runtime settings"))
+    guard = RealPilotGuard(pilot[0], pilot[1])
+    assert guard.execution_scope == scope
     assert BUDGET_KEY not in pilot[0].records
 
 
@@ -507,22 +643,33 @@ def test_analysis_page_budget_and_attempts(pilot):
         guard.reserve("analysis", key(guard, version="v3"), item_key="row-2", analysis_pages=1)
 
 
-@pytest.mark.parametrize("operation", ["search", "web_retrieval"])
-def test_customer_web_processing_is_separate_from_evaluation_approval(pilot, operation):
-    store, _, approval, _ = pilot
+@pytest.mark.parametrize("scope", ["full", "internal_only"])
+def test_customer_processing_consent_is_required_before_any_scope(pilot, scope):
+    store, record, original, _ = pilot
+    approval = approve_internal_only(pilot) if scope == "internal_only" else copy.deepcopy(original)
     approval["customer_processing_approved"] = False
     replace(store, APPROVAL_KEY, approval)
+    with pytest.raises(ValueError, match="customer processing"):
+        RealPilotGuard(store, record)
+    assert BUDGET_KEY not in store.records
+
+
+@pytest.mark.parametrize("scope", ["full", "internal_only"])
+def test_revoked_customer_processing_consent_stops_next_call(pilot, scope):
+    store, _, approval, _ = pilot
+    if scope == "internal_only":
+        approval = approve_internal_only(pilot)
     guard = start(pilot)
     reserve_inference(guard)
+    approval["customer_processing_approved"] = False
+    replace(store, APPROVAL_KEY, approval)
     with pytest.raises(ValueError, match="customer processing"):
-        guard.reserve(operation, key(guard, tier="vendor"), item_key="row-2")
-    assert guard.metadata()["attempted"][operation] == 0
+        reserve_inference(guard, "different-source")
+    assert guard.metadata()["attempted"]["inference"] == 1
+    assert guard.metadata()["invalidated"]
 
 
 def test_internal_retrieval_has_separate_attempt_ceiling_not_assumed_billing(pilot):
-    store, _, approval, _ = pilot
-    approval["customer_processing_approved"] = False
-    replace(store, APPROVAL_KEY, approval)
     guard = start(pilot)
     for index in range(4):
         reservation = guard.reserve(

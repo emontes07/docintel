@@ -209,9 +209,14 @@ class RealBatchProcessor(BatchProcessor):
             item, tier=purpose, source_version=version, prompt_version=REAL_PROMPT_VERSION,
         )
 
-    def document_bytes(self, binding, item, provenance):
-        from backend.core.pilot_sources import SourceReference, retrieve_document
+    def internal_copy(self, binding):
+        return (binding["kind"], binding.get("format"), binding.get("source_tier")) in {
+            ("blob", "pdf", "internal_pdf"), ("blob", "xlsx", "vendor_table"),
+        }
 
+    def document_bytes(self, binding, item, provenance):
+        if self.guard.execution_scope == "internal_only" and not self.internal_copy(binding):
+            raise ExecutionConfigurationError("Internal-only execution permits approved Blob PDF/XLSX copies only")
         if binding["kind"] == "blob":
             content, etag = self.store.read_bytes(binding["blob"], max_bytes=10 * 1024 * 1024)
             if digest(content) != binding["sha256"]:
@@ -222,6 +227,8 @@ class RealBatchProcessor(BatchProcessor):
                 sha256=digest(content), origin="approved_copy_not_sharepoint_ingestion",
             )
             return content, location
+        from backend.core.pilot_sources import SourceReference, retrieve_document
+
         cache_id = digest(json.dumps(binding, sort_keys=True).encode())
         if cache_id not in self.downloads:
             if not binding.get("enabled"):
@@ -347,6 +354,8 @@ class RealBatchProcessor(BatchProcessor):
         )
 
     def web_sources(self, binding, item, scope, pending, provenance):
+        if self.guard.execution_scope == "internal_only":
+            raise ExecutionConfigurationError("Web tiers are excluded by internal-only approval")
         from backend.core.websearch import WebSearchError, fetch_original_page
         from backend.core.websearch_webiq import WebIQSearchClient
 
@@ -421,12 +430,23 @@ class RealBatchProcessor(BatchProcessor):
 
                 if os.environ.get("AOAI_API_VERSION") != LLM_API_VERSION:
                     raise ValueError("Approved model API version differs from the installed client")
-                version = digest((system + user + schema.model_json_schema().__repr__()).encode())
+                request_parameters = {"max_completion_tokens": 2048}
+                if settings.LLM_DEPLOYMENT == "gpt-5":
+                    request_parameters["reasoning_effort"] = "minimal"
+                version_input = system + user + schema.model_json_schema().__repr__()
+                if "reasoning_effort" in request_parameters:
+                    version_input += "\n" + json.dumps({
+                        "deployment": settings.LLM_DEPLOYMENT, **request_parameters,
+                    }, sort_keys=True)
+                version = digest(version_input.encode())
                 key = processor.key(item, "inference", version)
                 cache_key = "real-inferences/" + key + ".json"
                 try:
                     stored, _ = read_json(processor.store, cache_key)
-                    processor.inference_provenance.append({"method": "compatible_response_cache", "key": key, "new_model_call": False})
+                    processor.inference_provenance.append({
+                        "method": "compatible_response_cache", "key": key, "new_model_call": False,
+                        "request_parameters": request_parameters,
+                    })
                     return schema.model_validate(stored["response"])
                 except Missing:
                     pass
@@ -444,7 +464,7 @@ class RealBatchProcessor(BatchProcessor):
                 )
                 client.sync_client = client.sync_client.with_options(max_retries=0)
                 try:
-                    response = client.complete_structured(system, user, schema, max_retries=1, max_completion_tokens=2048)
+                    response = client.complete_structured(system, user, schema, max_retries=1, **request_parameters)
                     if client.last_usage is not None:
                         try:
                             processor.guard.record_usage(reservation["reservation_id"], **client.last_usage)
@@ -453,10 +473,12 @@ class RealBatchProcessor(BatchProcessor):
                     processor.inference_provenance.append({
                         "method": "model", "reservation_id": reservation["reservation_id"],
                         "usage": client.last_usage, "new_model_call": True,
+                        "request_parameters": request_parameters,
                     })
                     write_json(processor.store, cache_key, {
                         "response": response.model_dump(mode="json"),
                         "usage": client.last_usage, "reservation_id": reservation["reservation_id"],
+                        "request_parameters": request_parameters,
                     })
                     return response
                 finally:
@@ -470,15 +492,27 @@ class RealBatchProcessor(BatchProcessor):
         manifest = Manifest.model_validate(item["manifest"])
         self.inference_provenance = []
         provenance = []
+        internal_only = self.guard.execution_scope == "internal_only"
+        if internal_only:
+            provenance = [{
+                "source_id": binding["source_id"], "reference": binding["reference"],
+                "source_tier": binding["source_tier"], "execution_scope": "internal_only",
+                "retrieval": "not_attempted", "parsing": "not_attempted",
+                "skip_reason": "internal_only_approved_copies_only",
+                "limitation": "External web and SharePoint retrieval were excluded by approval; references were retained as metadata only.",
+            } for binding in item["sources"] if not self.internal_copy(binding)]
 
         def load(tier, pending):
             sources = []
             for binding in item["sources"]:
                 if binding["source_tier"] != tier:
                     continue
+                if internal_only and not self.internal_copy(binding):
+                    continue
                 entry = {
                     "source_id": binding["source_id"], "reference": binding["reference"],
                     "source_tier": tier, "retrieval": "not_attempted", "parsing": "not_attempted",
+                    "execution_scope": self.guard.execution_scope,
                 }
                 provenance.append(entry)
                 scope = next((scope for scope in binding["applicability"] if scope["product"] == manifest.product.model_dump()), None)
@@ -522,6 +556,7 @@ class RealBatchProcessor(BatchProcessor):
             "state": "unresolved" if unresolved else "completed",
             "error": "Inspect source failures, applicability, and unresolved attributes" if unresolved else "",
             "provenance": provenance, "consumption": self.guard.metadata(),
+            "execution_scope": self.guard.execution_scope,
             "inference_provenance": self.inference_provenance,
             "coverage": coverage,
         }
