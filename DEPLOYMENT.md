@@ -171,7 +171,20 @@ modify its SDK. It uses the existing registry's ARM API **2019-04-01**:
    curated context. Reject links, private evidence, secrets, or permission drift.
 2. `az rest --method POST --url "$REGISTRY_ARM_ID/listBuildSourceUploadUrl?api-version=2019-04-01"`.
 3. PUT that archive as `BlockBlob` to the returned `uploadUrl`; put only the
-   returned `relativePath` in `sourceLocation`. The short-lived SAS stays in
+   returned `relativePath` in `sourceLocation`, unchanged. `SourceUploadDefinition`
+   defines `uploadUrl` and `relativePath` as strings; the installed CLI uploads to
+   the former and returns the latter directly. Neither contract requires a
+   `source/` prefix or a `.tar.gz` suffix. Treat the relative path as opaque,
+   subject to local safety bounds: at most 4096 UTF-8 bytes, no absolute/URI paths,
+   traversal, empty segments, controls, backslashes, malformed escapes, or
+   ambiguous encoded separators/double escaping. Compare decoded path segments
+   at exact boundaries against the trusted HTTPS SAS Blob URL; do not reinterpret
+   a suffix as a different blob or synthesize a new provider path.
+   Before validation, save `*-publication[-replacement]-upload-metadata.json`
+   containing only response/value types, byte lengths, path hashes, and shape
+   flags. Rejections include this safe summary. No raw provider paths, URLs,
+   query strings, or SAS signatures appear in these diagnostics.
+   The short-lived SAS stays in
    process memory/stdin, never command arguments, receipts, or printed errors.
    No redirects or upload retries are enabled.
 4. Save the exact request and its source/helper/context/archive hashes, then
@@ -208,6 +221,12 @@ loopback-only HTTP stub, using isolated `AZURE_CONFIG_DIR`, disabled telemetry,
 and `--skip-authorization-header`. The stub verifies both component request bodies,
 including CPU/timeout, and absence of an Authorization header. This proves real
 CLI parsing/serialization, not Azure authorization or successful remote execution.
+Representative opaque-path regressions are synthetic, not evidence of a failed
+provider response's actual shape. A rejection by the former prefix/extension
+restriction proves an unsupported local assumption; when the raw response was
+not retained, its actual value remains unknown. This offline correction grants
+no replacement attempt: consumed original/replacement receipts remain consumed,
+and no frontend-only partial publication should be started without authority.
 
 Full and component publication share atomic, create-once
 `backend-publication-attempt.json` / `frontend-publication-attempt.json` records
