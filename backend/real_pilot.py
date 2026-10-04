@@ -61,6 +61,19 @@ from urllib.parse import urlsplit
 from backend.batch_store import Conflict, Missing, read_json, write_json
 
 
+class RealPilotBudgetExceeded(ValueError):
+    """A capacity denial before reservation, not an authorization failure."""
+
+    def __init__(self, dimension: str, requested: int, remaining: int):
+        self.dimension = dimension
+        self.requested = requested
+        self.remaining = remaining
+        super().__init__(
+            f"Real-pilot {dimension} budget exhausted: requested {requested}, remaining {remaining}. "
+            "No service call or reservation was made."
+        )
+
+
 APPROVAL_KEY = "configuration/real-pilot-approval.json"
 BUDGET_KEY = "budgets/real-pilot.json"
 HARD_LIMITS = {
@@ -453,7 +466,9 @@ class RealPilotGuard:
             raise ValueError("Real-pilot operation key must bind an approved item")
         for name, value in (("input_tokens", max_input_tokens), ("output_tokens", max_output_tokens),
                             ("analysis_pages", analysis_pages)):
-            _integer(value, name, maximum=HARD_LIMITS[name])
+            _integer(value, name)
+            if value > HARD_LIMITS[name]:
+                raise RealPilotBudgetExceeded(name, value, HARD_LIMITS[name])
         if operation == "inference" and (max_input_tokens == 0 or max_output_tokens == 0):
             raise ValueError("Real-pilot inference requires server token upper bounds")
         if operation == "retrieval" and (max_input_tokens or max_output_tokens or analysis_pages):
@@ -471,14 +486,16 @@ class RealPilotGuard:
                 raise Conflict("Real-pilot operation already attempted; no automatic retry")
             limits = approval["limits"]
             if ledger["attempted"][operation] >= limits[operation]:
-                raise ValueError("Real-pilot operation budget exhausted")
+                raise RealPilotBudgetExceeded(operation, 1, limits[operation] - ledger["attempted"][operation])
             usage = {"input_tokens": max_input_tokens, "output_tokens": max_output_tokens, "analysis_pages": analysis_pages}
             for name, value in usage.items():
                 if ledger["reserved"][name] + value > limits[name]:
-                    raise ValueError(f"Real-pilot {name} budget exhausted")
+                    raise RealPilotBudgetExceeded(name, value, limits[name] - ledger["reserved"][name])
             cost = self._cost(approval, operation, **usage)
             if ledger["reserved"]["microdollars"] + cost > limits["spend_microdollars"]:
-                raise ValueError("Real-pilot approved spend ceiling exhausted")
+                raise RealPilotBudgetExceeded(
+                    "spend_microdollars", cost, limits["spend_microdollars"] - ledger["reserved"]["microdollars"],
+                )
             reservation = {
                 "reservation_id": key, "approval_id": self.approval_id,
                 "execution_id": self._execution_id, "operation": operation,

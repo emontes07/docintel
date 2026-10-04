@@ -639,8 +639,34 @@ def test_analysis_page_budget_and_attempts(pilot):
     with pytest.raises(ValueError, match="analysis_pages"):
         guard.reserve("analysis", key(guard, version="v2"), item_key="row-2", analysis_pages=5)
     guard.reserve("analysis", key(guard, version="v2"), item_key="row-2", analysis_pages=4)
-    with pytest.raises(ValueError, match="operation budget"):
+    with pytest.raises(ValueError, match="analysis budget"):
         guard.reserve("analysis", key(guard, version="v3"), item_key="row-2", analysis_pages=1)
+
+
+@pytest.mark.parametrize("limit,value,requested", [
+    ("input_tokens", 99, 100), ("output_tokens", 19, 20),
+    ("spend_microdollars", 139, 140), ("inference", 0, 1),
+])
+def test_capacity_denial_is_typed_and_preserves_entire_ledger(pilot, limit, value, requested):
+    store, _, approval, _ = pilot
+    approval["limits"][limit] = value
+    replace(store, APPROVAL_KEY, approval)
+    guard = start(pilot)
+    before = store.read_bytes(BUDGET_KEY)
+    with pytest.raises(real_pilot.RealPilotBudgetExceeded) as denied:
+        reserve_inference(guard)
+    assert (denied.value.dimension, denied.value.requested, denied.value.remaining) == (limit, requested, value)
+    assert store.read_bytes(BUDGET_KEY) == before
+
+
+def test_hard_input_capacity_denial_remains_bounded_without_reservation(pilot):
+    store, *_ = pilot
+    guard = start(pilot)
+    before = store.read_bytes(BUDGET_KEY)
+    with pytest.raises(real_pilot.RealPilotBudgetExceeded) as denied:
+        reserve_inference(guard, input_tokens=200001)
+    assert denied.value.remaining == 200000
+    assert store.read_bytes(BUDGET_KEY) == before
 
 
 @pytest.mark.parametrize("scope", ["full", "internal_only"])
@@ -676,7 +702,7 @@ def test_internal_retrieval_has_separate_attempt_ceiling_not_assumed_billing(pil
             "retrieval", key(guard, version=f"source-{index}"), item_key="row-2",
         )
         assert reservation["reserved_microdollars"] == 0
-    with pytest.raises(ValueError, match="operation budget"):
+    with pytest.raises(ValueError, match="retrieval budget"):
         guard.reserve("retrieval", key(guard, version="source-5"), item_key="row-2")
     with pytest.raises(Conflict, match="already attempted"):
         guard.reserve("retrieval", key(guard, version="source-0"), item_key="row-2")

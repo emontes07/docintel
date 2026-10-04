@@ -22,7 +22,58 @@ from backend.extract import ExecutionConfigurationError, run_enrichment
 from backend.models.enrichment import Evidence, ExtractionResponse, LiveBundle, Manifest, OfflineBundle, OfflineSource, ProductKey, ReviewAnnotation
 from backend.pilot import PARSER_VERSION, QUALIFICATIONS
 from backend.multisource import run_cascade
-from backend.real_pilot import RealPilotGuard
+from backend.real_pilot import RealPilotBudgetExceeded, RealPilotGuard
+
+
+COMPACT_PROMPT_FORMAT = "real-evidence-groups-v1"
+COMPACT_PROMPT_INSTRUCTIONS = """
+Evidence is a table with evidence_columns as its headers. Each row inherits all
+metadata, attribute_ids and qualification from evidence_groups[row.group].
+row.text_index selects its verbatim excerpt in evidence_texts. Its evidence_id is
+a request-local citation reference: cite that exact reference, selecting only the
+rows supporting the candidate. row.location preserves the original citation: a
+string is appended to both the group's evidence_id_prefix and source_locator_prefix;
+a two-string array gives the respective suffixes. The application restores the
+selected original IDs before validation. No row or original location is discarded.
+"""
+
+
+def compact_inference_prompt(user: str) -> tuple[str, dict[str, str]]:
+    payload = json.loads(user)
+    groups = {}
+    for entry in payload["evidence"]:
+        shared = {name: value for name, value in entry.items()
+                  if name not in {"evidence_id", "source_locator", "text"}}
+        key = json.dumps(shared, sort_keys=True, ensure_ascii=False)
+        if key not in groups:
+            groups[key] = (shared, [])
+        groups[key][1].append(entry)
+    references = {}
+    compact = []
+    metadata = []
+    texts = {}
+    for group_index, (shared, entries) in enumerate(groups.values()):
+        id_prefix = os.path.commonprefix([entry["evidence_id"] for entry in entries])
+        locator_prefix = os.path.commonprefix([entry["source_locator"] for entry in entries])
+        metadata.append({
+            **shared, "evidence_id_prefix": id_prefix, "source_locator_prefix": locator_prefix,
+        })
+        for entry in entries:
+            text = entry["text"]
+            if text not in texts:
+                texts[text] = len(texts)
+            reference = f"E{len(references) + 1}"
+            references[reference] = entry["evidence_id"]
+            id_suffix = entry["evidence_id"][len(id_prefix):]
+            locator_suffix = entry["source_locator"][len(locator_prefix):]
+            location = id_suffix if id_suffix == locator_suffix else [id_suffix, locator_suffix]
+            compact.append([reference, group_index, texts[text], location])
+    payload.update(
+        evidence=compact, evidence_groups=metadata, evidence_texts=list(texts),
+        evidence_columns=["evidence_id", "group", "text_index", "location"],
+        prompt_format=COMPACT_PROMPT_FORMAT,
+    )
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), references
 
 
 class ManagedCompletion:
@@ -201,6 +252,8 @@ class RealBatchProcessor(BatchProcessor):
     def reserve_real(self, *args, **kwargs):
         try:
             return self.guard.reserve(*args, **kwargs)
+        except RealPilotBudgetExceeded:
+            raise
         except (ValueError, Missing) as error:
             raise ExecutionConfigurationError("Real-pilot authorization or consumption guard stopped execution") from error
 
@@ -412,7 +465,13 @@ class RealBatchProcessor(BatchProcessor):
                 raise
             except (WebSearchError, ValueError, OSError) as error:
                 code = error.code if isinstance(error, WebSearchError) else "web_source_unavailable_or_inapplicable"
-                provenance.setdefault("page_errors", []).append({"source_id": source_id, "error": code})
+                detail: dict[str, str | int] = {"source_id": source_id, "error": code}
+                if isinstance(error, RealPilotBudgetExceeded):
+                    detail.update(
+                        error="budget_exhausted", budget=error.dimension,
+                        requested=error.requested, remaining=error.remaining,
+                    )
+                provenance.setdefault("page_errors", []).append(detail)
                 sources.append(OfflineSource(
                     source_id=source_id, product=product, source_tier=binding["source_tier"],
                     error_code="parse_failed",
@@ -430,6 +489,8 @@ class RealBatchProcessor(BatchProcessor):
 
                 if os.environ.get("AOAI_API_VERSION") != LLM_API_VERSION:
                     raise ValueError("Approved model API version differs from the installed client")
+                user, references = compact_inference_prompt(user)
+                system += COMPACT_PROMPT_INSTRUCTIONS
                 request_parameters = {"max_completion_tokens": 2048}
                 if settings.LLM_DEPLOYMENT == "gpt-5":
                     request_parameters["reasoning_effort"] = "minimal"
@@ -446,15 +507,24 @@ class RealBatchProcessor(BatchProcessor):
                     processor.inference_provenance.append({
                         "method": "compatible_response_cache", "key": key, "new_model_call": False,
                         "request_parameters": request_parameters,
+                        "prompt_format": COMPACT_PROMPT_FORMAT,
                     })
                     return schema.model_validate(stored["response"])
                 except Missing:
                     pass
                 input_bound = len(system.encode()) + len(user.encode()) + len(json.dumps(schema.model_json_schema()).encode()) + 4096
-                reservation = processor.reserve_real(
-                    "inference", key, item_key=item["item_key"],
-                    max_input_tokens=input_bound, max_output_tokens=2048,
-                )
+                try:
+                    reservation = processor.reserve_real(
+                        "inference", key, item_key=item["item_key"],
+                        max_input_tokens=input_bound, max_output_tokens=2048,
+                    )
+                except RealPilotBudgetExceeded as error:
+                    processor.inference_provenance.append({
+                        "method": "budget_blocked", "new_model_call": False,
+                        "prompt_format": COMPACT_PROMPT_FORMAT, "input_bound": input_bound,
+                        "budget": error.dimension, "requested": error.requested, "remaining": error.remaining,
+                    })
+                    raise
                 client = LLMClient(
                     endpoint=settings.LLM_ENDPOINT or settings.AI_FOUNDRY_ENDPOINT,
                     token_provider=get_bearer_token_provider(
@@ -474,11 +544,20 @@ class RealBatchProcessor(BatchProcessor):
                         "method": "model", "reservation_id": reservation["reservation_id"],
                         "usage": client.last_usage, "new_model_call": True,
                         "request_parameters": request_parameters,
+                        "prompt_format": COMPACT_PROMPT_FORMAT,
                     })
+                    response = schema.model_validate(response.model_dump())
+                    for candidate in response.candidates:
+                        if any(reference not in references for reference in candidate.evidence_ids):
+                            raise ValueError("Model cited an unknown compact evidence reference")
+                        candidate.evidence_ids = list(dict.fromkeys(
+                            references[reference] for reference in candidate.evidence_ids
+                        ))
                     write_json(processor.store, cache_key, {
                         "response": response.model_dump(mode="json"),
                         "usage": client.last_usage, "reservation_id": reservation["reservation_id"],
                         "request_parameters": request_parameters,
+                        "prompt_format": COMPACT_PROMPT_FORMAT,
                     })
                     return response
                 finally:
@@ -524,6 +603,15 @@ class RealBatchProcessor(BatchProcessor):
                         sources.extend(self.web_sources(binding, item, scope, [name for name in pending if name in scope["attribute_ids"]], entry))
                     else:
                         sources.append(self.real_document(binding, item, scope, entry))
+                except RealPilotBudgetExceeded as error:
+                    entry.update(
+                        retrieval="failed", error="budget_exhausted", budget=error.dimension,
+                        requested=error.requested, remaining=error.remaining,
+                    )
+                    sources.append(OfflineSource(
+                        source_id=binding["source_id"], product=manifest.product,
+                        source_tier=tier, error_code="parse_failed",
+                    ))
                 except (Conflict, ExecutionConfigurationError):
                     raise
                 except (Missing, ValueError, OSError, DocumentIntelligenceError, AzureError, WebSearchError):
@@ -626,7 +714,16 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                     write_json(store, f"results/{batch_id}/{item['item_key']}.json", result.model_dump(mode="json"))
                     state.update(outcome)
                     state["reviewable_attributes"] = [attribute.attribute_id for attribute in result.attributes if attribute.status != "existing"]
-                except (Conflict, ExecutionConfigurationError):
+                except ExecutionConfigurationError:
+                    if record["mode"] == "real_pilot":
+                        state.update(
+                            state="failed", finished_at=now(),
+                            error="Execution guard stopped this item; prior reservations remain consumed. No automatic retry.",
+                        )
+                        fence()
+                        write_json(store, key, state, item_version)
+                    raise
+                except Conflict:
                     raise
                 except Exception:
                     state.update(state="failed", error="Item execution failed; provider details withheld. No automatic retry")
@@ -634,8 +731,12 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                 state["finished_at"] = now()
                 write_json(store, key, state, item_version)
 
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                list(pool.map(execute, pending[:item_limit]))
+            if record["mode"] == "real_pilot":
+                for item in pending[:item_limit]:
+                    execute(item)
+            else:
+                with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    list(pool.map(execute, pending[:item_limit]))
             fence()
             record["state"] = "queued" if len(pending) > item_limit else "completed"
             record["updated_at"] = now()
