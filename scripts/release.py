@@ -37,6 +37,9 @@ SUPPLEMENTAL_PUBLICATION_RECORDS = (
     "backend-publication-supplemental-request.json", "backend-publication-supplemental-submission.json",
     "backend-publication-supplemental-queued.json", "backend-publication-supplemental-upload-metadata.json",
 )
+BACKEND_COMMAND = ["/app/.venv/bin/fastapi"]
+BACKEND_ARGUMENTS = ["run", "backend/main.py", "--port", "8080", "--host", "0.0.0.0"]
+UNCHANGED_INGRESS = object()
 
 
 def require(condition, message):
@@ -453,9 +456,13 @@ def require_pilot_acceptance(config, work):
         containers = safe_containers(resource)
         require(containers[0]["image"] == image(config, kind), "Pilot app differs from accepted release image")
         require(writable_containers(desired_containers(config, kind, containers)) == writable_containers(containers), "Pilot hosted authentication/storage baseline drift")
+        if kind == "backend":
+            require_backend_runtime(containers, writable_ingress(properties["configuration"].get("ingress")))
         revision = azure("containerapp", "revision", "show", "--subscription", config["subscription"], "-g", config["group"], "-n", config[kind], "--revision", properties["latestReadyRevisionName"])
         require(revision["properties"]["healthState"] == "Healthy", "Pilot deployed revision is not healthy")
         require([entry["image"] for entry in revision["properties"]["template"]["containers"]] == [image(config, kind)], "Pilot healthy revision image differs from accepted digest")
+        if kind == "backend":
+            require_backend_runtime(safe_containers(revision), writable_ingress(properties["configuration"].get("ingress")))
     identity_contract(config)
 
 
@@ -687,12 +694,22 @@ def image(config, kind):
     return value
 
 
-def desired_containers(config, kind, baseline):
+def desired_containers(config, kind, baseline, *, runtime=True):
     containers = copy.deepcopy(baseline)
     values = {entry["name"]: entry for entry in containers[0].get("env", [])}
     if kind == "backend":
         updates = {"DOCINTEL_BATCH_MODE": "hosted", "DOCINTEL_BATCH_STORAGE_URL": f"https://{config['storage']}.blob.core.windows.net", "DOCINTEL_BATCH_CONTAINER": config["container"], "DOCINTEL_AUTH_TENANT_ID": config["tenant"], "DOCINTEL_AUTH_AUDIENCE": config["api_client_id"], "DOCINTEL_AUTH_CLIENT_ID": config["frontend_client_id"], "DOCINTEL_BATCH_LIVE_ENABLED": "false"}
         values.pop("DOCINTEL_BATCH_HOME", None)
+        if runtime:
+            containers[0]["command"] = list(BACKEND_COMMAND)
+            containers[0]["args"] = list(BACKEND_ARGUMENTS)
+            updates.update({"API_PORT": "8080", "NEXT_PUBLIC_API_PORT": "8080"})
+            probes = containers[0].get("probes")
+            require(probes is None or isinstance(probes, list), "Invalid backend probe configuration")
+            for probe in probes or []:
+                handlers = [probe[name] for name in ("httpGet", "tcpSocket") if probe.get(name) is not None]
+                require(len(handlers) == 1 and isinstance(handlers[0], dict) and handlers[0].get("port") in (80, 8080), "Backend probe must target the approved API port")
+                handlers[0]["port"] = 8080
     else:
         updates = {"AUTH_URL": config["frontend_origin"], "DOCINTEL_PORTAL_ORIGIN": config["frontend_origin"], "DOCINTEL_BATCH_API_URL": config["backend_origin"] + "/api/v1/batches", "DOCINTEL_BATCH_DEV": "false", "DOCINTEL_API_SCOPE": f"api://{config['api_client_id']}/Batch.Access", "AUTH_MICROSOFT_ENTRA_ID_ID": config["frontend_client_id"], "AUTH_MICROSOFT_ENTRA_ID_TENANT_ID": f"https://login.microsoftonline.com/{config['tenant']}/v2.0"}
         for name, reference in (("AUTH_SECRET", "auth_secret_ref"), ("AUTH_MICROSOFT_ENTRA_ID_SECRET", "entra_secret_ref")):
@@ -718,9 +735,106 @@ def writable_containers(containers):
     return result
 
 
-def patch_app(config, kind, containers, work):
-    body = work / (kind + "-patch.json")
-    save(body, {"properties": {"template": {"containers": writable_containers(containers)}}})
+def writable_ingress(ingress):
+    if ingress is None:
+        return None
+    supported = {"additionalPortMappings", "allowInsecure", "clientCertificateMode", "corsPolicy", "customDomains", "exposedPort", "external", "ipSecurityRestrictions", "stickySessions", "targetPort", "traffic", "transport"}
+    require(isinstance(ingress, dict) and not (set(ingress) - supported - {"fqdn", "targetPortHttpScheme"}), "Unknown ingress fields; review write compatibility")
+    return {name: copy.deepcopy(value) for name, value in ingress.items() if name in supported}
+
+
+def desired_ingress(kind, baseline):
+    ingress = writable_ingress(baseline)
+    if kind == "backend":
+        require(ingress is not None and ingress.get("targetPort") in (80, 8080) and ingress.get("allowInsecure") is False, "Backend requires existing HTTPS-only ingress on the approved API port")
+        ingress["targetPort"] = 8080
+    return ingress
+
+
+def require_backend_runtime(containers, ingress):
+    container = containers[0]
+    require(container.get("command") == BACKEND_COMMAND and container.get("args") == BACKEND_ARGUMENTS, "Backend requires the nonroot-compatible explicit port-8080 FastAPI command")
+    values = environment_entries(container)
+    require(all(values.get(name) == {"name": name, "value": "8080"} for name in ("API_PORT", "NEXT_PUBLIC_API_PORT")), "Backend internal API port settings drift")
+    require(ingress is not None and ingress.get("targetPort") == 8080 and ingress.get("allowInsecure") is False, "Backend ingress must remain HTTPS-only and target port 8080")
+    probes = container.get("probes")
+    require(probes is None or isinstance(probes, list), "Invalid backend probe configuration")
+    for probe in probes or []:
+        handlers = [probe[name] for name in ("httpGet", "tcpSocket") if probe.get(name) is not None]
+        require(len(handlers) == 1 and isinstance(handlers[0], dict) and handlers[0].get("port") == 8080, "Backend probes must target port 8080")
+
+
+def preserve_json(path, value):
+    if path.exists():
+        require(private_json(path) == value, "Existing immutable runtime receipt differs; inspect instead of overwriting")
+    else:
+        save_once(path, value)
+
+
+def runtime_baseline(config, work, baseline, resources):
+    path = work / "runtime-baseline.json"
+    baseline_hash = hashlib.sha256((work / "baseline.json").read_bytes()).hexdigest()
+    if path.exists():
+        record = private_json(path)
+        require(record["target"] == fingerprint(config) and record["baseline_sha256"] == baseline_hash and record["baseline"] == baseline, "Runtime rollback snapshot drift")
+    else:
+        record = {"target": fingerprint(config), "baseline_sha256": baseline_hash, "baseline": baseline, "apps": {}}
+        for kind in ("backend", "frontend"):
+            original = baseline["apps"][kind]
+            current = safe_containers(resources[kind])
+            intended_path = work / (kind + "-intended.json")
+            prior = private_json(intended_path) if intended_path.exists() else None
+            expected = desired_containers(config, kind, original["containers"], runtime=False)
+            if prior is not None:
+                require(writable_containers(prior) in (writable_containers(expected), writable_containers(desired_containers(config, kind, original["containers"]))), "Prior recorded intent is not the exact release intent")
+            if "ingress" in original:
+                ingress = original["ingress"]
+            else:
+                require(writable_containers(current) in (writable_containers(original["containers"]), writable_containers(prior) if prior is not None else None), "Cannot capture missing ingress from unrelated or unrecorded state")
+                ingress = resources[kind]["properties"]["configuration"].get("ingress")
+                require(ingress is not None and (kind != "backend" or ingress.get("targetPort") == 80), "Original ingress is missing; refuse to invent rollback port/settings")
+            writable_ingress(ingress)
+            record["apps"][kind] = {
+                "ingress": copy.deepcopy(ingress), "prior_intended": prior,
+                "prior_intended_sha256": hashlib.sha256(intended_path.read_bytes()).hexdigest() if prior is not None else None,
+            }
+        preserve_json(path, record)
+    for kind, original in record["apps"].items():
+        intended_path = work / (kind + "-intended.json")
+        actual = hashlib.sha256(intended_path.read_bytes()).hexdigest() if intended_path.exists() else None
+        require(actual == original["prior_intended_sha256"], "Prior recorded intent changed since runtime snapshot")
+    return record
+
+
+def runtime_targets(config, baseline, snapshot, resources, *, allow_isolated=False):
+    targets = {}
+    for kind in ("backend", "frontend"):
+        original = baseline["apps"][kind]["containers"]
+        ingress = writable_ingress(snapshot["apps"][kind]["ingress"])
+        desired = desired_containers(config, kind, original)
+        target_ingress = desired_ingress(kind, ingress)
+        restored = copy.deepcopy(original)
+        restored[0]["image"] = baseline["apps"][kind].get("pinned_image", original[0]["image"])
+        states = [(writable_containers(original), ingress), (writable_containers(restored), ingress), (writable_containers(desired), target_ingress)]
+        prior = snapshot["apps"][kind]["prior_intended"]
+        if prior is not None:
+            prior_ingress = target_ingress if writable_containers(prior) == writable_containers(desired) else ingress
+            states.append((writable_containers(prior), prior_ingress))
+        if allow_isolated:
+            states.extend((containers, None) for containers, _ in list(states))
+        resource = resources[kind]
+        actual = (writable_containers(safe_containers(resource)), writable_ingress(resource["properties"]["configuration"].get("ingress")))
+        require(actual in states, "App or ingress drift since baseline/recorded intent; stop rather than overwrite")
+        targets[kind] = {"containers": desired, "ingress": target_ingress}
+    return targets
+
+
+def patch_app(config, kind, containers, work, *, ingress=UNCHANGED_INGRESS):
+    payload = {"properties": {"template": {"containers": writable_containers(containers)}}}
+    if ingress is not UNCHANGED_INGRESS:
+        payload["properties"]["configuration"] = {"ingress": writable_ingress(ingress)}
+    body = work / (kind + "-patch-" + fingerprint(payload) + ".json")
+    preserve_json(body, payload)
     resource = f"/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.App/containerApps/{config[kind]}"
     azure("rest", "--method", "PATCH", "--url", "https://management.azure.com" + resource + "?api-version=2024-03-01", "--body", "@" + str(body))
 
@@ -1433,7 +1547,10 @@ def run(options):
         update_worker_image(config, work)
     elif options.action == "capture":
         require(not (work / "baseline.json").exists(), "Refusing to replace rollback baseline")
-        baseline = {kind: {"containers": safe_containers(app(config, config[kind]))} for kind in ("backend", "frontend")}
+        resources = {kind: app(config, config[kind]) for kind in ("backend", "frontend")}
+        baseline = {kind: {"containers": safe_containers(resource), "ingress": copy.deepcopy(resource["properties"]["configuration"].get("ingress"))} for kind, resource in resources.items()}
+        for record in baseline.values():
+            writable_ingress(record["ingress"])
         for record in baseline.values():
             for container in record["containers"]:
                 current = container["image"]
@@ -1499,20 +1616,25 @@ def run(options):
         frontend = app(config, config["frontend"])
         refs = {entry["name"] for entry in frontend["properties"]["configuration"].get("secrets", [])}
         require({config["auth_secret_ref"], config["entra_secret_ref"]} <= refs, "Approved frontend secret references are missing")
+        resources = {kind: app(config, config[kind]) for kind in ("backend", "frontend")}
+        snapshot = runtime_baseline(config, work, baseline, resources)
+        targets = runtime_targets(config, baseline, snapshot, resources)
         for kind in ("backend", "frontend"):
-            current = safe_containers(app(config, config[kind]))
-            desired = desired_containers(config, kind, baseline["apps"][kind]["containers"])
-            require(current in (baseline["apps"][kind]["containers"], desired), "App drift since baseline capture; stop rather than overwrite")
-        for kind in ("backend", "frontend"):
-            desired = desired_containers(config, kind, baseline["apps"][kind]["containers"])
-            save(work / (kind + "-intended.json"), desired)
-            if safe_containers(app(config, config[kind])) != desired:
-                patch_app(config, kind, desired, work)
+            desired = targets[kind]["containers"]
+            ingress = targets[kind]["ingress"]
+            preserve_json(work / (kind + "-runtime-intended.json"), {"target": fingerprint(config), "baseline_sha256": snapshot["baseline_sha256"], **targets[kind]})
+            current = app(config, config[kind])
+            if writable_containers(safe_containers(current)) != writable_containers(desired) or writable_ingress(current["properties"]["configuration"].get("ingress")) != ingress:
+                patch_app(config, kind, desired, work, ingress=ingress)
             resource = app(config, config[kind])
+            require(writable_containers(safe_containers(resource)) == writable_containers(desired) and writable_ingress(resource["properties"]["configuration"].get("ingress")) == ingress, f"{kind} runtime/ingress did not converge")
             require(resource["properties"]["provisioningState"] == "Succeeded" and resource["properties"]["latestRevisionName"] == resource["properties"]["latestReadyRevisionName"], f"{kind} revision is not ready; stop and inspect before proceeding")
             revision = azure("containerapp", "revision", "show", "--subscription", config["subscription"], "-g", config["group"], "-n", config[kind], "--revision", resource["properties"]["latestReadyRevisionName"])
             require(revision["properties"]["healthState"] == "Healthy", f"{kind} revision is not healthy; deployment stopped")
             require([container["image"] for container in revision["properties"]["template"]["containers"]] == [container["image"] for container in desired], f"{kind} ready revision does not contain the intended image")
+            if kind == "backend":
+                require_backend_runtime(safe_containers(resource), ingress)
+                require_backend_runtime(safe_containers(revision), ingress)
     elif options.action == "start":
         require(re.fullmatch(r"[a-f0-9]{64}", options.batch_id or ""), "Explicit validated synthetic batch ID required")
         require(options.item_limit in (1, 2), "Acceptance slice must contain at most two items")
@@ -1535,13 +1657,9 @@ def run(options):
         baseline = json.loads((work / "baseline.json").read_text())
         require(baseline["target"] == fingerprint(config), "Rollback target mismatch")
         require(baseline["authenticated"] or options.isolate_legacy_baseline, "Baseline has no verified hosted authentication; approve ingress isolation or a secure rollback baseline, never restore it publicly")
-        for kind in ("backend", "frontend"):
-            current = safe_containers(app(config, config[kind]))
-            intended_path = work / (kind + "-intended.json")
-            intended = json.loads(intended_path.read_text()) if intended_path.exists() else None
-            restored = copy.deepcopy(baseline["apps"][kind]["containers"])
-            restored[0]["image"] = baseline["apps"][kind]["pinned_image"]
-            require(current in (baseline["apps"][kind]["containers"], intended, restored), "Rollback would overwrite unrelated app changes")
+        resources = {kind: app(config, config[kind]) for kind in ("backend", "frontend")}
+        snapshot = runtime_baseline(config, work, baseline, resources)
+        runtime_targets(config, baseline, snapshot, resources, allow_isolated=not baseline["authenticated"])
         stop(config)
         if not baseline["authenticated"]:
             for kind in ("frontend", "backend"):
@@ -1549,7 +1667,10 @@ def run(options):
         for kind in ("backend", "frontend"):
             containers = copy.deepcopy(baseline["apps"][kind]["containers"])
             containers[0]["image"] = baseline["apps"][kind]["pinned_image"]
-            patch_app(config, kind, containers, work)
+            ingress = snapshot["apps"][kind]["ingress"] if baseline["authenticated"] else None
+            patch_app(config, kind, containers, work, ingress=ingress)
+            resource = app(config, config[kind])
+            require(writable_containers(safe_containers(resource)) == writable_containers(containers) and writable_ingress(resource["properties"]["configuration"].get("ingress")) == writable_ingress(ingress), f"{kind} rollback runtime/ingress did not converge")
         print("Restored baseline images and exact environment/reference settings. Job, identities, grants, container, results and reviews retained. Ingress remains disabled for an unsafe legacy baseline.")
 
 

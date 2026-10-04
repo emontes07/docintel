@@ -404,6 +404,48 @@ container-scoped Blob Data Contributor and registry-scoped AcrPull. One replica,
 Seeding refuses nonempty storage. Deployment checks intended healthy image revisions.
 Stop on drift or failure; inspect partial state rather than blindly repeating writes.
 
+#### Nonroot Backend Runtime Port
+
+Deployment uses the **already published image**, without rebuilding it or changing
+its Dockerfile/user/privileges. A successful Docker startup smoke does not prove
+that the restricted hosted runtime permits UID 10001 to bind port 80. The backend
+runtime explicitly overrides the image command with:
+
+```text
+command: ["/app/.venv/bin/fastapi"]
+args: ["run", "backend/main.py", "--port", "8080", "--host", "0.0.0.0"]
+```
+
+In one ARM PATCH, the release helper aligns this command, the backend's
+`API_PORT`/`NEXT_PUBLIC_API_PORT` self-references, existing port-80 HTTP/TCP probes,
+and ingress `targetPort` to **8080**. Probe paths, headers, thresholds and timing
+are preserved; unsupported probe ports fail closed. External HTTPS origins,
+frontend routing, TLS-only `allowInsecure: false`, traffic, CORS, domains and all
+other supported ingress settings remain unchanged. The image's nonroot user
+and API processing/upload default-off guards are not bypassed. Worker commands
+and settings are not changed.
+
+Fresh `capture` records exact ingress alongside containers. Existing
+`baseline.json` files are never rewritten. Before the first runtime correction,
+`runtime-baseline.json` is written once with the original baseline snapshot/raw
+hash, exact observed prior ingress, and prior intent/hash. An older snapshot
+without ingress can be supplemented only while the backend is still on port 80
+and matches its baseline or the exact recorded prior release intent. Missing
+history or unrelated container/ingress drift stops the operation.
+
+The old `*-intended.json` and `*-patch.json` files remain untouched. New
+`*-runtime-intended.json` records are immutable, and new PATCH bodies use
+content-addressed `*-patch-<hash>.json` files. Re-running `deploy` in the same work
+directory recognizes the exact recorded low-port attempt or converged high-port
+state, not arbitrary changes. A ready matching backend is not patched again;
+an unhealthy backend still prevents frontend deployment.
+
+Ingress write projection drops only known read-only fields `fqdn` and
+`targetPortHttpScheme`, rejects unknown fields, and preserves all other supported
+values. Pilot acceptance additionally checks the effective app and healthy
+revision commands, internal-port settings, probes, and HTTPS ingress against the
+nonroot-compatible runtime; an image-only health match is insufficient.
+
 If the operator cannot reach private Blob storage, deploy the authenticated backend
 first, then seed through its existing managed identity instead of granting the
 operator data access or opening the storage firewall:
@@ -758,11 +800,15 @@ python3.13 scripts/release.py rollback --config "$CFG" --work "$WORK" --approve 
 ```
 
 Rollback stops active executions and restores pinned images and exact environment/
-secret-reference settings. It retains the job, identity, roles, container, inputs,
+secret-reference settings, command, probes and captured ingress atomically per
+app. A low-port baseline restores **port 80 together with its baseline image**,
+never leaving ingress at 8080. The helper verifies the restored runtime/ingress
+configuration before reporting convergence. It retains the job, identity, roles, container, inputs,
 results, reviews and budgets. It refuses unrelated configuration drift.
 An unauthenticated legacy baseline cannot be restored publicly. Either establish a
 verified secure baseline or explicitly approve `--isolate-legacy-baseline`, which
 disables ingress before restoring old images and causes an outage. Never silently
+re-enable ingress while restoring that unsafe baseline. Never silently
 authorize isolation, delete nonempty storage, or reset evidence to force a retry.
 Sanitize logs before sharing; do not export signed URLs, bearer tokens, account
 labels, document content, or secrets. No deployment, provisioning, rollback, grants,

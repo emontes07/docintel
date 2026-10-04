@@ -15,7 +15,13 @@ spec.loader.exec_module(release)
 @pytest.fixture
 def container_read_response():
     return {"identity": {"type": "SystemAssigned"}, "properties": {
-        "configuration": {"registries": [{"server": "synthetic.azurecr.io", "passwordSecretRef": "acr-password"}]},
+        "configuration": {"registries": [{"server": "synthetic.azurecr.io", "passwordSecretRef": "acr-password"}], "ingress": {
+            "additionalPortMappings": None, "allowInsecure": False, "clientCertificateMode": None,
+            "corsPolicy": None, "customDomains": None, "exposedPort": 0, "external": True,
+            "fqdn": "synthetic.invalid", "ipSecurityRestrictions": None, "stickySessions": None,
+            "targetPort": 80, "targetPortHttpScheme": None,
+            "traffic": [{"latestRevision": True, "weight": 100}], "transport": "Auto",
+        }},
         "template": {"volumes": [{"name": "cache", "storageType": "EmptyDir"}], "containers": [{
             "name": "synthetic", "image": "synthetic.azurecr.io/old:tag", "imageType": "ContainerImage",
             "command": ["python"], "args": ["-m", "backend.main"],
@@ -36,7 +42,7 @@ def test_patch_projects_read_response_without_mutation(tmp_path, monkeypatch, co
     calls = []
     monkeypatch.setattr(release, "azure", lambda *arguments: calls.append(arguments))
     release.patch_app(config, kind, containers, tmp_path)
-    payload = json.loads((tmp_path / (kind + "-patch.json")).read_text())
+    payload = json.loads(next(tmp_path.glob(kind + "-patch-*.json")).read_text())
     expected = copy.deepcopy(containers)
     expected[0].pop("imageType")
     expected[0]["resources"].pop("ephemeralStorage")
@@ -60,7 +66,7 @@ def test_deploy_and_rollback_use_write_projection(tmp_path, monkeypatch, contain
     from argparse import Namespace
     config = {"backend": "backend", "frontend": "frontend", "subscription": "synthetic", "group": "synthetic", "registry": "synthetic", "backend_image": "synthetic.azurecr.io/docintel/backend@sha256:" + "a" * 64, "frontend_image": "synthetic.azurecr.io/docintel/frontend@sha256:" + "b" * 64, "storage": "synthetic", "container": "batches", "tenant": "tenant", "api_client_id": "api", "frontend_client_id": "frontend", "frontend_origin": "https://portal.invalid", "backend_origin": "https://backend.invalid", "auth_secret_ref": "auth-reference", "entra_secret_ref": "entra-reference"}
     original = release.safe_containers(container_read_response)
-    baseline = {"target": release.fingerprint(config), "authenticated": False, "apps": {kind: {"containers": original, "pinned_image": "synthetic.azurecr.io/old@sha256:" + "c" * 64} for kind in ("backend", "frontend")}}
+    baseline = {"target": release.fingerprint(config), "authenticated": False, "apps": {kind: {"containers": original, "ingress": copy.deepcopy(container_read_response["properties"]["configuration"]["ingress"]), "pinned_image": "synthetic.azurecr.io/old@sha256:" + "c" * 64} for kind in ("backend", "frontend")}}
     release.save(tmp_path / "baseline.json", baseline)
     resources = {kind: copy.deepcopy(container_read_response) for kind in ("backend", "frontend")}
     for kind, resource in resources.items():
@@ -69,6 +75,7 @@ def test_deploy_and_rollback_use_write_projection(tmp_path, monkeypatch, contain
         if action == "rollback":
             intended = release.desired_containers(config, kind, original)
             resource["properties"]["template"]["containers"] = intended
+            resource["properties"]["configuration"]["ingress"] = release.desired_ingress(kind, baseline["apps"][kind]["ingress"])
             release.save(tmp_path / (kind + "-intended.json"), intended)
     before = copy.deepcopy(resources)
     calls = []
@@ -79,13 +86,14 @@ def test_deploy_and_rollback_use_write_projection(tmp_path, monkeypatch, contain
             assert arguments[arguments.index("--method") + 1] == "PATCH"
             assert arguments[arguments.index("--url") + 1].endswith("?api-version=2024-03-01")
             path = Path(arguments[arguments.index("--body") + 1][1:])
-            kind = path.name.removesuffix("-patch.json")
+            kind = path.name.split("-patch-")[0]
             payload = json.loads(path.read_text())
             payloads[kind] = payload
             assert set(payload) == {"properties"}
-            assert set(payload["properties"]) == {"template"}
+            assert set(payload["properties"]) == {"template", "configuration"}
             assert set(payload["properties"]["template"]) == {"containers"}
             resources[kind]["properties"]["template"]["containers"] = payload["properties"]["template"]["containers"]
+            resources[kind]["properties"]["configuration"]["ingress"] = payload["properties"]["configuration"]["ingress"]
         elif arguments[:3] == ("containerapp", "revision", "show"):
             kind = arguments[arguments.index("-n") + 1]
             return {"properties": {"healthState": "Healthy", "template": resources[kind]["properties"]["template"]}}
@@ -106,7 +114,8 @@ def test_deploy_and_rollback_use_write_projection(tmp_path, monkeypatch, contain
         expected[0]["resources"].pop("ephemeralStorage")
         assert payload["properties"]["template"]["containers"] == expected
         assert resources[kind]["identity"] == before[kind]["identity"]
-        assert resources[kind]["properties"]["configuration"] == before[kind]["properties"]["configuration"]
+        assert {key: value for key, value in resources[kind]["properties"]["configuration"].items() if key != "ingress"} == {key: value for key, value in before[kind]["properties"]["configuration"].items() if key != "ingress"}
+        assert payload["properties"]["configuration"]["ingress"] == (release.desired_ingress(kind, baseline["apps"][kind]["ingress"]) if action == "deploy" else None)
         assert resources[kind]["properties"]["template"]["volumes"] == before[kind]["properties"]["template"]["volumes"]
     if action == "rollback":
         assert calls[0] == ("stop",)
@@ -1381,17 +1390,24 @@ def test_rollback_restores_configuration_without_deleting_resources(tmp_path, mo
     config = {"backend": "backend", "frontend": "frontend", "subscription": "subscription", "group": "group"}
     original = [{"image": "old:tag", "env": [{"name": "AUTH_SECRET", "secretRef": "retained-old-reference"}, {"name": "SETTING", "value": "old"}]}]
     current = [{"image": "new@sha256:digest", "env": [{"name": "AUTH_SECRET", "secretRef": "new-reference"}]}]
-    baseline = {"target": release.fingerprint(config), "authenticated": False, "apps": {kind: {"containers": original, "pinned_image": "old@sha256:digest"} for kind in ("backend", "frontend")}}
+    ingress = {"targetPort": 80, "allowInsecure": False}
+    baseline = {"target": release.fingerprint(config), "authenticated": False, "apps": {kind: {"containers": original, "ingress": ingress, "pinned_image": "old@sha256:digest"} for kind in ("backend", "frontend")}}
     release.save(tmp_path / "baseline.json", baseline)
     for kind in ("backend", "frontend"):
         release.save(tmp_path / (kind + "-intended.json"), current)
     monkeypatch.setattr(release, "load_config", lambda _: config)
     monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
-    monkeypatch.setattr(release, "app", lambda *args: {"properties": {"template": {"containers": current}}})
+    monkeypatch.setattr(release, "desired_containers", lambda *args, **kwargs: current)
+    state = {kind: {"properties": {"template": {"containers": copy.deepcopy(current)}, "configuration": {"ingress": release.desired_ingress(kind, ingress)}}} for kind in ("backend", "frontend")}
+    monkeypatch.setattr(release, "app", lambda _, kind: state[kind])
     actions = []
     monkeypatch.setattr(release, "stop", lambda _: actions.append("stop"))
     monkeypatch.setattr(release, "azure", lambda *args: actions.append(args))
-    monkeypatch.setattr(release, "patch_app", lambda config, kind, containers, work: actions.append((kind, containers)))
+    def patch(config, kind, containers, work, *, ingress):
+        actions.append((kind, containers))
+        state[kind]["properties"]["template"]["containers"] = copy.deepcopy(containers)
+        state[kind]["properties"]["configuration"]["ingress"] = ingress
+    monkeypatch.setattr(release, "patch_app", patch)
     options = Namespace(work=tmp_path, config=None, action="rollback", approve="rollback", isolate_legacy_baseline=False)
     with pytest.raises(ValueError, match="never restore it publicly"):
         release.run(options)
@@ -1421,21 +1437,24 @@ def test_deploy_resumes_without_repatching_ready_backend(tmp_path, monkeypatch, 
     from argparse import Namespace
     config = {"backend": "backend", "frontend": "frontend", "subscription": "subscription", "group": "group", "auth_secret_ref": "auth-ref", "entra_secret_ref": "entra-ref"}
     original = [{"image": "old", "env": []}]
-    desired = [{"image": "new", "env": []}]
-    release.save(tmp_path / "baseline.json", {"target": release.fingerprint(config), "apps": {kind: {"containers": original} for kind in ("backend", "frontend")}})
+    desired = [{"image": "new", "command": release.BACKEND_COMMAND, "args": release.BACKEND_ARGUMENTS, "env": [{"name": name, "value": "8080"} for name in ("API_PORT", "NEXT_PUBLIC_API_PORT")]}]
+    ingress = {"targetPort": 80, "allowInsecure": False}
+    release.save(tmp_path / "baseline.json", {"target": release.fingerprint(config), "apps": {kind: {"containers": original, "ingress": ingress} for kind in ("backend", "frontend")}})
     state = {"backend": desired, "frontend": original}
+    ingress_state = {kind: release.desired_ingress(kind, ingress) for kind in ("backend", "frontend")}
     mutations = []
     monkeypatch.setattr(release, "load_config", lambda _: config)
     monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
     monkeypatch.setattr(release, "require_release_images", lambda *args: None)
     monkeypatch.setattr(release, "identity_contract", lambda _: None)
-    monkeypatch.setattr(release, "desired_containers", lambda *args: desired)
+    monkeypatch.setattr(release, "desired_containers", lambda *args, **kwargs: desired)
     monkeypatch.setattr(release, "azure", lambda *args: {"properties": {"healthState": "Healthy", "template": {"containers": desired}}})
     def resource(config, kind):
-        return {"properties": {"provisioningState": "Succeeded" if ready else "Updating", "template": {"containers": state[kind]}, "configuration": {"secrets": [{"name": "auth-ref"}, {"name": "entra-ref"}]}, "latestRevisionName": "ready", "latestReadyRevisionName": "ready"}}
-    def patch(config, kind, containers, work):
+        return {"properties": {"provisioningState": "Succeeded" if ready else "Updating", "template": {"containers": state[kind]}, "configuration": {"secrets": [{"name": "auth-ref"}, {"name": "entra-ref"}], "ingress": ingress_state[kind]}, "latestRevisionName": "ready", "latestReadyRevisionName": "ready"}}
+    def patch(config, kind, containers, work, *, ingress):
         mutations.append(kind)
         state[kind] = containers
+        ingress_state[kind] = ingress
     monkeypatch.setattr(release, "app", resource)
     monkeypatch.setattr(release, "patch_app", patch)
     options = Namespace(work=tmp_path, config=None, action="deploy", approve="deploy")
@@ -1446,6 +1465,160 @@ def test_deploy_resumes_without_repatching_ready_backend(tmp_path, monkeypatch, 
         with pytest.raises(ValueError, match="not ready"):
             release.run(options)
         assert not mutations
+
+
+@pytest.fixture
+def runtime_release(tmp_path, monkeypatch, container_read_response, pilot_release):
+    from types import SimpleNamespace
+    config = pilot_release.config
+    work = tmp_path / "runtime"
+    resources = {kind: copy.deepcopy(container_read_response) for kind in ("backend", "frontend")}
+    originals = {}
+    for kind, resource in resources.items():
+        container = resource["properties"]["template"]["containers"][0]
+        container["image"] = "synthetic.azurecr.io/docintel/" + kind + "@sha256:" + "c" * 64
+        if kind == "backend":
+            container.pop("command")
+            container.pop("args")
+            container["env"].extend({"name": name, "value": value} for name, value in {
+                "API_PORT": "80", "NEXT_PUBLIC_API_PORT": "80",
+                "DOCINTEL_REAL_PILOT_ENABLED": "false", "DOCINTEL_PILOT_UPLOAD_ENABLED": "false",
+            }.items())
+            container["probes"].append({"type": "Startup", "httpGet": None, "tcpSocket": {"port": 80}, "failureThreshold": 30})
+        else:
+            container["probes"][0]["httpGet"]["port"] = 3000
+            resource["properties"]["configuration"]["ingress"]["targetPort"] = 3000
+        originals[kind] = copy.deepcopy(resource["properties"]["template"]["containers"])
+        resource["properties"].update(provisioningState="Succeeded", latestRevisionName="ready", latestReadyRevisionName="ready")
+        resource["properties"]["configuration"]["secrets"] = [{"name": config[name]} for name in ("auth_secret_ref", "entra_secret_ref")]
+    baseline = {"target": release.fingerprint(config), "authenticated": True, "apps": {kind: {"containers": original, "pinned_image": original[0]["image"]} for kind, original in originals.items()}}
+    release.save(work / "baseline.json", baseline)
+    prior = release.desired_containers(config, "backend", originals["backend"], runtime=False)
+    release.save(work / "backend-intended.json", prior)
+    release.save(work / "backend-patch.json", {"properties": {"template": {"containers": release.writable_containers(prior)}}})
+    resources["backend"]["properties"]["template"]["containers"] = copy.deepcopy(prior)
+    resources["backend"]["properties"]["latestRevisionName"] = "failed-low-port"
+    state = SimpleNamespace(config=config, work=work, resources=resources, originals=originals, baseline=baseline, calls=[], healthy=True)
+
+    def azure(*arguments, **kwargs):
+        if arguments[:3] == ("containerapp", "revision", "show"):
+            kind = arguments[arguments.index("-n") + 1]
+            return {"properties": {"healthState": "Healthy" if state.healthy else "Unhealthy", "template": copy.deepcopy(resources[kind]["properties"]["template"])}}
+        assert arguments[:3] == ("rest", "--method", "PATCH")
+        kind = arguments[arguments.index("--url") + 1].split("/containerApps/")[1].split("?")[0]
+        path = Path(arguments[arguments.index("--body") + 1][1:])
+        payload = release.private_json(path)
+        state.calls.append((kind, payload, path))
+        resources[kind]["properties"]["template"]["containers"] = copy.deepcopy(payload["properties"]["template"]["containers"])
+        ingress = payload["properties"]["configuration"]["ingress"]
+        resources[kind]["properties"]["configuration"]["ingress"] = {**container_read_response["properties"]["configuration"]["ingress"], **ingress} if ingress is not None else None
+        resources[kind]["properties"].update(latestRevisionName="high-port-ready", latestReadyRevisionName="high-port-ready")
+        return resources[kind]
+
+    monkeypatch.setattr(release, "load_config", lambda _: config)
+    monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
+    monkeypatch.setattr(release, "require_release_images", lambda *args: None)
+    monkeypatch.setattr(release, "identity_contract", lambda _: None)
+    monkeypatch.setattr(release, "app", lambda _, kind: copy.deepcopy(resources[kind]))
+    monkeypatch.setattr(release, "azure", azure)
+    monkeypatch.setattr(release, "stop", lambda _: None)
+    return state
+
+
+def test_runtime_port_correction_is_atomic_preserves_receipts_and_rolls_back(runtime_release):
+    from argparse import Namespace
+    state = runtime_release
+    original_bytes = {name: (state.work / name).read_bytes() for name in ("baseline.json", "backend-intended.json", "backend-patch.json")}
+    original_ingress = {kind: copy.deepcopy(resource["properties"]["configuration"]["ingress"]) for kind, resource in state.resources.items()}
+    options = Namespace(action="deploy", approve="deploy", work=state.work, config=None)
+    release.run(options)
+    assert [kind for kind, _, _ in state.calls] == ["backend", "frontend"]
+    backend = state.calls[0][1]
+    container = backend["properties"]["template"]["containers"][0]
+    assert container["command"] == ["/app/.venv/bin/fastapi"]
+    assert container["args"] == ["run", "backend/main.py", "--port", "8080", "--host", "0.0.0.0"]
+    assert {name: release.environment_entries(container)[name]["value"] for name in ("API_PORT", "NEXT_PUBLIC_API_PORT")} == {"API_PORT": "8080", "NEXT_PUBLIC_API_PORT": "8080"}
+    assert container["probes"][0]["httpGet"]["port"] == container["probes"][1]["tcpSocket"]["port"] == 8080
+    assert container["probes"][0]["httpGet"]["httpHeaders"] == state.originals["backend"][0]["probes"][0]["httpGet"]["httpHeaders"]
+    assert container["probes"][1]["failureThreshold"] == 30
+    assert release.environment_entries(container)["DOCINTEL_REAL_PILOT_ENABLED"]["value"] == "false"
+    assert release.environment_entries(container)["DOCINTEL_PILOT_UPLOAD_ENABLED"]["value"] == "false"
+    expected_ingress = release.writable_ingress(original_ingress["backend"])
+    expected_ingress["targetPort"] = 8080
+    assert backend["properties"]["configuration"]["ingress"] == expected_ingress
+    assert "fqdn" not in expected_ingress and "targetPortHttpScheme" not in expected_ingress
+    assert state.calls[1][1]["properties"]["configuration"]["ingress"] == release.writable_ingress(original_ingress["frontend"])
+    snapshot = release.private_json(state.work / "runtime-baseline.json")
+    assert snapshot["baseline"] == state.baseline
+    assert snapshot["baseline_sha256"] == hashlib.sha256(original_bytes["baseline.json"]).hexdigest()
+    assert snapshot["apps"]["backend"]["ingress"] == original_ingress["backend"]
+    assert all((state.work / name).read_bytes() == value for name, value in original_bytes.items())
+    snapshot_bytes = (state.work / "runtime-baseline.json").read_bytes()
+    release.run(options)
+    assert len(state.calls) == 2
+    assert (state.work / "runtime-baseline.json").read_bytes() == snapshot_bytes
+    options.action = options.approve = "rollback"
+    options.isolate_legacy_baseline = False
+    release.run(options)
+    restored = state.calls[2][1]
+    assert restored["properties"]["template"]["containers"] == release.writable_containers(state.originals["backend"])
+    assert restored["properties"]["configuration"]["ingress"] == release.writable_ingress(original_ingress["backend"])
+    assert restored["properties"]["configuration"]["ingress"]["targetPort"] == 80
+    assert state.calls[0][2] != state.calls[2][2]
+    assert all((state.work / name).read_bytes() == value for name, value in original_bytes.items())
+
+
+@pytest.mark.parametrize("defect", ["unrecorded", "changed_env", "changed_command", "changed_intent", "unknown_ingress"])
+def test_runtime_continuation_rejects_unrelated_drift(runtime_release, defect):
+    from argparse import Namespace
+    state = runtime_release
+    container = state.resources["backend"]["properties"]["template"]["containers"][0]
+    if defect == "unrecorded":
+        (state.work / "backend-intended.json").unlink()
+    elif defect == "changed_env":
+        container["env"].append({"name": "UNRELATED", "value": "drift"})
+    elif defect == "changed_command":
+        container["command"] = ["/unrelated/command"]
+    elif defect == "changed_intent":
+        release.save(state.work / "backend-intended.json", [{"image": "unrelated"}])
+    else:
+        state.resources["backend"]["properties"]["configuration"]["ingress"]["futureUnknown"] = True
+    with pytest.raises(ValueError):
+        release.run(Namespace(action="deploy", approve="deploy", work=state.work, config=None))
+    assert not state.calls
+
+
+@pytest.mark.parametrize("field", ["allowInsecure", "transport", "targetPort"])
+def test_runtime_resume_rejects_ingress_drift_after_snapshot(runtime_release, field):
+    from argparse import Namespace
+    state = runtime_release
+    options = Namespace(action="deploy", approve="deploy", work=state.work, config=None)
+    release.run(options)
+    count = len(state.calls)
+    state.resources["backend"]["properties"]["configuration"]["ingress"][field] = {"allowInsecure": True, "transport": "tcp", "targetPort": 80}[field]
+    with pytest.raises(ValueError, match="drift"):
+        release.run(options)
+    assert len(state.calls) == count
+
+
+def test_runtime_unhealthy_backend_does_not_patch_frontend(runtime_release):
+    from argparse import Namespace
+    state = runtime_release
+    state.healthy = False
+    with pytest.raises(ValueError, match="not healthy"):
+        release.run(Namespace(action="deploy", approve="deploy", work=state.work, config=None))
+    assert [kind for kind, _, _ in state.calls] == ["backend"]
+
+
+def test_fresh_capture_includes_exact_ingress(runtime_release):
+    from argparse import Namespace
+    state = runtime_release
+    (state.work / "baseline.json").unlink()
+    release.run(Namespace(action="capture", work=state.work, config=None))
+    captured = release.private_json(state.work / "baseline.json")
+    for kind in ("backend", "frontend"):
+        assert captured["apps"][kind]["ingress"] == state.resources[kind]["properties"]["configuration"]["ingress"]
+    assert not state.calls
 
 
 @pytest.fixture
@@ -1505,7 +1678,7 @@ def pilot_release(tmp_path, monkeypatch):
             "identity": {"type": "SystemAssigned", "principalId": approval["identities"]["api_principal_id"]},
             "properties": {
                 "provisioningState": "Succeeded", "latestRevisionName": "ready", "latestReadyRevisionName": "ready",
-                "configuration": {"ingress": {"external": True}, "secrets": [{"name": "existing-web-key"}]},
+                "configuration": {"ingress": {"external": True, "allowInsecure": False, "targetPort": 8080 if kind == "backend" else 3000}, "secrets": [{"name": "existing-web-key"}]},
                 "template": {"containers": containers, "volumes": [{"name": "retained"}]},
             },
         }
@@ -1748,6 +1921,56 @@ def test_pilot_requires_healthy_actual_published_revision(pilot_release, monkeyp
     with pytest.raises(ValueError, match="not healthy"):
         enable_test_pilot(state)
     assert not state.calls and not state.console_calls
+
+
+@pytest.mark.parametrize("surface", ["app", "revision"])
+@pytest.mark.parametrize("defect", ["command", "args", "probe", "port_env"])
+def test_pilot_acceptance_requires_effective_nonroot_high_port_runtime(pilot_release, monkeypatch, surface, defect):
+    state = pilot_release
+
+    def change(container):
+        if defect == "command":
+            container.pop("command")
+        elif defect == "args":
+            container["args"] = ["run", "backend/main.py", "--port", "80"]
+        elif defect == "probe":
+            container["probes"] = [{"type": "Readiness", "httpGet": {"path": "/health", "port": 80}}]
+        else:
+            next(entry for entry in container["env"] if entry["name"] == "API_PORT")["value"] = "80"
+
+    if surface == "app":
+        change(state.resources["backend"]["properties"]["template"]["containers"][0])
+    else:
+        azure = release.azure
+
+        def altered(*args):
+            result = azure(*args)
+            if args[:3] == ("containerapp", "revision", "show") and args[args.index("-n") + 1] == "backend":
+                change(result["properties"]["template"]["containers"][0])
+            return result
+
+        monkeypatch.setattr(release, "azure", altered)
+    with pytest.raises(ValueError):
+        release.require_pilot_acceptance(state.config, state.work)
+    assert not state.calls and not state.console_calls
+
+
+@pytest.mark.parametrize("field,value", [("targetPort", 80), ("allowInsecure", True), ("unknownField", "drift")])
+def test_pilot_acceptance_requires_matching_https_ingress(pilot_release, field, value):
+    state = pilot_release
+    state.resources["backend"]["properties"]["configuration"]["ingress"][field] = value
+    with pytest.raises(ValueError):
+        release.require_pilot_acceptance(state.config, state.work)
+    assert not state.calls and not state.console_calls
+
+
+def test_backend_runtime_command_is_accepted_by_installed_fastapi_cli():
+    from fastapi_cli.cli import app
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(app, [*release.BACKEND_ARGUMENTS, "--help"])
+    assert result.exit_code == 0, result.output
+    assert "--port" in result.output and "--host" in result.output
 
 
 @pytest.mark.parametrize("defect", ["active", "retry", "timeout", "replicas", "container", "image", "identity", "storage"])
