@@ -1,7 +1,10 @@
+import copy
 import hashlib
 import json
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,7 +12,10 @@ import pytest
 
 from backend.batch import BatchService
 from backend.batch_store import Conflict, Missing, SQLiteStore, read_json, write_json
-from backend.batch_worker import RealBatchProcessor, run_batch
+from backend.batch_worker import (
+    COMPACT_PROMPT_FORMAT, COMPACT_PROMPT_INSTRUCTIONS, RealBatchProcessor,
+    compact_inference_prompt, run_batch,
+)
 from backend.core.docintel import ParsedDocument, ParsedParagraph
 from backend.core.llm import LLM_API_VERSION
 from backend.models.enrichment import AttributeDefinition, Candidate, ExtractionResponse, Manifest, ProductKey
@@ -166,7 +172,7 @@ def install_services(monkeypatch):
             calls.append((payload, kwargs))
             candidates = []
             for attribute in payload["attributes"]:
-                for evidence in payload["evidence"]:
+                for evidence in model_evidence(payload):
                     for part in evidence["text"].split("; "):
                         if part.startswith(attribute["attribute_id"] + ": "):
                             candidates.append(Candidate(
@@ -238,7 +244,7 @@ def test_real_worker_default_off_never_calls_service(configured, monkeypatch, ex
 
 
 @pytest.mark.parametrize("execution_scope", ["full", "internal_only"])
-def test_real_worker_budget_failure_stops_before_later_paid_work(configured, monkeypatch, execution_scope):
+def test_real_worker_budget_denial_preserves_independently_authorized_sources(configured, monkeypatch, execution_scope):
     store, record, approval = configured
     analyses, queries, _, calls = install_services(monkeypatch)
     if execution_scope == "internal_only":
@@ -246,10 +252,33 @@ def test_real_worker_budget_failure_stops_before_later_paid_work(configured, mon
     approval["limits"]["analysis"] = 0
     _, version = read_json(store, "configuration/real-pilot-approval.json")
     write_json(store, "configuration/real-pilot-approval.json", approval, version)
-    from backend.extract import ExecutionConfigurationError
-    with pytest.raises(ExecutionConfigurationError):
-        run_batch(store, record["id"], concurrency=1, item_limit=1)
-    assert not analyses and not queries and not calls
+    run_batch(store, record["id"], concurrency=1, item_limit=1)
+    assert not analyses
+    detail = BatchService(store).detail(record["id"], "row-2", record["owner"])
+    assert detail["state"] == "unresolved"
+    assert any(entry.get("error") == "budget_exhausted" for entry in detail["provenance"])
+    assert detail["consumption"]["attempted"]["analysis"] == 0
+    if execution_scope == "internal_only":
+        assert not queries and not calls
+    else:
+        assert len(queries) == len(calls) == 1
+        assert detail["machine_result"]["attributes"][1]["status"] == "proposed"
+
+
+def test_web_fetch_budget_denial_preserves_internal_result_and_safe_details(configured, monkeypatch):
+    store, record, approval = configured
+    _, queries, pages, calls = install_services(monkeypatch)
+    approval["limits"]["web_retrieval"] = 0
+    _, version = read_json(store, "configuration/real-pilot-approval.json")
+    write_json(store, "configuration/real-pilot-approval.json", approval, version)
+    run_batch(store, record["id"], concurrency=1, item_limit=1)
+    detail = BatchService(store).detail(record["id"], "row-2", record["owner"])
+    assert detail["machine_result"]["attributes"][0]["status"] == "proposed"
+    error = detail["provenance"][1]["page_errors"][0]
+    assert error["error"] == "budget_exhausted"
+    assert (error["budget"], error["requested"], error["remaining"]) == ("web_retrieval", 1, 0)
+    assert len(queries) == len(calls) == 1 and not pages
+    assert detail["consumption"]["attempted"]["web_retrieval"] == 0
 
 
 def test_source_failure_preserves_external_proposals(configured, monkeypatch):
@@ -357,7 +386,7 @@ def test_vendor_rows_supplement_pdf_before_web_without_variant_leakage(configure
     class TableLLM(original_llm):
         def complete_structured(self, system, user, schema, **kwargs):
             payload = json.loads(user)
-            evidence = next((entry for entry in payload["evidence"] if entry["source_tier"] == "vendor_table"), None)
+            evidence = next((entry for entry in model_evidence(payload) if entry["source_tier"] == "vendor_table"), None)
             if evidence:
                 calls.append((payload, kwargs))
                 assert "wrong-variant" not in evidence["text"]
@@ -485,17 +514,17 @@ def test_gpt5_request_parameters_are_bound_to_cache_identity(configured, monkeyp
     completion = processor.completion(item)
     completion.complete_structured(system, user, ExtractionResponse)
     completion.complete_structured(system, user, ExtractionResponse)
-    assert len(calls) == (1 if deployment == "gpt-5" else 0)
+    assert len(calls) == 1
     assert processor.inference_provenance[-1]["method"] == "compatible_response_cache"
     cached = [path for path in store.keys("real-inferences/") if path != old_key]
+    assert len(cached) == 1
+    cached_response = read_json(store, cached[0])[0]
+    assert cached_response["prompt_format"] == COMPACT_PROMPT_FORMAT
+    expected = {"max_completion_tokens": 2048}
     if deployment == "gpt-5":
-        assert len(cached) == 1
-        assert read_json(store, cached[0])[0]["request_parameters"] == {
-            "max_completion_tokens": 2048, "reasoning_effort": "minimal",
-        }
-        assert guard.metadata()["attempted"]["inference"] == 1
-    else:
-        assert not cached and guard.metadata()["attempted"]["inference"] == 0
+        expected["reasoning_effort"] = "minimal"
+    assert cached_response["request_parameters"] == expected
+    assert guard.metadata()["attempted"]["inference"] == 1
 
 
 def test_webiq_contribution_requires_independent_original_evidence(configured, monkeypatch):
@@ -545,3 +574,232 @@ def test_discovery_failure_keeps_independently_supported_reference(configured, m
     assert detail["provenance"][1]["discovery_error"] == "provider_error"
     assert detail["state"] == "unresolved"
     assert len(pages) == 1 and len(calls) == 2
+
+
+def model_evidence(payload):
+    assert payload["evidence_columns"] == ["evidence_id", "group", "text_index", "location"]
+    return [
+        {**payload["evidence_groups"][group], "evidence_id": reference, "text": payload["evidence_texts"][text_index]}
+        for reference, group, text_index, _ in payload["evidence"]
+    ]
+
+
+def expand_prompt_evidence(payload):
+    expanded = []
+    for _, group, text_index, location in payload["evidence"]:
+        shared = dict(payload["evidence_groups"][group])
+        id_prefix = shared.pop("evidence_id_prefix")
+        locator_prefix = shared.pop("source_locator_prefix")
+        id_suffix, locator_suffix = (location, location) if isinstance(location, str) else location
+        expanded.append({
+            **shared, "text": payload["evidence_texts"][text_index],
+            "evidence_id": id_prefix + id_suffix, "source_locator": locator_prefix + locator_suffix,
+        })
+    return sorted(expanded, key=lambda entry: entry["evidence_id"])
+
+
+def test_compact_prompt_is_lossless_and_never_merges_different_applicability(configured):
+    from backend.extract import source_evidence
+    from backend.models.enrichment import OfflineSource
+
+    _, record, _ = configured
+    product = ProductKey.model_validate(record["items"][0]["manifest"]["product"])
+    stamp = datetime.now(timezone.utc)
+    document = ParsedDocument(
+        source="batchblob:///documents/synthetic.pdf", cache_key="sha256:" + "e" * 64, parsed_at=stamp,
+        paragraphs=[ParsedParagraph(text="Body Material: brass", page_number=1) for _ in range(79)],
+    )
+    source = OfflineSource(
+        source_id="pdf", product=product, document=document, attribute_ids=["Body Material"],
+        qualification="Applicable only to this product. " * 100, provider_retrieved_at=stamp,
+    )
+    entries = [entry.model_dump(mode="json") for entry in source_evidence(source, stamp)]
+    distinct = copy.deepcopy(entries[0])
+    distinct.update(evidence_id="another-id", source_locator="opaque:another/location",
+                    attribute_ids=["Outlet"], qualification="Different attribute applicability.")
+    entries.append(distinct)
+    original = {"product": product.model_dump(), "attributes": record["items"][0]["manifest"]["attributes"], "evidence": entries}
+    prompt, references = compact_inference_prompt(json.dumps(original))
+    projected = json.loads(prompt)
+    assert len(json.dumps(original).encode()) > 200000
+    assert len(prompt.encode()) < 12000
+    assert projected["product"] == original["product"] and projected["attributes"] == original["attributes"]
+    assert len(projected["evidence_groups"]) == 2
+    assert len(projected["evidence"]) == 80
+    assert len(projected["evidence_texts"]) == 1
+    assert expand_prompt_evidence(projected) == sorted(entries, key=lambda entry: entry["evidence_id"])
+    assert sorted(references.values()) == sorted(entry["evidence_id"] for entry in entries)
+    assert references["E1"] == entries[0]["evidence_id"]
+    assert entries[0]["evidence_id"] != "E1"
+
+
+def test_compact_response_rejects_unknown_citation_without_retry(configured, monkeypatch):
+    store, record, _ = configured
+    install_services(monkeypatch)
+    internal_only(configured, monkeypatch)
+    client = Mock()
+    client.sync_client.with_options.return_value = client.sync_client
+    client.last_usage = {"input_tokens": 10, "output_tokens": 10}
+    client.complete_structured.return_value = ExtractionResponse(candidates=[Candidate(
+        attribute_id="Body Material", value="brass", evidence_ids=["invented-reference"],
+        supporting_quote="Body Material: brass", qualification="Exact product.",
+    )])
+    monkeypatch.setattr("backend.batch_worker.LLMClient", Mock(return_value=client))
+    run_batch(store, record["id"], concurrency=1, item_limit=1)
+    detail = BatchService(store).detail(record["id"], "row-2", record["owner"])
+    assert detail["machine_result"]["extraction_error"] == "invalid_response"
+    assert all(not attribute["candidates"] for attribute in detail["machine_result"]["attributes"])
+    assert detail["consumption"]["attempted"]["inference"] == 1
+    assert detail["consumption"]["actual_usage"]["input_tokens"] == 10
+    assert not store.keys("real-inferences/")
+    run_batch(store, record["id"], concurrency=1, item_limit=1)
+    client.complete_structured.assert_called_once()
+
+
+def test_compact_citation_selects_only_one_original_location(configured, monkeypatch):
+    store, record, _ = configured
+    install_services(monkeypatch)
+    internal_only(configured, monkeypatch)
+
+    class Parser:
+        def __init__(self, **kwargs):
+            pass
+
+        def extract_pdf_bytes(self, content, *, source, page_limit):
+            text = "Synthetic PART-001; Body Material: brass"
+            return ParsedDocument(
+                source=source, cache_key="sha256:" + hashlib.sha256(content).hexdigest(),
+                parsed_at=datetime.now(timezone.utc), raw_text=text,
+                paragraphs=[ParsedParagraph(text=text, page_number=1) for _ in range(2)],
+            )
+
+    client = Mock()
+    client.sync_client.with_options.return_value = client.sync_client
+    client.last_usage = {"input_tokens": 10, "output_tokens": 10}
+    client.complete_structured.return_value = ExtractionResponse(candidates=[Candidate(
+        attribute_id="Body Material", value="brass", evidence_ids=["E2"],
+        supporting_quote="Body Material: brass", qualification="Exact product.",
+    )])
+    monkeypatch.setattr("backend.batch_worker.DocumentIntelligenceService", Parser)
+    monkeypatch.setattr("backend.batch_worker.LLMClient", Mock(return_value=client))
+    run_batch(store, record["id"], concurrency=1, item_limit=1)
+    result = BatchService(store).detail(record["id"], "row-2", record["owner"])["machine_result"]
+    assert len(result["evidence"]) == 2
+    selected = result["evidence"][1]["evidence_id"]
+    assert result["attributes"][0]["candidates"][0]["evidence_ids"] == [selected]
+    assert selected.endswith("paragraph=1")
+    cached, _ = read_json(store, store.keys("real-inferences/")[0])
+    assert cached["response"]["candidates"][0]["evidence_ids"] == [selected]
+
+
+def two_items(configured):
+    store, record, approval = configured
+    second = copy.deepcopy(record["items"][0])
+    second.update(item_key="row-3", row=3)
+    second["manifest"]["product"].update(item_id="002", mpn="PART-002")
+    second["original"].update({"PIMITEM Number": "002", "MPN": "PART-002"})
+    content = b"%PDF-1.7 another synthetic\n%%EOF"
+    for binding in second["sources"]:
+        binding["products"] = [second["manifest"]["product"]]
+        binding["applicability"][0]["product"] = second["manifest"]["product"]
+        binding["applicability"][0]["identity_terms"] = ["Synthetic", "PART-002"]
+        if binding["format"] == "pdf":
+            binding.update(blob="documents/second.pdf", sha256=hashlib.sha256(content).hexdigest())
+    record["items"].append(second)
+    record["product_count"] = approval["limits"]["products"] = 2
+    approval["batch_sha256"] = binding_digest(record)
+    for path, value in [(f"batches/{record['id']}.json", record), ("configuration/real-pilot-approval.json", approval)]:
+        _, version = read_json(store, path)
+        write_json(store, path, value, version)
+    store.write_bytes("documents/second.pdf", content)
+
+
+def test_oversized_prompt_is_visible_and_does_not_abort_independent_item(configured, monkeypatch):
+    store, record, _ = configured
+    analyses, _, _, calls = install_services(monkeypatch)
+    two_items(configured)
+    internal_only(configured, monkeypatch)
+
+    class Parser:
+        def __init__(self, **kwargs):
+            pass
+
+        def extract_pdf_bytes(self, content, *, source, page_limit):
+            analyses.append(source)
+            text = "Synthetic PART-002; Body Material: brass" if source.endswith("second.pdf") else "Synthetic PART-001 " + "X" * 200000
+            return ParsedDocument(
+                source=source, cache_key="sha256:" + hashlib.sha256(content).hexdigest(),
+                parsed_at=datetime.now(timezone.utc), raw_text=text,
+                paragraphs=[ParsedParagraph(text=text, page_number=1)],
+            )
+
+    monkeypatch.setattr("backend.batch_worker.DocumentIntelligenceService", Parser)
+    run_batch(store, record["id"], concurrency=1, item_limit=2)
+    first = BatchService(store).detail(record["id"], "row-2", record["owner"])
+    second = BatchService(store).detail(record["id"], "row-3", record["owner"])
+    assert first["state"] == "unresolved"
+    assert first["machine_result"]["model_call_status"] == "not_attempted"
+    assert first["machine_result"]["skip_reason"] is None
+    assert first["machine_result"]["failure"]["exception_class"] == "RealPilotBudgetExceeded"
+    assert first["machine_result"]["failure"]["parameter"] == "input_tokens"
+    assert first["inference_provenance"][0]["new_model_call"] is False
+    assert first["inference_provenance"][0]["input_bound"] > 200000
+    assert second["machine_result"]["attributes"][0]["status"] == "proposed"
+    assert len(analyses) == 2 and len(calls) == 1
+    ledger, _ = read_json(store, "budgets/real-pilot.json")
+    assert ledger["attempted"]["inference"] == 1
+    assert read_json(store, f"batches/{record['id']}.json")[0]["state"] == "completed"
+
+
+def test_authorization_denial_remains_fatal_without_starting_next_item(configured, monkeypatch):
+    from backend.extract import ExecutionConfigurationError
+
+    store, record, _ = configured
+    two_items(configured)
+    internal_only(configured, monkeypatch)
+    denied = Mock(side_effect=ValueError("Approval invalidated"))
+    monkeypatch.setattr(RealPilotGuard, "reserve", denied)
+    with pytest.raises(ExecutionConfigurationError):
+        run_batch(store, record["id"], concurrency=1, item_limit=2)
+    denied.assert_called_once()
+    failed, _ = read_json(store, f"items/{record['id']}/row-2.json")
+    assert failed["state"] == "failed" and failed["finished_at"]
+    assert "No automatic retry" in failed["error"]
+    assert not store.keys(f"items/{record['id']}/row-3")
+
+
+def test_interrupted_item_is_not_retried_by_corrected_prompt(configured, monkeypatch):
+    store, record, _ = configured
+    internal_only(configured, monkeypatch)
+    write_json(store, f"items/{record['id']}/row-2.json", {"state": "running"})
+    processor = Mock(side_effect=AssertionError("Interrupted item must not run again"))
+    run_batch(store, record["id"], processor=processor, concurrency=1, item_limit=1)
+    processor.assert_not_called()
+    assert read_json(store, f"items/{record['id']}/row-2.json")[0]["state"] == "interrupted"
+    assert not store.keys("results/")
+
+
+def test_actual_private_four_product_prompt_bounds():
+    path = os.environ.get("DOCINTEL_TEST_PILOT_PROMPTS")
+    if not path:
+        pytest.skip("Requires private actual PDF/vendor prompt captures for all four products")
+    records = json.loads(Path(path).read_text())
+    assert len(records) == 8
+    assert len({record["item_key"] for record in records}) == 4
+    for item in {record["item_key"] for record in records}:
+        calls = [record for record in records if record["item_key"] == item]
+        assert len(calls) == 2
+        assert {frozenset(entry["source_tier"] for entry in record["user"]["evidence"])
+                for record in calls} == {frozenset({"internal_pdf"}), frozenset({"vendor_table"})}
+        assert calls[0]["user"]["attributes"] == calls[1]["user"]["attributes"]
+    total = 0
+    for record in records:
+        original = record["user"]
+        assert len(json.dumps(original).encode()) == record["original_user_bytes"]
+        compact, references = compact_inference_prompt(json.dumps(original))
+        projected = json.loads(compact)
+        assert expand_prompt_evidence(projected) == sorted(original["evidence"], key=lambda entry: entry["evidence_id"])
+        assert sorted(references.values()) == sorted(entry["evidence_id"] for entry in original["evidence"])
+        total += (len((record["system"] + COMPACT_PROMPT_INSTRUCTIONS).encode()) + len(compact.encode())
+                  + len(json.dumps(record["schema"]).encode()) + 4096)
+    assert total <= 200000

@@ -710,6 +710,29 @@ The cap still includes reasoning and visible output, so minimal effort is not a
 guarantee of a usable response; an empty/invalid response remains a counted,
 non-retried failed attempt.
 
+Real-pilot model requests use a lossless, versioned compact evidence projection.
+Shared source metadata, applicability and qualifications are grouped only when
+identical; repeated verbatim text is stored once. Every original excerpt retains
+its own selectable row and citation reference, even when its text is duplicated.
+Original evidence IDs and locations remain encoded by exact prefixes/suffixes;
+request-local citation references are expanded back to the selected original IDs
+before quote/applicability validation, caching or export.
+Stored evidence and approved inputs are not rewritten or truncated. The effective
+compact system/user/schema bytes plus the existing safety allowance still determine
+the conservative reservation; measured token usage never refunds that reservation.
+Verify the sum for every possible source-stage call across the actual selected
+products, not merely each individual prompt or synthetic fixtures.
+
+A capacity denial before reservation is reported as `RealPilotBudgetExceeded`,
+with the requested/remaining units and `new_model_call=false` provenance.
+It does not consume an inference attempt, masquerade as a model response, or abort
+independent eligible sources/items. Authorization, approval drift, expiry and
+duplicate-attempt failures remain fatal. Guard-stopped items retain a safe failure
+status when the storage lease permits writing it; no later real-pilot item starts
+after a fatal guard error. Interrupted items are never automatically
+resubmitted. Correcting a prompt does not reopen a closed activation, replenish
+executions or authorize another build.
+
 The existing PDF request still selects `pages="1-5"` with a 120-second polling
 bound. Offline SDK tests verify those arguments, not server handling when a PDF
 has fewer pages. No undocumented out-of-range acceptance is assumed and no

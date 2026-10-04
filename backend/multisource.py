@@ -65,7 +65,8 @@ def run_cascade(
                 target.status = "conflict" if len(values) > 1 else "proposed"
             elif current.status in {"retrieval_failed", "extraction_failed"}:
                 target.status = current.status
-    status = "failed" if "failed" in calls else "succeeded" if "succeeded" in calls else "skipped"
+    status = ("failed" if "failed" in calls else "succeeded" if "succeeded" in calls
+              else "not_attempted" if "not_attempted" in calls else "skipped")
     return EnrichmentResult(
         execution_mode="live_inference", candidate_source="llm",
         model_call_status=status,

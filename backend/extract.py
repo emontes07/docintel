@@ -15,6 +15,7 @@ from backend.models.enrichment import (
     AttributeResult, EnrichmentResult, Evidence, ExtractionResponse, Manifest,
     InferenceFailure, LiveBundle, OfflineBundle, OfflineSource, RetrievalOutcome, ReviewDecision,
 )
+from backend.real_pilot import RealPilotBudgetExceeded
 
 
 class StructuredCompletion(Protocol):
@@ -28,6 +29,11 @@ class ExecutionConfigurationError(ValueError):
 
 
 def sanitized_failure(error: Exception, stage: str) -> InferenceFailure:
+    if isinstance(error, RealPilotBudgetExceeded):
+        return InferenceFailure(
+            stage="client_initialization", exception_class="RealPilotBudgetExceeded",
+            parameter=error.dimension, explanation=str(error),
+        )
     import httpx
     import openai
     from azure.core.exceptions import ClientAuthenticationError
@@ -321,6 +327,10 @@ def run_enrichment(
                 response = ExtractionResponse(candidates=accepted)
             else:
                 validate_response(response, manifest, evidence)
+        except RealPilotBudgetExceeded as error:
+            model_call_status = "not_attempted"
+            extraction_error = "model_failed"
+            failure = sanitized_failure(error, "client_initialization")
         except ExecutionConfigurationError:
             raise
         except Exception as error:
