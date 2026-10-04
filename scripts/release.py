@@ -4,7 +4,7 @@ import argparse
 import base64
 import copy
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import io
@@ -31,6 +31,12 @@ PILOT_ENVIRONMENT_KEYS = {"AZURE_CLIENT_ID", "AZURE_DOCUMENT_INTELLIGENCE_ENDPOI
 PILOT_EXTERNAL_ENVIRONMENT_KEYS = {"WEBSEARCH_PROVIDER", "WEBIQ_ENDPOINT", "AI_FOUNDRY_PROJECT_ENDPOINT", "BING_CONNECTION_ID", "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_INDEX_NAME"}
 PILOT_LIMITS = {"products": 4, "executions": 2, "analysis": 2, "inference": 16, "search": 8, "web_retrieval": 12, "retrieval": 4, "analysis_pages": 10, "input_tokens": 200000, "output_tokens": 32768}
 PUBLICATION_API_VERSION = "2019-04-01"
+SUPPLEMENTAL_PUBLICATION_RECORDS = (
+    "metadata-preflight-attempt.json", "metadata-preflight-result.json",
+    "backend-publication-supplemental-attempt.json", "backend-publication-supplemental-result.json",
+    "backend-publication-supplemental-request.json", "backend-publication-supplemental-submission.json",
+    "backend-publication-supplemental-queued.json", "backend-publication-supplemental-upload-metadata.json",
+)
 
 
 def require(condition, message):
@@ -878,24 +884,62 @@ def validate_publication_replacement(approval, config, work, revision):
     return approval
 
 
-def require_unused_publication(work, kinds, replacement=None):
+def validate_publication_supplemental(approval, config, work, revision):
+    fields = {"schema_version", "approved", "id", "approved_by", "target", "work", "revision", "original_attempt", "original_attempt_sha256", "replacement_attempt", "replacement_attempt_sha256", "metadata_requests", "additional_backend_attempts", "cpu", "timeout_seconds", "expires_at"}
+    require(isinstance(approval, dict) and set(approval) == fields, "Publication supplemental approval schema mismatch")
+    for name, value in (("schema_version", 1), ("metadata_requests", 1), ("additional_backend_attempts", 1), ("cpu", 2), ("timeout_seconds", 900)):
+        require(type(approval[name]) is int and approval[name] == value, "Supplemental approval permits one metadata preflight and one two-CPU, 900-second backend attempt")
+    require(approval["approved"] is True, "Explicit supplemental publication approval required")
+    for name in ("id", "approved_by"):
+        require(isinstance(approval[name], str) and str(uuid.UUID(approval[name])) == approval[name], "Canonical supplemental approval/operator UUID required")
+    approved_operator(config, approval)
+    require(approval["target"] == fingerprint(config) and approval["work"] == str(work.resolve()), "Supplemental target/work mismatch")
+    require(re.fullmatch(r"[0-9a-f]{40}", revision) and approval["revision"] == revision, "Supplemental source revision mismatch")
+    end = datetime.fromisoformat(approval["expires_at"])
+    require(end.tzinfo is not None and datetime.now(timezone.utc) < end <= publication_deadline(config), "Supplemental approval expired or exceeds private target deadline")
+    for field, stem in (("original_attempt", "backend-publication"), ("replacement_attempt", "backend-publication-replacement")):
+        path = work / (stem + "-attempt.json")
+        require(approval[field] == str(path.resolve()), "Supplemental prior attempt path mismatch")
+        record = private_json(path)
+        require(approval[field + "_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest(), "Supplemental prior attempt hash mismatch")
+        require(all(record.get(name) == value for name, value in {"revision": revision, "component": "backend", "cpu": 2, "timeout_seconds": 900, "status": "attempted"}.items()), "Supplemental prior attempt source/component/bounds mismatch")
+        require(not any((work / (stem + suffix)).exists() for suffix in ("-request.json", "-submission.json", "-queued.json", "-result.json")), "Prior attempt has upload/submission evidence; supplemental scope mismatch")
+    return approval
+
+
+def require_unused_publication(work, kinds, replacement=None, supplemental=None):
+    require(replacement is None or supplemental is None, "Replacement and supplemental approvals are mutually exclusive")
     require(not (work / "images.json").exists() and not (work / "publication-progress.json").exists(), "Publication already attempted or accepted; no automatic retry")
+    require(not any((work / name).exists() for name in SUPPLEMENTAL_PUBLICATION_RECORDS), "Supplemental publication already attempted; no automatic retry")
     for kind in kinds:
         require(kind in {"backend", "frontend"}, "Unsupported publication component")
         replacing = kind == "backend" and replacement is not None
-        stem = kind + "-publication" + ("-replacement" if replacing else "")
-        if kind == "backend":
+        supplementing = kind == "backend" and supplemental is not None
+        stem = kind + "-publication" + ("-supplemental" if supplementing else "-replacement" if replacing else "")
+        if kind == "backend" and not supplementing:
             require(not (work / "backend-publication-replacement-attempt.json").exists(), "Component publication already attempted; no automatic retry")
         require(not (work / f"{stem}-attempt.json").exists() and not (work / f"{stem}-result.json").exists(), "Component publication already attempted; no automatic retry")
 
 
-def reserve_publication_attempt(work, kind, revision, *, replacement=None, config=None):
+def reserve_publication_attempt(work, kind, revision, *, replacement=None, config=None, supplemental=None):
     require(kind in {"backend", "frontend"}, "Unsupported publication component")
+    require(replacement is None or supplemental is None, "Replacement and supplemental approvals are mutually exclusive")
     replacing = kind == "backend" and replacement is not None
-    stem = kind + "-publication" + ("-replacement" if replacing else "")
+    supplementing = kind == "backend" and supplemental is not None
+    stem = kind + "-publication" + ("-supplemental" if supplementing else "-replacement" if replacing else "")
+    if supplemental is None:
+        require(not any((work / name).exists() for name in SUPPLEMENTAL_PUBLICATION_RECORDS), "Supplemental publication already attempted; no automatic retry")
+    else:
+        validate_publication_supplemental(supplemental, config, work, revision)
+        preflight_attempt = private_json(work / "metadata-preflight-attempt.json")
+        preflight = private_json(work / "metadata-preflight-result.json")
+        require(preflight_attempt["approval_sha256"] == preflight["approval_sha256"] == fingerprint(supplemental) and preflight["status"] == "validated", "A successful bound metadata preflight is required")
+        if kind == "frontend":
+            progress = private_json(work / "publication-progress.json")
+            require(progress["revision"] == revision and "backend_run_id" in progress, "Supplemental backend must succeed before original frontend publication")
     if replacement is not None:
         validate_publication_replacement(replacement, config, work, revision)
-    if kind == "backend" and not replacing:
+    if kind == "backend" and not replacing and not supplementing:
         require(not (work / "backend-publication-replacement-attempt.json").exists(), "Component publication already attempted; no automatic retry")
     require(not (work / f"{stem}-result.json").exists(), "Component publication already attempted; no automatic retry")
     record = {
@@ -905,6 +949,8 @@ def reserve_publication_attempt(work, kind, revision, *, replacement=None, confi
     }
     if replacement is not None:
         record.update({"replacement_approval": replacement, "replacement_approval_sha256": fingerprint(replacement)})
+    if supplemental is not None:
+        record.update({"supplemental_approval": supplemental, "supplemental_approval_sha256": fingerprint(supplemental)})
     path = work / f"{stem}-attempt.json"
     save_once(path, record)
     return path
@@ -988,19 +1034,56 @@ def archive_publication_context(work, kind, destination):
     return fingerprint(inventory)
 
 
-def upload_publication_context(upload, archive, timeout):
+class PublicationUploadError(ValueError):
+    def __init__(self, stage, upload):
+        self.stage = stage
+        super().__init__("Invalid registry upload destination or relative path; validation_stage=" + stage + "; safe metadata: " + json.dumps(publication_upload_metadata(upload), sort_keys=True))
+
+
+def validate_publication_upload(upload, *, now=None, valid_until=None):
+    stage = "response_shape"
     try:
         require(isinstance(upload, dict), "Invalid registry upload response")
         source, url = upload.get("relativePath"), upload.get("uploadUrl")
+        stage = "source_path"
         source_segments = publication_source_path(source)
+        stage = "upload_url"
         require(isinstance(url, str) and len(url.encode("utf-8")) <= 16384 and not any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url), "Invalid registry upload URL")
         parts = urlsplit(url)
+        stage = "https_blob_destination"
         require(parts.scheme == "https" and parts.hostname is not None and re.fullmatch(r"[a-z0-9]+\.blob\.core\.windows\.net", parts.hostname) and parts.port in (None, 443) and not parts.username and not parts.password and not parts.fragment and parts.path.startswith("/"), "Invalid registry upload destination")
+        stage = "blob_path"
         blob_segments = publication_source_path(parts.path[1:])
-        signatures = parse_qs(parts.query, keep_blank_values=True, max_num_fields=32).get("sig", [])
-        require(len(signatures) == 1 and bool(signatures[0]) and len(blob_segments) >= 2 and blob_segments[-len(source_segments):] == source_segments, "Invalid registry upload destination binding")
+        stage = "source_blob_binding"
+        require(len(blob_segments) >= 2 and blob_segments[-len(source_segments):] == source_segments, "Invalid registry upload destination binding")
+        stage = "sas_signature"
+        query = parse_qs(parts.query, keep_blank_values=True, max_num_fields=32)
+        signatures = query.get("sig", [])
+        require(len(signatures) == 1 and bool(signatures[0]), "Invalid registry upload signature")
+        if valid_until is not None:
+            stage = "sas_expiry"
+            require(now is not None and now.tzinfo is not None and valid_until.tzinfo is not None and valid_until > now, "Invalid SAS validation window")
+            expiry = query.get("se", [])
+            require(len(expiry) == 1, "SAS expiry is required")
+            end = datetime.fromisoformat(expiry[0])
+            require(end.tzinfo is not None and end >= valid_until, "SAS expiry does not cover the bounded upload/queue window")
+            stage = "sas_not_before"
+            starts = query.get("st")
+            if starts is not None:
+                require(len(starts) == 1, "Invalid SAS start")
+                start = datetime.fromisoformat(starts[0])
+                require(start.tzinfo is not None and start <= now < end, "SAS is not yet active")
+            stage = "sas_write_permission"
+            permissions = query.get("sp", [])
+            require(len(permissions) == 1 and bool(set(permissions[0]) & {"w", "c"}), "SAS requires write or create permission")
     except (ValueError, TypeError):
-        raise ValueError("Invalid registry upload destination or relative path; safe metadata: " + json.dumps(publication_upload_metadata(upload), sort_keys=True)) from None
+        raise PublicationUploadError(stage, upload) from None
+    return source
+
+
+def upload_publication_context(upload, archive, timeout):
+    source = validate_publication_upload(upload)
+    url = upload["uploadUrl"]
     # The SAS travels only over stdin, never argv, receipts, or diagnostic output.
     try:
         result = subprocess.run([
@@ -1016,10 +1099,50 @@ def upload_publication_context(upload, archive, timeout):
     return source
 
 
-def build_publication(config, work, kind, revision, *, replacement=None):
-    attempt = reserve_publication_attempt(work, kind, revision, replacement=replacement, config=config)
+def supplemental_upload_window(approval):
+    now = datetime.now(timezone.utc)
+    expires = datetime.fromisoformat(approval["expires_at"])
+    require((expires - now).total_seconds() >= 900, "Insufficient approved time remains for a 900-second build; no next upload/queue action")
+    return now, min(expires, now + timedelta(seconds=1200)) + timedelta(seconds=60)
+
+
+def publication_metadata_preflight(config, work, revision, approval):
+    validate_publication_supplemental(approval, config, work, revision)
+    require_unused_publication(work, ("backend", "frontend"), supplemental=approval)
+    supplemental_upload_window(approval)
+    binding = {"approval_sha256": fingerprint(approval), "target": fingerprint(config), "source_revision": revision}
+    save_once(work / "metadata-preflight-attempt.json", {**binding, "approval": approval, "stage": "metadata_request", "status": "attempted"})
+    resource = f"https://management.azure.com/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.ContainerRegistry/registries/{config['registry']}"
+    try:
+        supplemental_upload_window(approval)
+        upload = azure("rest", "--method", "POST", "--url", resource + "/listBuildSourceUploadUrl?api-version=" + PUBLICATION_API_VERSION, timeout=60)
+    except (ValueError, OSError, TypeError):
+        save_once(work / "metadata-preflight-result.json", {**binding, "stage": "metadata_request", "status": "failed_or_unknown"})
+        raise ValueError("Supplemental metadata request failed or is unknown; no upload/build reserved, no retry") from None
+    shape = publication_upload_metadata(upload)
+    try:
+        now, valid_until = supplemental_upload_window(approval)
+        validate_publication_upload(upload, now=now, valid_until=valid_until)
+    except ValueError as error:
+        stage = error.stage if isinstance(error, PublicationUploadError) else "approval_window"
+        save_once(work / "metadata-preflight-result.json", {**binding, "stage": stage, "status": "rejected", "shape": shape})
+        raise ValueError("Supplemental metadata preflight rejected at " + stage + "; safe metadata: " + json.dumps(shape, sort_keys=True) + "; no upload/build reserved, no retry") from None
+    save_once(work / "metadata-preflight-result.json", {**binding, "stage": "metadata_validation", "status": "validated", "shape": shape})
+    return upload
+
+
+def build_publication(config, work, kind, revision, *, replacement=None, supplemental=None, upload_metadata=None):
+    require(replacement is None or supplemental is None, "Replacement and supplemental approvals are mutually exclusive")
+    require(upload_metadata is None or (supplemental is not None and kind == "backend"), "Only supplemental backend may reuse preflight metadata")
+    if supplemental is not None and kind == "backend":
+        require(upload_metadata is not None, "Supplemental backend requires the in-memory preflight response")
+        now, valid_until = supplemental_upload_window(supplemental)
+        validate_publication_upload(upload_metadata, now=now, valid_until=valid_until)
+        require(private_json(work / "metadata-preflight-result.json")["shape"] == publication_upload_metadata(upload_metadata), "Preflight metadata binding changed")
+    attempt = reserve_publication_attempt(work, kind, revision, replacement=replacement, config=config, supplemental=supplemental)
     stem = attempt.name.removesuffix("-attempt.json")
-    expires = datetime.fromisoformat(replacement["expires_at"]) if replacement is not None else None
+    authorization = supplemental if supplemental is not None else replacement
+    expires = datetime.fromisoformat(authorization["expires_at"]) if authorization is not None else None
     deadline = time.monotonic() + min(1200, (expires - datetime.now(timezone.utc)).total_seconds() if expires else 1200)
     resource = f"https://management.azure.com/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.ContainerRegistry/registries/{config['registry']}"
     archive = work / (stem + "-context.tar.gz")
@@ -1042,10 +1165,13 @@ def build_publication(config, work, kind, revision, *, replacement=None):
         archive_created = True
         tool_revision = command(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()
         require(re.fullmatch(r"[0-9a-f]{40}", tool_revision), "Publication helper revision is invalid")
-        upload = rest("POST", "/listBuildSourceUploadUrl")
+        upload = upload_metadata if upload_metadata is not None else rest("POST", "/listBuildSourceUploadUrl")
         save_once(work / (stem + "-upload-metadata.json"), publication_upload_metadata(upload))
         if expires is not None:
             require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no next upload/queue action")
+        if supplemental is not None:
+            now, valid_until = supplemental_upload_window(supplemental)
+            validate_publication_upload(upload, now=now, valid_until=valid_until)
         source = upload_publication_context(upload, archive, remaining(120))
         body = publication_request(kind, revision, source)
         body_path = work / (stem + "-request.json")
@@ -1060,6 +1186,9 @@ def build_publication(config, work, kind, revision, *, replacement=None):
             "expires_at": expires.isoformat() if expires else None,
         }
         require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no run submitted")
+        if supplemental is not None:
+            now, valid_until = supplemental_upload_window(supplemental)
+            validate_publication_upload(upload, now=now, valid_until=valid_until)
         save_once(work / (stem + "-submission.json"), submission)
         attempt_id = private_json(attempt)["attempt_id"]
         queued = rest("POST", "/scheduleRun", "--body", "@" + str(body_path), "--headers", "x-docintel-publication-attempt-id=" + attempt_id)
@@ -1258,6 +1387,12 @@ def run(options):
         require(options.approve == options.action, "Explicit approval for this operation is required")
     replacement = None
     replacement_path = getattr(options, "publication_replacement_approval", None)
+    supplemental = None
+    supplemental_path = getattr(options, "publication_supplemental_approval", None)
+    require(not (replacement_path is not None and supplemental_path is not None), "Replacement and supplemental approvals are mutually exclusive")
+    if supplemental_path is not None:
+        require(options.action == "publish", "Supplemental approval is valid only for full publish")
+        supplemental = validate_publication_supplemental(private_json(supplemental_path, max_bytes=16384), config, work, verify_source(work)["revision"])
     if replacement_path is not None:
         require(options.action in {"publish", "publish-backend", "publish-frontend"}, "Publication replacement approval is valid only for publication")
         replacement = validate_publication_replacement(private_json(replacement_path, max_bytes=16384), config, work, verify_source(work)["revision"])
@@ -1321,10 +1456,13 @@ def run(options):
         actual = {str(path.relative_to(work / "context")): hashlib.sha256(path.read_bytes()).hexdigest() for path in (work / "context").rglob("*") if path.is_file()}
         require(inventory == actual, "Build context drift")
         require(all(source["files"].get(relative) == digest for relative, digest in actual.items()), "Context differs from reviewed committed source")
-        require_unused_publication(work, ("backend", "frontend"), replacement)
+        require_unused_publication(work, ("backend", "frontend"), replacement, supplemental)
+        upload_metadata = publication_metadata_preflight(config, work, source["revision"], supplemental) if supplemental is not None else None
         published = {"revision": source["revision"]}
         for kind in ("backend", "frontend"):
-            result = build_publication(config, work, kind, source["revision"], replacement=replacement)
+            result = build_publication(config, work, kind, source["revision"], replacement=replacement, supplemental=supplemental, upload_metadata=upload_metadata if kind == "backend" else None)
+            if kind == "backend":
+                upload_metadata = None
             digest = result["digest"]
             published[kind] = config["registry"] + f".azurecr.io/docintel/{kind}@" + digest
             published[kind + "_run_id"] = result["runId"]
@@ -1420,7 +1558,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["plan", "stage", "package", "package-backend", "context", "identity-check", "capture", "publish", "publish-frontend", "publish-backend", "update-worker", "what-if", "provision", "seed", "deploy", "start", "stop", "rollback", "pilot-enable", "pilot-start", "pilot-disable", "pilot-upload-enable", "pilot-upload-disable", "pilot-configure"])
     parser.add_argument("--previous-work", type=Path)
-    parser.add_argument("--publication-replacement-approval", type=Path, help="Owner-only, single-use authorization replacing the exact CLI-rejected backend attempt; never resets original records")
+    publication_approval = parser.add_mutually_exclusive_group()
+    publication_approval.add_argument("--publication-replacement-approval", type=Path, help="Owner-only, single-use authorization replacing the exact CLI-rejected backend attempt; never resets original records")
+    publication_approval.add_argument("--publication-supplemental-approval", type=Path, help="Full publish only: one metadata preflight and, only on validation success, one supplemental backend attempt")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--revision")
