@@ -280,7 +280,7 @@ def publication_transport(monkeypatch):
             if "/listBuildSourceUploadUrl?" in url:
                 assert method == "POST"
                 assert list(work.glob("*-publication*attempt.json"))
-                return {"relativePath": "source/20300203/synthetic.tar.gz", "uploadUrl": "never-used"}
+                return {"relativePath": "source/20300203/synthetic.tar.gz", "uploadUrl": "https://registryaccount.blob.core.windows.net/container/source/20300203/synthetic.tar.gz?sig=TEST-ONLY-SAS&se=2030-02-04T13:00:00Z&sp=rw"}
             if "/scheduleRun?" in url:
                 assert method == "POST"
                 body_path = Path(arguments[arguments.index("--body") + 1].removeprefix("@"))
@@ -527,6 +527,246 @@ def publication_replacement(tmp_path, publication_case):
         "original_failure": "unsupported_acr_build_cpu_argument", "additional_attempts": 1,
         "cpu": 2, "timeout_seconds": 900, "expires_at": "2030-02-03T13:00:00Z",
     }
+
+
+@pytest.fixture
+def publication_supplemental(tmp_path, publication_case, publication_replacement):
+    config, source = publication_case
+    replacement = release.reserve_publication_attempt(tmp_path, "backend", source["revision"], replacement=publication_replacement, config=config)
+    return {
+        "schema_version": 1, "approved": True, "id": "44444444-4444-4444-8444-444444444444",
+        "approved_by": config["pilot_operator_ids"][0], "target": release.fingerprint(config),
+        "work": str(tmp_path.resolve()), "revision": source["revision"],
+        "original_attempt": publication_replacement["original_attempt"],
+        "original_attempt_sha256": publication_replacement["original_attempt_sha256"],
+        "replacement_attempt": str(replacement.resolve()),
+        "replacement_attempt_sha256": hashlib.sha256(replacement.read_bytes()).hexdigest(),
+        "metadata_requests": 1, "additional_backend_attempts": 1, "cpu": 2,
+        "timeout_seconds": 900, "expires_at": "2030-02-03T13:00:00Z",
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("schema_version", True), ("approved", False), ("metadata_requests", 2),
+    ("metadata_requests", True), ("additional_backend_attempts", 2), ("cpu", 4),
+    ("timeout_seconds", 901), ("id", "invalid"), ("target", "0" * 64),
+    ("approved_by", "33333333-3333-4333-8333-333333333333"), ("work", "/different"),
+    ("revision", "b" * 40), ("original_attempt", "/different"),
+    ("replacement_attempt", "/different"), ("original_attempt_sha256", "0" * 64),
+    ("replacement_attempt_sha256", "0" * 64), ("expires_at", "2030-02-03T09:00:00Z"),
+    ("expires_at", "2030-02-03T13:00:01Z"), ("extra", "forbidden"),
+])
+def test_supplemental_publication_scope_rejects_before_preflight(tmp_path, monkeypatch, publication_case, publication_supplemental, field, value):
+    config, source = publication_case
+    monkeypatch.setattr(release, "azure", lambda *args, **kwargs: pytest.fail("Azure called"))
+    with pytest.raises(ValueError):
+        release.publication_metadata_preflight(config, tmp_path, source["revision"], {**publication_supplemental, field: value})
+    assert not (tmp_path / "metadata-preflight-attempt.json").exists()
+    assert not (tmp_path / "backend-publication-supplemental-attempt.json").exists()
+
+
+@pytest.mark.parametrize("record", ["backend-publication-attempt.json", "backend-publication-replacement-attempt.json"])
+def test_supplemental_publication_rejects_prior_receipt_byte_drift(tmp_path, monkeypatch, publication_case, publication_supplemental, record):
+    config, source = publication_case
+    path = tmp_path / record
+    path.write_bytes(path.read_bytes() + b"\n")
+    monkeypatch.setattr(release, "azure", lambda *args, **kwargs: pytest.fail("Azure called"))
+    with pytest.raises(ValueError, match="prior attempt hash"):
+        release.publication_metadata_preflight(config, tmp_path, source["revision"], publication_supplemental)
+    assert not (tmp_path / "metadata-preflight-attempt.json").exists()
+
+
+@pytest.mark.parametrize("stage", ["response_shape", "source_path", "https_blob_destination", "source_blob_binding", "sas_signature", "sas_expiry", "sas_not_before", "sas_write_permission"])
+def test_supplemental_preflight_failure_consumes_only_metadata_slot(tmp_path, monkeypatch, publication_case, publication_supplemental, stage):
+    config, source = publication_case
+    location = {"relativePath": "opaque-blob", "uploadUrl": "https://registryaccount.blob.core.windows.net/container/opaque-blob?sig=TEST-ONLY-SAS&se=2030-02-03T13:00:00Z&sp=rw"}
+    if stage == "response_shape":
+        location = None
+    elif stage == "source_path":
+        location["relativePath"] = "../private"
+    elif stage == "https_blob_destination":
+        location["uploadUrl"] = location["uploadUrl"].replace("https://", "http://")
+    elif stage == "source_blob_binding":
+        location["relativePath"] = "different"
+    elif stage == "sas_signature":
+        location["uploadUrl"] = location["uploadUrl"].replace("sig=TEST-ONLY-SAS", "sig=")
+    elif stage == "sas_expiry":
+        location["uploadUrl"] = location["uploadUrl"].replace("13:00:00", "10:20:59")
+    elif stage == "sas_not_before":
+        location["uploadUrl"] += "&st=2030-02-03T10:01:00Z"
+    elif stage == "sas_write_permission":
+        location["uploadUrl"] = location["uploadUrl"].replace("sp=rw", "sp=r")
+    calls = []
+    monkeypatch.setattr(release, "azure", lambda *args, **kwargs: calls.append(args) or location)
+    monkeypatch.setattr(release, "upload_publication_context", lambda *args: pytest.fail("Context uploaded"))
+    monkeypatch.setattr(release, "archive_publication_context", lambda *args: pytest.fail("Context archived"))
+    with pytest.raises(ValueError, match=stage) as error:
+        release.publication_metadata_preflight(config, tmp_path, source["revision"], publication_supplemental)
+    assert "TEST-ONLY-SAS" not in str(error.value)
+    assert len(calls) == 1 and "/listBuildSourceUploadUrl?" in " ".join(calls[0])
+    result = release.private_json(tmp_path / "metadata-preflight-result.json")
+    assert result["status"] == "rejected" and result["stage"] == stage
+    assert not (tmp_path / "backend-publication-supplemental-attempt.json").exists()
+    assert not (tmp_path / "frontend-publication-attempt.json").exists()
+    for approval in (publication_supplemental, {**publication_supplemental, "id": str(release.uuid.uuid4())}):
+        with pytest.raises(ValueError, match="already attempted"):
+            release.publication_metadata_preflight(config, tmp_path, source["revision"], approval)
+    for kind in ("backend", "frontend"):
+        with pytest.raises(ValueError, match="already attempted"):
+            release.reserve_publication_attempt(tmp_path, kind, source["revision"])
+    assert len(calls) == 1
+    assert all("TEST-ONLY-SAS" not in path.read_text() for path in tmp_path.glob("*.json"))
+
+
+def test_supplemental_preflight_request_failure_has_no_raw_error_or_retry(tmp_path, monkeypatch, publication_case, publication_supplemental):
+    config, source = publication_case
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(args)
+        raise ValueError("TEST-ONLY-SAS")
+
+    monkeypatch.setattr(release, "azure", fail)
+    with pytest.raises(ValueError, match="failed or is unknown") as error:
+        release.publication_metadata_preflight(config, tmp_path, source["revision"], publication_supplemental)
+    assert "TEST-ONLY-SAS" not in str(error.value)
+    result = release.private_json(tmp_path / "metadata-preflight-result.json")
+    assert result["status"] == "failed_or_unknown" and result["stage"] == "metadata_request"
+    assert not (tmp_path / "backend-publication-supplemental-attempt.json").exists()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", ["Succeeded", "Failed", "Unknown"])
+def test_supplemental_full_publish_reuses_metadata_and_preserves_all_counters(tmp_path, monkeypatch, publication_case, publication_supplemental, publication_replacement, publication_transport, status):
+    from argparse import Namespace
+    config, _ = publication_case
+    path = tmp_path / "supplemental-approval.json"
+    release.save(path, publication_supplemental)
+    originals = {name: (tmp_path / name).read_bytes() for name in ("backend-publication-attempt.json", "backend-publication-replacement-attempt.json")}
+    calls, requests, archives = publication_transport(tmp_path, config, status)
+    azure, upload = release.azure, release.upload_publication_context
+    metadata, uploaded = [], []
+
+    def request(*args, **kwargs):
+        result = azure(*args, **kwargs)
+        if "/listBuildSourceUploadUrl?" in " ".join(args):
+            if not metadata:
+                assert (tmp_path / "metadata-preflight-attempt.json").exists()
+                assert not (tmp_path / "backend-publication-supplemental-attempt.json").exists()
+            metadata.append(result)
+        return result
+
+    def upload_context(location, archive, timeout):
+        assert location is metadata[len(uploaded)]
+        uploaded.append(location)
+        return upload(location, archive, timeout)
+
+    monkeypatch.setattr(release, "azure", request)
+    monkeypatch.setattr(release, "upload_publication_context", upload_context)
+    options = Namespace(action="publish", approve="publish", work=tmp_path, config=None, publication_supplemental_approval=path)
+    if status == "Succeeded":
+        release.run(options)
+        assert len(metadata) == len(requests) == len(archives) == 2
+        assert (tmp_path / "images.json").exists()
+        assert (tmp_path / "frontend-publication-attempt.json").exists()
+    else:
+        with pytest.raises(ValueError, match="did not succeed|unknown"):
+            release.run(options)
+        assert len(metadata) == len(requests) == len(archives) == 1
+        assert not (tmp_path / "frontend-publication-attempt.json").exists()
+        assert not (tmp_path / "images.json").exists()
+    assert sum(body["imageNames"][0].startswith("docintel/backend:") for body in requests.values()) == 1
+    assert release.private_json(tmp_path / "metadata-preflight-result.json")["status"] == "validated"
+    assert (tmp_path / "backend-publication-supplemental-attempt.json").exists()
+    assert all((tmp_path / name).read_bytes() == value for name, value in originals.items())
+    assert all("TEST-ONLY-SAS" not in record.read_text() for record in tmp_path.glob("*.json"))
+    count = len(calls)
+    for extra in (None, "replacement", "supplemental"):
+        options.publication_supplemental_approval = path if extra == "supplemental" else None
+        replacement_path = tmp_path / "old-replacement-approval.json"
+        release.save(replacement_path, publication_replacement)
+        options.publication_replacement_approval = replacement_path if extra == "replacement" else None
+        with pytest.raises(ValueError, match="already attempted"):
+            release.run(options)
+    for kind in ("backend", "frontend"):
+        with pytest.raises(ValueError, match="already attempted"):
+            release.publish_component(config, tmp_path, None, kind)
+    assert len(calls) == count
+
+
+def test_supplemental_preflight_is_atomic(tmp_path, monkeypatch, publication_case, publication_supplemental):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    config, source = publication_case
+    barrier = threading.Barrier(4)
+    calls = []
+    location = {"relativePath": "opaque", "uploadUrl": "https://registryaccount.blob.core.windows.net/container/opaque?sig=TEST-ONLY-SAS&se=2030-02-03T13:00:00Z&sp=rw"}
+    monkeypatch.setattr(release, "azure", lambda *args, **kwargs: calls.append(args) or location)
+
+    def preflight(index):
+        barrier.wait()
+        try:
+            return release.publication_metadata_preflight(config, tmp_path, source["revision"], publication_supplemental)
+        except ValueError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(preflight, range(4)))
+    assert sum(value is location for value in outcomes) == 1 and len(calls) == 1
+    assert not (tmp_path / "backend-publication-supplemental-attempt.json").exists()
+
+
+@pytest.mark.parametrize("action,with_replacement", [("publish-backend", False), ("publish-frontend", False), ("publish", True)])
+def test_supplemental_flag_rejects_other_actions_and_coexisting_approval(tmp_path, monkeypatch, publication_case, publication_supplemental, action, with_replacement):
+    from argparse import Namespace
+    path = tmp_path / "supplemental-approval.json"
+    release.save(path, publication_supplemental)
+    monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: pytest.fail("Azure target read"))
+    with pytest.raises(ValueError, match="full publish|mutually exclusive"):
+        release.run(Namespace(action=action, approve=action, work=tmp_path, config=None, publication_supplemental_approval=path, publication_replacement_approval=path if with_replacement else None))
+
+
+@pytest.mark.parametrize("record", release.SUPPLEMENTAL_PUBLICATION_RECORDS)
+def test_supplemental_residual_receipts_never_reopen_preflight(tmp_path, monkeypatch, publication_case, publication_supplemental, record):
+    config, source = publication_case
+    release.save(tmp_path / record, {})
+    monkeypatch.setattr(release, "azure", lambda *args, **kwargs: pytest.fail("Azure called"))
+    with pytest.raises(ValueError, match="already attempted"):
+        release.publication_metadata_preflight(config, tmp_path, source["revision"], publication_supplemental)
+    for kind in ("backend", "frontend"):
+        with pytest.raises(ValueError, match="already attempted"):
+            release.reserve_publication_attempt(tmp_path, kind, source["revision"])
+
+
+def test_supplemental_expiring_cached_sas_never_refreshes_metadata(tmp_path, monkeypatch, publication_case, publication_supplemental, publication_transport):
+    from argparse import Namespace
+    from datetime import datetime, timezone
+    config, _ = publication_case
+    approval_path = tmp_path / "supplemental-approval.json"
+    release.save(approval_path, publication_supplemental)
+    calls, requests, uploads = publication_transport(tmp_path, config)
+    azure, archive = release.azure, release.archive_publication_context
+    now = [datetime(2030, 2, 3, 10, tzinfo=timezone.utc)]
+    monkeypatch.setattr(release.datetime, "now", classmethod(lambda cls, tz=None: now[0]))
+
+    def request(*args, **kwargs):
+        result = azure(*args, **kwargs)
+        if "/listBuildSourceUploadUrl?" in " ".join(args):
+            result["uploadUrl"] = result["uploadUrl"].replace("2030-02-04T13:00:00Z", "2030-02-03T10:22:00Z")
+        return result
+
+    def archive_context(*args):
+        result = archive(*args)
+        now[0] = datetime(2030, 2, 3, 10, 5, tzinfo=timezone.utc)
+        return result
+
+    monkeypatch.setattr(release, "azure", request)
+    monkeypatch.setattr(release, "archive_publication_context", archive_context)
+    with pytest.raises(release.PublicationUploadError, match="sas_expiry"):
+        release.run(Namespace(action="publish", approve="publish", work=tmp_path, config=None, publication_supplemental_approval=approval_path))
+    assert len(calls) == 1 and not requests and not uploads
+    assert (tmp_path / "backend-publication-supplemental-attempt.json").exists()
+    assert not (tmp_path / "frontend-publication-attempt.json").exists()
 
 
 @pytest.mark.parametrize("field,value", [

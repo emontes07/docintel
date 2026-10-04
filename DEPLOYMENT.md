@@ -305,6 +305,79 @@ paths, or full-versus-component commands cannot renew either slot.
 revision does not silently replace the older reviewed image source. Existing
 validation and publication receipts remain untouched.
 
+#### Explicit Supplemental Metadata Preflight And Conditional Backend Attempt
+
+Only a **new, explicit private authorization** can enable this narrowly scoped
+supplement. It does not reopen the original or replacement backend records,
+increase the approved spend ceiling, change services/roles, or change worker
+allowances. It is accepted only for full `publish`, never component publication,
+and is mutually exclusive with `--publication-replacement-approval`.
+
+The owner-only file supplied through `--publication-supplemental-approval` must
+contain exactly these fields:
+
+| Field | Required value/binding |
+| --- | --- |
+| `schema_version`, `approved` | Integer `1`, literal `true` after actual approval |
+| `id`, `approved_by` | Canonical UUIDs; approver in private target `pilot_operator_ids` |
+| `target`, `work`, `revision` | Exact target fingerprint, canonical absolute prescribed work path, and original full reviewed source revision |
+| `original_attempt` | Canonical absolute path to that work's `backend-publication-attempt.json` |
+| `original_attempt_sha256` | SHA-256 of its unchanged raw file bytes |
+| `replacement_attempt` | Canonical absolute path to that work's `backend-publication-replacement-attempt.json` |
+| `replacement_attempt_sha256` | SHA-256 of its unchanged raw file bytes |
+| `metadata_requests` | Integer `1` |
+| `additional_backend_attempts` | Integer `1` |
+| `cpu`, `timeout_seconds` | Integers `2`, `900` |
+| `expires_at` | Active aware ISO timestamp bounded by the private target's active `publication_deadline` |
+
+Both old records must match the exact backend source and bounds, without
+upload/submission/run-result evidence that contradicts the narrowly approved
+pre-upload failures. No old record is erased, edited, or reclassified.
+
+```sh
+python3.13 scripts/release.py publish \
+  --config "$CFG" --work "$WORK" --approve publish \
+  --publication-supplemental-approval "$SUPPLEMENTAL_APPROVAL"
+```
+
+The command first atomically creates `metadata-preflight-attempt.json`, then
+performs exactly one `listBuildSourceUploadUrl` request on the existing approved
+registry. This standalone metadata stage does **not** archive/upload context,
+call `scheduleRun`, or reserve a backend build. The shared pure
+`validate_publication_upload` function checks the required strings, bounded
+opaque path, trusted HTTPS Blob URL, exact path binding, and SAS fields. For this
+supplement, SAS expiry must cover the bounded twenty-minute observation window
+(or the earlier approval expiry) plus a sixty-second safety margin; optional
+`st` must already be active, and `sp` must allow write or create. These are local
+structural/time checks, not cryptographic proof that Blob storage will accept
+the signature.
+
+`metadata-preflight-result.json` records the approval/source binding, safe shape
+metadata, validation stage, and outcome. Failures identify a sanitized stage
+(for example `source_blob_binding`, `sas_expiry`, or `sas_write_permission`),
+not raw response data. A failed/unknown request or rejected response stops the
+whole command, leaves the backend slot unreserved, and never obtains a second
+preflight response. Do not patch around successive live failures or run frontend
+publication merely to leave a partial release.
+
+On successful validation only, the exact response remains **in process memory**
+and is passed directly to the backend build. The command reserves the fixed
+`backend-publication-supplemental-attempt.json` before upload and reuses that
+response; it never requests another backend upload URL. It revalidates SAS/time
+conditions before upload/queue and stops rather than refreshing an expiring SAS.
+The ordinary frontend counter remains single-use; frontend runs only after the
+backend succeeds and uses its one necessary original metadata acquisition,
+validated by the same pure function before upload. Both components retain the
+full 900-second remaining-window gates, CPU/timeout limits, immutable attempt and
+run-ID receipts, read-only polling, digest checks, and distinct helper/source
+provenance.
+
+All publication paths reject existing supplemental/preflight attempt or result
+evidence; changing flags, approval IDs, or command paths cannot renew the slots.
+A process restart cannot reuse a saved SAS—none is saved—and cannot repeat the
+preflight. No accepted `images.json` is written unless both images succeed; no
+application deployment or worker execution is implicit.
+
 ### Provisioning And Deployment
 
 Verify Entra registrations, consent, secret references, private network access,
