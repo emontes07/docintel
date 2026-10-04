@@ -66,6 +66,226 @@ def test_multi_product_intake_is_explicit_and_examples_never_become_definitions(
         service.get(result["id"], "another-actor")
 
 
+def intake_contract(definition_rows, *, definition_headers=None, selection="definitions.xlsx", node="Valve", sources=None, registry=None):
+    from backend.batch import validate_batch
+    definition_headers = definition_headers or ["node", "potential_attribute_name", "potential_attribute_data_type"]
+    manifest = write_workbook({"Products": [
+        ["PIMITEM Number", "Vendor Name", "MPN", "Hierarchy Node", "Attributes to Fill", *(sources or {})],
+        ["001", "Synthetic", "PART-1", node, selection, *(sources or {}).values()],
+    ]})
+    attributes = write_workbook({"Definitions": [definition_headers, *definition_rows]})
+    return validate_batch(manifest, attributes, "definitions.xlsx", registry or [])
+
+
+def test_intake_legacy_batch_inputs_and_blocked_source_registry_remain_valid():
+    from backend.batch import validate_batch
+    registry = [{
+        "reference": "synthetic.pdf", "source_id": "synthetic", "kind": "sharepoint",
+        "products": [
+            {"item_id": "001", "vendor": "Synthetic", "mpn": "PART-1", "hierarchy_node": "Valve"},
+            {"item_id": "002", "vendor": "Synthetic", "mpn": "PART-2", "hierarchy_node": "Valve"},
+        ],
+    }]
+    result = validate_batch(*workbooks(), "definitions.xlsx", registry)
+    assert result["valid"] and result["product_count"] == 2
+    for item in result["items"]:
+        assert item["errors"] == []
+        assert item["manifest"]["attributes"][0]["unit"] == "PSI"
+        assert item["manifest"]["attributes"][0]["examples"] == []
+        assert item["manifest"]["source_ids"] == ["synthetic"]
+        assert any("SharePoint download blocked" in warning for warning in item["warnings"])
+
+
+def test_intake_hosted_api_synthetic_fixture_remains_valid(tmp_path):
+    from backend.batch import validate_batch
+    from scripts.release_fixture import prepare
+    fixture = tmp_path / "synthetic-intake"
+    prepare(fixture)
+    registry = json.loads((fixture / "seed/configuration/sources.json").read_text())["sources"]
+    result = validate_batch(
+        (fixture / "manifest.xlsx").read_bytes(),
+        (fixture / "definitions.xlsx").read_bytes(),
+        "definitions.xlsx", registry,
+    )
+    assert result["valid"] and result["product_count"] == 2
+    assert all(item["errors"] == [] for item in result["items"])
+    assert all(item["manifest"]["attributes"][0]["unit_resolved"] is True for item in result["items"])
+
+
+def test_intake_missing_sources_are_valid_and_units_remain_qualified_unresolved():
+    result = intake_contract([["Valve", "Pressure", "Numeric"]])
+    assert result["valid"]
+    item = result["items"][0]
+    assert item["manifest"]["source_ids"] == [] and item["sources"] == []
+    definition = item["manifest"]["attributes"][0]
+    assert definition["value_type"] == "number" and definition["unit"] is None
+    assert definition["unit_resolved"] is False
+    assert any("Unresolved unit" in warning for warning in item["warnings"])
+    assert any("No approved evidence" in warning for warning in item["warnings"])
+
+
+@pytest.mark.parametrize("unit", ["", "PSI"])
+def test_intake_explicit_numeric_units_are_not_inferred(unit):
+    result = intake_contract([["Valve", "Pressure", "Numeric", unit]], definition_headers=["node", "potential_attribute_name", "potential_attribute_data_type", "unit"])
+    definition = result["items"][0]["manifest"]["attributes"][0]
+    assert result["valid"] and definition["unit_resolved"] is True
+    assert definition["unit"] == (unit or None)
+
+
+def test_intake_type_guidance_examples_and_source_basis_are_not_evidence():
+    rows = [
+        ["Valve", "Connections", "Enumerated", "EXAMPLE ONLY", "Definition research, not product evidence"],
+        ["Valve", "Standards", "Multi-Select", "DO NOT COPY", "Generic standard context"],
+    ]
+    result = intake_contract(rows, definition_headers=["node", "potential_attribute_name", "potential_attribute_data_type", "potential_attribute_example_values", "source_basis"])
+    assert result["valid"]
+    item = result["items"][0]
+    definitions = item["manifest"]["attributes"]
+    assert [definition["value_type"] for definition in definitions] == ["string", "string"]
+    assert [definition["type_guidance"] for definition in definitions] == ["Enumerated", "Multi-Select"]
+    assert definitions[0]["definition_context"] == rows[0][4]
+    assert all(definition["allowed_values"] == [] and definition["examples"] == [] for definition in definitions)
+    assert item["sources"] == [] and item["manifest"]["source_ids"] == []
+    assert result["original_definitions"][0]["potential_attribute_example_values"] == "EXAMPLE ONLY"
+
+
+def test_intake_inherits_only_explicit_parent_chain_and_closest_definition_wins():
+    rows = [
+        ["Family", "Connection", "String", "", "Family definition"],
+        ["Family", "Material", "Enumerated", "", "Family material"],
+        ["Valve", "Connection", "String", "Family", "Child definition"],
+        ["Other", "Not requested", "String", "", "Unrelated"],
+    ]
+    result = intake_contract(rows, definition_headers=["node", "potential_attribute_name", "potential_attribute_data_type", "parent_node", "description"])
+    assert result["valid"]
+    definitions = result["items"][0]["manifest"]["attributes"]
+    assert [definition["attribute_id"] for definition in definitions] == ["Connection", "Material"]
+    assert definitions[0]["definition_node"] == "Valve" and definitions[0]["description"] == "Child definition"
+    assert definitions[1]["definition_node"] == "Family"
+    no_parent = intake_contract([["Family", "Material", "String"]], node="Family.Child", selection="Material")
+    assert not no_parent["valid"]
+
+
+@pytest.mark.parametrize("rows", [
+    [["Valve", "Material", "String", "Family"], ["Family", "Other", "String", "Valve"]],
+    [["Valve", "Material", "String", "Family"], ["Valve", "Other", "String", "Different"]],
+])
+def test_intake_cyclic_or_conflicting_parent_links_are_errors(rows):
+    result = intake_contract(rows, definition_headers=["node", "potential_attribute_name", "potential_attribute_data_type", "parent_node"])
+    assert not result["valid"] and result["items"][0]["manifest"] is None
+
+
+def test_intake_all_evidence_columns_require_exact_approved_product_and_tier():
+    product = {"item_id": "001", "vendor": "Synthetic", "mpn": "PART-1", "hierarchy_node": "Valve"}
+    registry = [
+        {"reference": "spec.pdf", "source_id": "pdf", "kind": "sharepoint", "products": [product]},
+        {"reference": "vendor.xlsx", "source_id": "table", "kind": "blob", "format": "xlsx", "source_tier": "vendor_table", "blob": "documents/vendor.xlsx", "sha256": "a" * 64, "products": [product], "table": {"sheet": "Rows", "mpn_column": "MPN", "expected_vendor": "Synthetic"}},
+        *[
+            {"reference": reference, "source_id": source_id, "kind": "web", "format": "web", "source_tier": tier, "url": f"https://{source_id}.invalid/approved", "products": [product]}
+            for reference, source_id, tier in [("maker", "maker", "manufacturer_web"), ("distributor", "dist", "approved_web"), ("other", "other", "approved_web")]
+        ],
+    ]
+    sources = {"PDF Tech Spec": "spec.pdf", "Vendor Tabular Data": "vendor.xlsx", "Vendor Website": "maker", "Distributors": "distributor", "Other Web Sources": "other"}
+    result = intake_contract([["Valve", "Material", "String"]], sources=sources, registry=registry)
+    assert result["valid"]
+    assert result["items"][0]["manifest"]["source_ids"] == ["pdf", "table", "maker", "dist", "other"]
+    assert any("URL alone is not evidence" in warning for warning in result["items"][0]["warnings"])
+    for column in sources:
+        invalid = intake_contract([["Valve", "Material", "String"]], sources={column: "not approved"}, registry=registry)
+        assert not invalid["valid"]
+    mismatch = intake_contract([["Valve", "Material", "String"]], sources={"PDF Tech Spec": "vendor.xlsx"}, registry=registry)
+    assert not mismatch["valid"]
+
+
+def test_intake_source_binding_preserves_legacy_blocked_and_explicit_applicability_contracts():
+    from backend.batch import SourceBinding
+    product = {"item_id": "001", "vendor": "Synthetic", "mpn": "PART-1", "hierarchy_node": "Valve"}
+    legacy = SourceBinding(reference="blocked.pdf", source_id="blocked", kind="sharepoint", products=[product])
+    assert legacy.format == "pdf" and legacy.source_tier == "internal_pdf"
+    assert legacy.enabled is False and legacy.applicability == []
+    scope = {"product": product, "identity_terms": ["PART-1"], "attribute_ids": [], "qualification": "Operator approved family scope only"}
+    enabled = SourceBinding(**{**legacy.model_dump(), "enabled": True, "drive_id": "drive", "item_id": "document", "tenant_id": "tenant", "sha256": "a" * 64, "url": "https://synthetic.sharepoint.com/sites/catalog/spec.pdf", "applicability": [scope]})
+    assert enabled.applicability[0].attribute_ids == []
+    for changes in [
+        {"enabled": True},
+        {"sha256": "a" * 64},
+        {"applicability": [{**scope, "qualification": " "}]},
+        {"applicability": [{**scope, "identity_terms": [" "]}]},
+        {"applicability": [{**scope, "product": {**product, "mpn": "OTHER"}}]},
+        {"table": {"sheet": "Rows", "mpn_column": "MPN", "expected_vendor": "Synthetic"}},
+    ]:
+        with pytest.raises(ValueError):
+            SourceBinding(**{**legacy.model_dump(), **changes})
+
+
+def test_intake_enabled_sharepoint_requires_hash_and_canonical_url_before_retrieval():
+    from backend.batch import SourceBinding
+    product = {"item_id": "001", "vendor": "Synthetic", "mpn": "PART-1", "hierarchy_node": "Valve"}
+    legacy = SourceBinding(reference="spec.pdf", source_id="spec", kind="sharepoint", products=[product])
+    assert legacy.enabled is False and legacy.sha256 is None and legacy.blob is None
+    approved = {
+        **legacy.model_dump(), "enabled": True, "drive_id": "drive", "item_id": "document",
+        "tenant_id": "tenant", "sha256": "a" * 64,
+        "url": "https://synthetic.sharepoint.com/sites/catalog/spec.pdf",
+    }
+    assert SourceBinding(**approved).enabled is True
+    for change in [
+        {"sha256": None}, {"sha256": "a" * 63}, {"url": None},
+        {"url": "http://synthetic.sharepoint.com/spec.pdf"},
+        {"url": "https://synthetic.sharepoint.com/spec.pdf?download=1"},
+        {"url": "https://other.invalid/spec.pdf"},
+        {"drive_id": None}, {"item_id": None}, {"tenant_id": None},
+    ]:
+        with pytest.raises(ValueError):
+            SourceBinding(**{**approved, **change})
+
+
+def test_intake_enabled_sharepoint_uses_url_and_retrieval_compatible_source_id():
+    from backend.batch import SourceBinding
+    product = {"item_id": "001", "vendor": "Synthetic", "mpn": "PART-1", "hierarchy_node": "Valve"}
+    legacy = SourceBinding(reference="file.pdf", source_id="Legacy.PDF_1", kind="sharepoint", products=[product])
+    approved = {
+        **legacy.model_dump(), "source_id": "vendor-spec-1", "enabled": True,
+        "drive_id": "drive", "item_id": "document", "tenant_id": "tenant",
+        "sha256": "a" * 64, "url": "https://synthetic.sharepoint.com/sites/catalog/file.pdf",
+    }
+    binding = SourceBinding(**approved)
+    assert binding.reference == "file.pdf" and binding.url == approved["url"]
+    assert legacy.source_id == "Legacy.PDF_1" and not legacy.enabled
+    for source_id in ["Legacy.PDF_1", "UPPER", "vendor_spec"]:
+        with pytest.raises(ValueError, match="source ID"):
+            SourceBinding(**{**approved, "source_id": source_id})
+    assert SourceBinding(**{
+        **legacy.model_dump(), "kind": "blob", "blob": "documents/file.pdf", "sha256": "a" * 64,
+    }).source_id == "Legacy.PDF_1"
+
+
+def test_intake_source_binding_owner_requires_canonical_hosted_identity():
+    from backend.batch import SourceBinding
+    source = {
+        "reference": "synthetic.pdf", "source_id": "synthetic", "kind": "sharepoint",
+        "products": [{"item_id": "001", "vendor": "Synthetic", "mpn": "PART-1", "hierarchy_node": "Valve"}],
+    }
+    owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    assert SourceBinding(**source).owner is None
+    assert SourceBinding(**source, owner=None).owner is None
+    assert SourceBinding(**source, owner=owner).model_dump()["owner"] == owner
+    for invalid in [
+        "", "development:local-unverified", "tenant/object", owner.upper(),
+        owner.replace("-", ""), owner.split("/")[0], owner + "/extra",
+        " " + owner, owner + " ", owner.replace("/", "/{") + "}",
+    ]:
+        with pytest.raises(ValueError):
+            SourceBinding(**source, owner=invalid)
+
+
+@pytest.mark.parametrize("url", ["http://example.invalid", "https://user:password@example.invalid", "https://example.invalid/#fragment", "file:///private.xlsx", "https://example.invalid/a b"])
+def test_intake_web_registration_rejects_nonapproved_url_shapes(url):
+    from backend.batch import SourceBinding
+    with pytest.raises(ValueError):
+        SourceBinding(reference="web", source_id="web", kind="web", format="web", source_tier="manufacturer_web", url=url, products=[{"item_id": "001", "vendor": "Synthetic", "mpn": "PART-1", "hierarchy_node": "Valve"}])
+
+
 def test_submission_requires_consent_and_is_idempotent(service):
     result = service.intake(*workbooks(), "definitions.xlsx", "actor")
     request_id = "11111111-1111-4111-8111-111111111111"

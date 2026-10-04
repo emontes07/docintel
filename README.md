@@ -5,13 +5,13 @@ traceable attribute proposals, human decisions, and a qualified Excel export.
 DocIntel addresses the manual work of finding missing product attributes while
 keeping source evidence, conflicting values, and uncertainty visible.
 
-> **WIP SOURCE CHECKPOINT: NOT READY TO MERGE OR DEPLOY.** The committed dependency
-> lock is inconsistent with Document Intelligence and PyJWT requirements; a clean
-> locked installation/image is not verified. SharePoint download remains blocked.
-> Hosted batch authentication, private persistence, and worker execution have not
-> passed Azure acceptance. Local tests and Bicep compilation do not remove these
-> gates. Do not run `azd up`, provision, deploy, grant access, or process customer
-> batches without separate approval. Never bypass the lock, hooks, CI, or signing.
+> **Real processing remains off by default.** The hosted synthetic foundation was
+> accepted on 2026-10-03: authenticated intake, private persistence, finite worker
+> continuation, owner isolation, review, and Excel download. That acceptance did not
+> establish real-product accuracy or SharePoint ingestion. The multi-source
+> increment requires its own validation, publication, and explicit bounded pilot
+> approval. Prior build/execution allowances are exhausted. Do not run `azd up`,
+> provision, deploy, grant access, or process customer batches without approval.
 
 ## The Batch Workflow
 
@@ -44,15 +44,15 @@ Local development is an explicit loopback-only mode with unverified identity and
 private SQLite state. The separate local pilot can replay prior results. Its
 local authentication controls do **not** secure hosted use.
 
-| Capability | Evidence as of 2026-10-01 |
+| Capability | Recorded evidence / current scope |
 | --- | --- |
 | Intake, queue, finite worker, review, Excel export | Implemented; locally exercised with temporary synthetic data. |
 | Validation, leases, replay safety | Offline tests; no duplicate batch/review writes in the focused regression. |
 | Desktop/mobile browser workflow | Initial attempts 1-3 failed on an automation sandbox defect; corrected attempts 4-6 passed consecutively on warm servers. Two earlier user Retry incidents remain uncorrelated. No cold-start or real-device acceptance claim. |
-| Azure frontend/backend | Last inspection found healthy **older revisions**, not deployment of this batch increment. No job existed in the inspected group. |
-| Hosted identity, Blob leases, manual worker | Implementation/template present; Azure end-to-end acceptance still blocked. |
-| AI and document sources | Prior bounded parsing/inference observations and two synthetic model cases are not catalog accuracy evidence. SharePoint retained metadata 200, content 302, download 401; no active fallback. |
-| Clean installation and release | Blocked on a reconciled, approved dependency lock and clean-image verification. Unrelated working lock edits do not establish reproducibility. |
+| Azure frontend/backend | Accepted synthetic foundation: frontend source `984598a`, backend/worker source `4370b15`. Exact digests and receipts remain private. These are not deployment claims for later changes. |
+| Hosted identity, Blob leases, manual worker | Two finite synthetic slices, unchanged prior results, owner isolation, attributable rejection, and user-confirmed native Excel download passed. |
+| AI and document sources | Multi-source intake, attribute-level fallback, and bounded real-pilot controls extend the existing pipeline. Real-source access, WebIQ customer-processing entitlement, and human product review remain separate gates. |
+| Clean installation and release | Foundation lock/schema/permissions/Blob-read defects were repaired. Each new source revision still needs locked CI and non-root image startup verification before publication. |
 
 ## Guides
 

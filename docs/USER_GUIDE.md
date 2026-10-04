@@ -29,8 +29,13 @@ Use unique, nonblank headers in row 1 and contiguous data rows. Keep identifiers
 text, especially leading zeros. Limits per workbook: 10 MiB compressed, 50 MiB
 expanded, 500 ZIP entries, 256 columns, and 10,000 data rows. These are safety bounds,
 not tested throughput. Formulas, macros, merged cells, external workbook links,
-Excel error cells, formatted numeric/date cells, malformed addresses, and blank
-row gaps are rejected. Supply literal data, not an evaluated formula workbook.
+Excel error cells, date/time or unsupported number formats, malformed addresses,
+and blank row gaps are rejected. Formatting such as wrap-text with the General
+number format is accepted. Text identities are retained exactly, including spaces
+and leading zeros. An explicit integer zero-mask such as `000000` preserves those
+displayed zeros; missing zeros in a General numeric cell are never guessed.
+Supported ordinary decimal/grouping formats retain the underlying numeric text
+without rounding. Supply literal data, not an evaluated formula workbook.
 
 ### Product Manifest
 
@@ -39,32 +44,71 @@ row gaps are rejected. Supply literal data, not an evaluated formula workbook.
 | `PIMITEM Number` | Product item ID as text. |
 | `Vendor Name` | Exact associated vendor name. |
 | `MPN` | Exact manufacturer part number. |
-| `Hierarchy Node` | Exact `node` in the definitions workbook and source association. |
-| `PDF Tech Spec` | One registered reference or a JSON array such as `["synthetic.pdf"]`. |
+| `Hierarchy Node` | Exact node identity; inheritance uses only explicit `parent_node` links in the definitions workbook. |
 | `Attributes to Fill` | Exact bound definitions-workbook reference, one attribute name, or a JSON array of attribute names. |
 
 Duplicate item/vendor/MPN combinations are errors. Attribute selections must be
 nonempty and unique. Optional `existing_values` is a JSON object keyed by attribute
 name; existing values are preserved rather than generated again. Other columns
 remain in the exported inputs. `Party ID` is not substituted for the item ID.
-Supplementary vendor-table and website columns are retained but not retrieved.
+
+The optional source columns `PDF Tech Spec`, `Vendor Tabular Data`, `Vendor Website`,
+`Distributors`, and `Other Web Sources` each accept one registered reference or a
+JSON array of references. A blank or absent source is valid: unsupported attributes
+remain unresolved. A **present but unapproved reference is an error**, as is an
+association with a different item/vendor/MPN/hierarchy or the wrong evidence tier.
+PDF, vendor-table, manufacturer-web, and approved-web registrations are distinct.
+Website cells do not authorize arbitrary URL retrieval; a registered HTTPS URL
+alone is never evidence. Definition research is not an implicit source registration.
 
 ### Attribute Definitions
 
 | Column | Rule |
 | --- | --- |
-| `node` | Required; exact hierarchy match. |
+| `node` | Required; exact hierarchy identity. |
+| `parent_node` | Optional; explicit parent link. Only this chain allows inherited definitions; dotted names are not interpreted as ancestry. Cycles or conflicting parents are errors. |
 | `potential_attribute_name` | Required; one definition per node/name pair. |
-| `potential_attribute_data_type` | Required; `String`, `Numeric`, or `Boolean` maps to the scalar type when `value_type` is absent. |
-| `value_type` | Explicit `string`, `number`, `integer`, or `boolean`; required for Enumerated/Multi-Select declarations. |
-| `unit` | Column required for number/integer definitions; blank explicitly means dimensionless. |
+| `potential_attribute_data_type` | Required; `String`, `Numeric`, or `Boolean` maps to the scalar type when `value_type` is absent. `Enumerated` and `Multi-Select` remain strings with their original type guidance. |
+| `value_type` | Optional explicit `string`, `number`, `integer`, or `boolean`; required for otherwise unknown type declarations. |
+| `unit` | If present, retained exactly; an explicitly blank cell means dimensionless. An absent numeric unit column is qualified as unresolved, not guessed to be dimensionless or a physical unit. |
 | `allowed_values` | Optional JSON array of permitted scalar values, not example answers. |
 | `description` | Optional; otherwise the attribute name is used. |
 | `potential_attribute_example_values` | Retained input only; never evidence, allowed values, or model answers. |
+| `source_basis` | Retained as definition context only, not product evidence or permission to retrieve a source. |
 
-Multi-select needs a separately approved scalar representation; native set-valued
-attributes are not supported. Do not infer units or enumerations from examples.
-Incomplete real-workbook mappings still require operator approval.
+Native set-valued attributes are not supported. An `Enumerated` or `Multi-Select`
+declaration does not turn examples into allowed values. Bound-workbook selection
+includes definitions from the explicit parent chain; a nearer child definition
+overrides the same attribute name on a parent. Requested names stay exact and all
+original definition rows are retained. Do not infer units or enumerations from examples.
+
+### Registered Vendor Tables
+
+Vendor XLSX files are **source evidence**, not attribute-definition workbooks. The
+operator supplies `table.sheet`, `table.header_row` (1-based), and
+`table.mpn_column` (the exact header), plus either `table.vendor_column` or an
+explicit `table.expected_vendor` association. A configured vendor must match the
+product vendor exactly. Metadata before the selected header is not evidence.
+Only rows whose literal MPN matches exactly are returned: no trimming, case
+folding, zero guessing, prefix matching, or sharing across variants. Multiple
+matching rows remain separate, with original worksheet, row, and cell references.
+
+Vendor tables have a separate 50,001-physical-row bound (including metadata and
+headers), with the same 10 MiB compressed, 50 MiB expanded, 500 ZIP-entry, and
+256-column limits. Row gaps are permitted because their original addresses are
+retained. Formula/macro/link/error/merged-cell restrictions still apply throughout
+the workbook, including unmatched rows. Date-formatted report metadata may be
+ignored before the selected header; it is not emitted as evidence.
+
+Registrations explicitly declare `format: xlsx` and `source_tier: vendor_table`.
+SharePoint registrations remain disabled by default; enabling one requires
+approved drive, item, and tenant identifiers, an exact SHA256, and a canonical
+HTTPS tenant SharePoint `url` without query or fragment. Its source ID uses only
+lowercase letters, digits, and hyphens; `reference` remains the manifest association
+key and may be a filename. Optional `applicability` entries
+bind an exact product, nonblank identity terms, explicit attribute IDs, and an
+operator qualification. An empty attribute-ID list grants **no model eligibility**;
+document-family scope is never invented from a filename or neighboring variant.
 
 ### Synthetic Example
 

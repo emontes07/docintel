@@ -3,6 +3,9 @@
 import argparse
 import base64
 import copy
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
 import hashlib
 import io
 import json
@@ -13,11 +16,18 @@ import subprocess
 import tarfile
 import tomllib
 import uuid
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"Succeeded", "Failed", "Stopped"}
-OPERATIONS = {"provision", "publish", "publish-frontend", "publish-backend", "update-worker", "seed", "deploy", "start", "stop", "rollback"}
+OPERATIONS = {"provision", "publish", "publish-frontend", "publish-backend", "update-worker", "seed", "deploy", "start", "stop", "rollback", "pilot-enable", "pilot-start", "pilot-disable", "pilot-upload-enable", "pilot-upload-disable", "pilot-configure"}
+PILOT_API_SETTINGS = {"DOCINTEL_REAL_PILOT_ENABLED", "DOCINTEL_REAL_PILOT_OPERATOR_IDS", "DOCINTEL_REAL_PILOT_WORKER_PRINCIPAL_ID"}
+PILOT_UPLOAD_SETTINGS = {"DOCINTEL_PILOT_UPLOAD_ENABLED", "DOCINTEL_REAL_PILOT_OPERATOR_IDS"}
+PILOT_CONFIGURATION_KEYS = {"upload": "configuration/pilot-source-upload.json", "real": "configuration/real-pilot-approval.json"}
+PILOT_ENVIRONMENT_KEYS = {"AZURE_CLIENT_ID", "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "LLM_ENDPOINT", "LLM_DEPLOYMENT", "AOAI_API_VERSION", "WEBSEARCH_PROVIDER", "WEBIQ_ENDPOINT", "AI_FOUNDRY_PROJECT_ENDPOINT", "BING_CONNECTION_ID", "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_INDEX_NAME"}
+PILOT_EXTERNAL_ENVIRONMENT_KEYS = {"WEBSEARCH_PROVIDER", "WEBIQ_ENDPOINT", "AI_FOUNDRY_PROJECT_ENDPOINT", "BING_CONNECTION_ID", "AZURE_SEARCH_ENDPOINT", "AZURE_SEARCH_INDEX_NAME"}
+PILOT_LIMITS = {"products": 4, "executions": 2, "analysis": 2, "inference": 16, "search": 8, "web_retrieval": 12, "retrieval": 4, "analysis_pages": 10, "input_tokens": 200000, "output_tokens": 32768}
 
 
 def require(condition, message):
@@ -57,14 +67,549 @@ def save(path, data):
     path.chmod(0o600)
 
 
+def private_json(path, max_bytes=262144):
+    require(path is not None, "An explicit private file is required")
+    path = private_path(path)
+    require(path.is_file() and path.stat().st_mode & 0o077 == 0, "Private receipt/approval must be an owner-only file")
+    require(path.stat().st_size <= max_bytes, "Private receipt/approval exceeds the read bound")
+    return json.loads(path.read_text())
+
+
+def bounded_metadata(approval):
+    raw = json.dumps(approval, sort_keys=True, allow_nan=False, separators=(",", ":")).encode()
+    require(len(raw) <= 65536, "Approval metadata exceeds the 64 KiB raw bound; source bytes never belong in console metadata")
+    encoded = base64.b64encode(zlib.compress(raw, level=9)).decode()
+    require(len(encoded) <= 8192, "Compressed approval metadata exceeds the 8 KiB console bound")
+    return encoded
+
+
+def require_real_pilot_off(resource):
+    entries = environment_entries(safe_containers(resource)[0])
+    flag = entries.get("DOCINTEL_REAL_PILOT_ENABLED")
+    require(flag is None or flag == {"name": "DOCINTEL_REAL_PILOT_ENABLED", "value": "false"}, "Real-pilot processing must remain disabled during source/configuration bootstrap")
+
+
+def run_pilot_console(config, backend, code, marker):
+    require(len(base64.b64encode(code.encode())) + 80 <= 16384, "Complete approval console frame exceeds the 16 KiB transport bound")
+    output = console_code([
+        "az", "containerapp", "exec", "--subscription", config["subscription"],
+        "-g", config["group"], "-n", config["backend"],
+        "--revision", backend["properties"]["latestReadyRevisionName"],
+        "--command", "/usr/bin/env PYTHON_BASIC_REPL=1 /app/.venv/bin/python -q", "--only-show-errors",
+    ], code, marker)
+    require(marker in output.decode().splitlines(), "Pilot metadata operation did not confirm; inspect private state before proceeding")
+
+
+def save_once(path, data):
+    path = private_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise ValueError("Pilot action already attempted; inspect its immutable receipt, never blindly retry") from None
+    with os.fdopen(descriptor, "w") as output:
+        json.dump(data, output, sort_keys=True)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+@contextmanager
+def pilot_lock(work):
+    import fcntl
+
+    work.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(work / "pilot.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "r+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("Another pilot release action is in progress") from None
+        yield
+
+
+def pilot_window(approval):
+    start = datetime.fromisoformat(approval["not_before"])
+    end = datetime.fromisoformat(approval["expires_at"])
+    require(start.tzinfo is not None and end.tzinfo is not None, "Pilot timestamps require timezones")
+    require(0 < (end - start).total_seconds() <= 1200 and start <= datetime.now(timezone.utc) < end, "Pilot approval is expired, not active, or exceeds twenty minutes")
+
+
+def load_pilot_approval(path, batch_id):
+    approval = private_json(path, max_bytes=65536)
+    fields = {"schema_version", "approved", "id", "approved_by", "not_before", "expires_at", "batch_id", "owner", "batch_sha256", "customer_processing_approved", "identities", "environment", "limits", "unit_prices_usd"}
+    require(isinstance(approval, dict) and fields <= set(approval) <= fields | {"execution_scope"}, "Pilot approval schema mismatch")
+    scope = approval.get("execution_scope", "full")
+    require(scope in ("full", "internal_only"), "Pilot execution_scope must be full or internal_only")
+    require(type(approval["schema_version"]) is int and approval["schema_version"] == 1 and approval["approved"] is True, "An explicitly approved real-pilot packet is required")
+    require(re.fullmatch(r"[a-f0-9]{64}", batch_id or "") and approval["batch_id"] == batch_id, "Exact approved batch ID required")
+    require(isinstance(approval["owner"], str) and approval["owner"] and re.fullmatch(r"[a-f0-9]{64}", approval["batch_sha256"]), "Pilot owner and input binding required")
+    require(set(approval["identities"]) == {"api_principal_id", "worker_principal_id"}, "Separate API/worker principal bindings required")
+    for value in (approval["id"], approval["approved_by"], *approval["identities"].values()):
+        require(isinstance(value, str) and str(uuid.UUID(value)) == value, "Canonical approval/operator/principal UUID required")
+    pilot_window(approval)
+    require(approval["customer_processing_approved"] is True, "Explicit customer processing approval is required in every scope")
+    require(set(approval["limits"]) == set(PILOT_LIMITS) | {"spend_microdollars"}, "Pilot limit schema mismatch")
+    for name, maximum in PILOT_LIMITS.items():
+        value = approval["limits"][name]
+        require(type(value) is int and 0 <= value <= maximum, "Pilot limit exceeds its finite ceiling")
+    for name in ("products", "executions", "spend_microdollars"):
+        require(type(approval["limits"][name]) is int and approval["limits"][name] > 0, "Positive explicit pilot allowance required")
+    if scope == "internal_only":
+        require(all(approval["limits"][name] == 0 for name in ("search", "web_retrieval", "retrieval")), "Internal-only approval requires zero external operation budgets")
+    prices = approval["unit_prices_usd"]
+    price_keys = {"analysis_page", "input_token", "output_token"}
+    if scope == "full":
+        price_keys.update(("search", "web_retrieval"))
+    require(set(prices) == price_keys, "Complete per-unit upper-bound prices required")
+    for value in prices.values():
+        require(isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]{0,8})(?:\.[0-9]{1,18})?", value) and Decimal(value) > 0, "Positive explicit decimal-string unit prices required")
+    environment = approval["environment"]
+    require(set(environment) <= PILOT_ENVIRONMENT_KEYS and "AZURE_CLIENT_ID" in environment, "Unsupported or missing worker environment binding")
+    if scope == "internal_only":
+        require(not set(environment) & PILOT_EXTERNAL_ENVIRONMENT_KEYS, "Internal-only approval must omit external service environment settings")
+    require(all(isinstance(value, str) for value in environment.values()), "Worker settings must be strings, never credential objects")
+    if environment["AZURE_CLIENT_ID"]:
+        require(str(uuid.UUID(environment["AZURE_CLIENT_ID"])) == environment["AZURE_CLIENT_ID"], "Canonical managed identity client ID required")
+    return approval
+
+
+def load_upload_approval(path, config):
+    import sys
+
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    approval = private_json(path, max_bytes=65536)
+    try:
+        from backend.pilot_upload import validate_upload_approval
+        validate_upload_approval(approval)
+    except (ImportError, AttributeError, ValueError, TypeError):
+        raise ValueError("Source upload approval schema is invalid or unavailable") from None
+    require(datetime.fromisoformat(approval["expires_at"]) > datetime.now(timezone.utc), "Source upload approval is expired")
+    require(approval["owner"].split("/")[0] == config["tenant"], "Source upload owner belongs to another tenant")
+    approved_operator(config, approval)
+    bounded_metadata(approval)
+    return approval
+
+
+def approved_operator(config, approval):
+    operators = config.get("pilot_operator_ids")
+    require(isinstance(operators, list) and 1 <= len(operators) <= 4 and len(set(operators)) == len(operators), "Independently approved pilot_operator_ids are required in the private target")
+    for operator in operators:
+        require(isinstance(operator, str) and str(uuid.UUID(operator)) == operator, "Trusted pilot operator IDs must be canonical UUIDs")
+    require(approval["approved_by"] in operators, "Approval operator is not in the trusted target allowlist")
+    return approval["approved_by"]
+
+
+def pilot_values(approval):
+    return {
+        "DOCINTEL_REAL_PILOT_ENABLED": "true",
+        "DOCINTEL_REAL_PILOT_OPERATOR_IDS": approval["approved_by"],
+        "DOCINTEL_REAL_PILOT_WORKER_PRINCIPAL_ID": approval["identities"]["worker_principal_id"],
+    }
+
+
+def upload_values(approval):
+    return {"DOCINTEL_PILOT_UPLOAD_ENABLED": "true", "DOCINTEL_REAL_PILOT_OPERATOR_IDS": approval["approved_by"]}
+
+
+def metadata_backend(config):
+    require(isinstance(config.get("api_principal_id"), str) and str(uuid.UUID(config["api_principal_id"])) == config["api_principal_id"], "Verified private target api_principal_id is required for metadata/upload actions")
+    backend = app(config, config["backend"])
+    require_pilot_identity(backend, config["api_principal_id"])
+    require_real_pilot_off(backend)
+    return backend
+
+
+def remote_metadata_code(approval, kind, tenant, *, write):
+    require(kind in PILOT_CONFIGURATION_KEYS, "Only the two fixed pilot approval keys may be configured")
+    encoded = bounded_metadata(approval)
+    marker = "DOCINTEL_PILOT_METADATA_OK:" + kind + ":" + fingerprint(approval)
+    code = f'''import base64, hashlib, json, os, zlib
+from datetime import datetime, timezone
+from backend.batch_store import Conflict, Missing, configured_store, read_json, write_json
+decoder = zlib.decompressobj()
+raw = decoder.decompress(base64.b64decode({encoded!r}, validate=True), 65537)
+assert len(raw) <= 65536 and decoder.eof and not decoder.unused_data and not decoder.unconsumed_tail
+candidate = json.loads(raw)
+assert hashlib.sha256(json.dumps(candidate, sort_keys=True).encode()).hexdigest() == {fingerprint(approval)!r}
+store = configured_store()
+key = {PILOT_CONFIGURATION_KEYS[kind]!r}
+os.environ["DOCINTEL_REAL_PILOT_OPERATOR_IDS"] = candidate["approved_by"]
+'''
+    if kind == "upload":
+        code += f'''from backend.pilot_upload import PilotSourceUpload, validate_upload_approval
+validate_upload_approval(candidate)
+assert candidate["owner"].split("/")[0] == {tenant!r}
+os.environ["DOCINTEL_PILOT_UPLOAD_ENABLED"] = "true"
+os.environ["DOCINTEL_REAL_PILOT_ENABLED"] = "false"
+class ApprovedView:
+    def read_bytes(self, name, **kwargs):
+        return (raw, "candidate") if name == key else store.read_bytes(name, **kwargs)
+PilotSourceUpload(ApprovedView())._prepare(candidate["owner"])
+'''
+    else:
+        code += '''from backend.real_pilot import BUDGET_KEY, RealPilotGuard, _sha256
+batch, _ = read_json(store, "batches/" + candidate["batch_id"] + ".json")
+checker = RealPilotGuard.__new__(RealPilotGuard)
+checker.store, checker.batch = store, batch
+checker._validate_approval(candidate, verify_runtime=False)
+try:
+    ledger, _ = read_json(store, BUDGET_KEY)
+except Missing:
+    pass
+else:
+    assert ledger["approval_sha256"] == _sha256(candidate) and not ledger.get("invalidated")
+'''
+    if write:
+        code += '''try:
+    existing, _ = read_json(store, key)
+except Missing:
+    try:
+        write_json(store, key, candidate)
+    except Conflict:
+        existing, _ = read_json(store, key)
+        assert existing == candidate
+else:
+    assert existing == candidate
+'''
+    code += f'''verified, _ = read_json(store, key)
+assert verified == candidate
+print({marker!r})
+'''
+    require(len(base64.b64encode(code.encode())) + 80 <= 16384, "Complete approval console frame exceeds the 16 KiB transport bound")
+    return code, marker
+
+
+def pilot_configure(config, approval, work, kind):
+    approved_operator(config, approval)
+    with pilot_lock(work):
+        require_pilot_acceptance(config, work)
+        backend = metadata_backend(config)
+        if kind == "real":
+            require(approval["identities"]["api_principal_id"] == config["api_principal_id"], "Final approval API principal differs from verified target")
+        code, marker = remote_metadata_code(approval, kind, config["tenant"], write=True)
+        receipt = {"target": fingerprint(config), "key": PILOT_CONFIGURATION_KEYS[kind], "approval_sha256": fingerprint(approval)}
+        attempt = work / f"pilot-configure-{kind}-attempt.json"
+        if attempt.exists():
+            require(private_json(attempt) == receipt, "Different metadata cannot replace the pinned configuration attempt")
+        else:
+            save_once(attempt, receipt)
+        run_pilot_console(config, backend, code, marker)
+        result = work / f"pilot-configured-{kind}.json"
+        if result.exists():
+            require(private_json(result) == receipt, "Configured metadata receipt drift")
+        else:
+            save_once(result, receipt)
+
+
+def pilot_upload_enable(config, approval, work):
+    approved_operator(config, approval)
+    with pilot_lock(work):
+        require_pilot_acceptance(config, work)
+        backend = metadata_backend(config)
+        require(not active_executions(config)[1], "Worker must be idle during source upload activation")
+        code, marker = remote_metadata_code(approval, "upload", config["tenant"], write=False)
+        run_pilot_console(config, backend, code, marker)
+        containers = safe_containers(backend)
+        entries = environment_entries(containers[0])
+        flag = entries.get("DOCINTEL_PILOT_UPLOAD_ENABLED")
+        require(flag is None or flag == {"name": "DOCINTEL_PILOT_UPLOAD_ENABLED", "value": "false"}, "Pilot upload API must initially be disabled")
+        values = upload_values(approval)
+        baseline = {name: entries.get(name) for name in PILOT_UPLOAD_SETTINGS}
+        intended = {name: {"name": name, "value": value} for name, value in values.items()}
+        merge_environment(containers[0], values)
+        receipt = {"target": fingerprint(config), "approval_sha256": fingerprint(approval), "baseline": baseline, "intended": intended}
+        save_once(work / "pilot-upload-enablement.json", receipt)
+        patch_pilot_backend(config, backend, containers, work)
+        save_once(work / "pilot-upload-enabled.json", {"target": receipt["target"], "approval_sha256": receipt["approval_sha256"]})
+
+
+def pilot_upload_disable(config, work):
+    with pilot_lock(work):
+        baseline = private_json(work / "pilot-upload-enablement.json")
+        require(baseline["target"] == fingerprint(config), "Pilot upload disable target mismatch")
+        backend = metadata_backend(config)
+        containers = safe_containers(backend)
+        entries = environment_entries(containers[0])
+        actual = {name: entries.get(name) for name in PILOT_UPLOAD_SETTINGS}
+        require(actual in (baseline["baseline"], baseline["intended"]), "Upload-managed settings drift; refusing unsafe rollback")
+        if actual != baseline["baseline"]:
+            for name, entry in baseline["baseline"].items():
+                if entry is None:
+                    entries.pop(name, None)
+                else:
+                    entries[name] = entry
+            containers[0]["env"] = list(entries.values())
+            save_once(work / "pilot-upload-disable-attempt.json", {"target": fingerprint(config)})
+            patch_pilot_backend(config, backend, containers, work)
+        if not (work / "pilot-upload-disabled.json").exists():
+            save_once(work / "pilot-upload-disabled.json", {"target": fingerprint(config)})
+
+
+def environment_entries(container):
+    entries = container.get("env", [])
+    require(len({entry["name"] for entry in entries}) == len(entries), "Duplicate environment entries require explicit review")
+    return {entry["name"]: copy.deepcopy(entry) for entry in entries}
+
+
+def merge_environment(container, updates):
+    entries = environment_entries(container)
+    entries.update({name: {"name": name, "value": value} for name, value in updates.items()})
+    container["env"] = list(entries.values())
+
+
+def require_pilot_identity(resource, principal, client_id=None):
+    identity = resource.get("identity", {})
+    if client_id:
+        require(any(value.get("clientId") == client_id and value.get("principalId") == principal for value in identity.get("userAssignedIdentities", {}).values()), "Approved user-assigned worker identity is not attached")
+    else:
+        require("SystemAssigned" in identity.get("type", "") and identity.get("principalId") == principal, "Approved system-assigned principal differs from resource identity")
+
+
+def require_pilot_job(config, approval):
+    job, running = active_executions(config)
+    require(not running, "A worker execution is already active")
+    expected = f"/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.App/jobs/{config['job']}"
+    require(job["id"].lower() == expected.lower(), "Pilot worker resource mismatch")
+    settings = job["properties"]["configuration"]
+    require(settings["replicaRetryLimit"] == 0 and settings["replicaTimeout"] == 600, "Pilot worker requires zero retries and a 600-second timeout")
+    require(settings.get("manualTriggerConfig") == {"parallelism": 1, "replicaCompletionCount": 1}, "Pilot worker requires exactly one replica")
+    containers = safe_containers(job)
+    require(containers[0]["image"] == image(config, "backend"), "Pilot worker image mismatch")
+    environment = environment_entries(containers[0])
+    flag = environment.get("DOCINTEL_REAL_PILOT_ENABLED")
+    require(flag is None or flag == {"name": "DOCINTEL_REAL_PILOT_ENABLED", "value": "false"}, "Persistent worker real-pilot mode must remain default-off")
+    for name, value in {
+        "DOCINTEL_BATCH_MODE": "hosted",
+        "DOCINTEL_BATCH_STORAGE_URL": f"https://{config['storage']}.blob.core.windows.net",
+        "DOCINTEL_BATCH_CONTAINER": config["container"],
+        "DOCINTEL_BATCH_LIVE_ENABLED": "false",
+    }.items():
+        require(environment.get(name) == {"name": name, "value": value}, "Pilot worker storage/mode/synthetic guard drift")
+    require_pilot_identity(job, approval["identities"]["worker_principal_id"], approval["environment"]["AZURE_CLIENT_ID"])
+    return job
+
+
+def require_pilot_build_receipts(config, work):
+    for kind in ("backend", "frontend"):
+        component_work = work
+        seen = set()
+        while True:
+            require(component_work not in seen and len(seen) < 8, "Cyclic or excessive preserved publication chain")
+            seen.add(component_work)
+            source = verify_source(component_work)
+            published = private_json(component_work / "images.json")
+            require(published["revision"] == source["revision"] and published[kind] == image(config, kind), "Pilot component publication source/image mismatch")
+            preserved = published.get("preserved_" + kind)
+            if not preserved:
+                break
+            component_work = private_path(preserved["work"])
+            require(fingerprint(private_json(component_work / "images.json")) == preserved["receipt_sha256"], "Preserved pilot publication receipt changed")
+        clean = private_json(component_work / "clean-checks.json")
+        smoke = private_json(component_work / f"{kind}-smoke.json")
+        inventory = private_json(component_work / "context.json")
+        modes = private_json(component_work / "context-modes.json")
+        context = component_work / "context"
+        require(inventory == {str(path.relative_to(context)): hashlib.sha256(path.read_bytes()).hexdigest() for path in context.rglob("*") if path.is_file()}, "Pilot smoke context content drift")
+        require(modes == {str(path.relative_to(context)): path.stat().st_mode & 0o777 for path in context.rglob("*")}, "Pilot smoke context permission drift")
+        require(all(source["files"].get(name) == digest for name, digest in inventory.items()), "Pilot tested context differs from published source")
+        require(clean["revision"] == smoke["revision"] == source["revision"], "Pilot clean/runtime receipt revision mismatch")
+        expected_clean = "clean_locked_install_offline_tests" if kind == "backend" else "clean_npm_ci_checks_build"
+        require(clean.get(kind) == expected_clean, "Pilot requires actual clean component installation/build checks")
+        require(clean["lock_sha256"] == source["files"].get("uv.lock"), "Pilot clean checks do not bind the published lock")
+        require(smoke.get("passed") is True and smoke.get("network") == "none", "Pilot offline startup smoke did not pass")
+        require(smoke["context_sha256"] == fingerprint(inventory) and smoke["modes_sha256"] == fingerprint(modes), "Pilot startup smoke did not test this exact build context")
+        if kind == "backend":
+            require(smoke.get("startup") == "health_200_anonymous_batch_401" and smoke.get("uid") == 10001, "Pilot backend startup/auth/nonroot smoke is missing")
+        else:
+            require(smoke.get("running") is True and smoke.get("permission_failure") is False and smoke.get("probe_exit_code") == 0, "Pilot frontend nonroot asset/startup smoke is missing")
+
+
+def require_pilot_acceptance(config, work):
+    require_release_images(config, work)
+    require_pilot_build_receipts(config, work)
+    receipt = private_json(work / "pilot-acceptance.json")
+    require(set(receipt) == {"target", "revision", "backend_image", "frontend_image", "authenticated", "synthetic_accepted"}, "Pilot acceptance receipt schema mismatch")
+    published = private_json(work / "images.json")
+    require(receipt.get("target") == fingerprint(config) and receipt.get("revision") == published["revision"], "Pilot acceptance source/target mismatch")
+    require(receipt.get("authenticated") is True and receipt.get("synthetic_accepted") is True, "Accepted hosted authentication and synthetic baseline required")
+    for kind in ("backend", "frontend"):
+        require(receipt.get(kind + "_image") == image(config, kind), "Pilot accepted image mismatch")
+        resource = app(config, config[kind])
+        properties = resource["properties"]
+        require(properties["provisioningState"] == "Succeeded" and properties["latestRevisionName"] == properties["latestReadyRevisionName"], "Pilot app revision is not ready")
+        containers = safe_containers(resource)
+        require(containers[0]["image"] == image(config, kind), "Pilot app differs from accepted release image")
+        require(writable_containers(desired_containers(config, kind, containers)) == writable_containers(containers), "Pilot hosted authentication/storage baseline drift")
+        revision = azure("containerapp", "revision", "show", "--subscription", config["subscription"], "-g", config["group"], "-n", config[kind], "--revision", properties["latestReadyRevisionName"])
+        require(revision["properties"]["healthState"] == "Healthy", "Pilot deployed revision is not healthy")
+        require([entry["image"] for entry in revision["properties"]["template"]["containers"]] == [image(config, kind)], "Pilot healthy revision image differs from accepted digest")
+    identity_contract(config)
+
+
+def bind_pilot(config, approval, work):
+    binding = {"target": fingerprint(config), "approval_sha256": fingerprint(approval), "approval_id": approval["id"], "batch_id": approval["batch_id"]}
+    path = work / "pilot-binding.json"
+    if path.exists():
+        require(private_json(path) == binding, "Pilot approval/target drift cannot reset local allowance")
+    else:
+        save_once(path, binding)
+    return binding
+
+
+def remote_pilot_check_code(approval):
+    marker = "DOCINTEL_REAL_PILOT_CONFIG_OK:" + fingerprint(approval)
+    code = f'''import hashlib, json, os
+from backend.batch_store import Missing, configured_store, read_json
+from backend.real_pilot import BUDGET_KEY, RealPilotGuard, _sha256
+store = configured_store()
+approval, _ = read_json(store, "configuration/real-pilot-approval.json")
+assert hashlib.sha256(json.dumps(approval, sort_keys=True).encode()).hexdigest() == {fingerprint(approval)!r}
+batch, _ = read_json(store, "batches/" + {approval['batch_id']!r} + ".json")
+os.environ["DOCINTEL_REAL_PILOT_ENABLED"] = "true"
+os.environ["DOCINTEL_REAL_PILOT_OPERATOR_IDS"] = {approval['approved_by']!r}
+checker = RealPilotGuard.__new__(RealPilotGuard)
+checker.store, checker.batch = store, batch
+checker._validate()
+try:
+    ledger, _ = read_json(store, BUDGET_KEY)
+except Missing:
+    pass
+else:
+    assert ledger["approval_sha256"] == _sha256(approval) and not ledger.get("invalidated")
+    assert len(ledger["executions"]) < approval["limits"]["executions"]
+print({marker!r})
+'''
+    return code, marker
+
+
+def verify_pilot_seed(config, approval):
+    backend = app(config, config["backend"])
+    require_pilot_identity(backend, approval["identities"]["api_principal_id"])
+    code, marker = remote_pilot_check_code(approval)
+    result = console_code([
+        "az", "containerapp", "exec", "--subscription", config["subscription"],
+        "-g", config["group"], "-n", config["backend"],
+        "--revision", backend["properties"]["latestReadyRevisionName"],
+        "--command", "/usr/bin/env PYTHON_BASIC_REPL=1 /app/.venv/bin/python -q", "--only-show-errors",
+    ], code, marker)
+    require(marker in result.decode().splitlines(), "Private pilot approval/batch preflight did not confirm; no activation")
+
+
+def patch_pilot_backend(config, expected, containers, work):
+    require(app(config, config["backend"]) == expected, "Backend changed during pilot activation; refusing to overwrite drift")
+    body = work / "pilot-backend-patch.json"
+    save(body, {"properties": {"template": {"containers": writable_containers(containers)}}})
+    resource = expected["id"]
+    arguments = ["rest", "--method", "PATCH", "--url", "https://management.azure.com" + resource + "?api-version=2024-03-01", "--body", "@" + str(body)]
+    if expected.get("etag"):
+        arguments.extend(("--headers", "If-Match=" + expected["etag"]))
+    azure(*arguments)
+    actual = app(config, config["backend"])
+    require(writable_containers(safe_containers(actual)) == writable_containers(containers), "Pilot backend settings not confirmed; inspect before retrying")
+    require(actual.get("identity") == expected.get("identity") and actual["properties"]["configuration"] == expected["properties"]["configuration"], "Pilot backend identity/auth configuration changed")
+
+
+def pilot_enable(config, approval, work):
+    approved_operator(config, approval)
+    with pilot_lock(work):
+        require_pilot_acceptance(config, work)
+        require_pilot_job(config, approval)
+        verify_pilot_seed(config, approval)
+        binding = bind_pilot(config, approval, work)
+        backend = app(config, config["backend"])
+        containers = safe_containers(backend)
+        entries = environment_entries(containers[0])
+        upload_flag = entries.get("DOCINTEL_PILOT_UPLOAD_ENABLED")
+        require(upload_flag is None or upload_flag == {"name": "DOCINTEL_PILOT_UPLOAD_ENABLED", "value": "false"}, "Disable pilot source upload before enabling real-pilot processing")
+        flag = entries.get("DOCINTEL_REAL_PILOT_ENABLED")
+        require(flag is None or flag == {"name": "DOCINTEL_REAL_PILOT_ENABLED", "value": "false"}, "Pilot API must initially be disabled")
+        baseline = {name: entries.get(name) for name in PILOT_API_SETTINGS}
+        intended = {name: {"name": name, "value": value} for name, value in pilot_values(approval).items()}
+        merge_environment(containers[0], pilot_values(approval))
+        pilot_window(approval)
+        save_once(work / "pilot-enablement.json", {**binding, "baseline": baseline, "intended": intended, "backend_image": image(config, "backend")})
+        patch_pilot_backend(config, backend, containers, work)
+        save_once(work / "pilot-enabled.json", binding)
+
+
+def pilot_start(config, approval, work, item_limit):
+    approved_operator(config, approval)
+    require(type(item_limit) is int and 1 <= item_limit <= min(4, approval["limits"]["products"]), "Pilot slice exceeds approved product count")
+    with pilot_lock(work):
+        require_pilot_acceptance(config, work)
+        binding = bind_pilot(config, approval, work)
+        require(private_json(work / "pilot-enabled.json") == binding, "Confirmed pilot API enablement receipt required")
+        require(not (work / "pilot-disabled.json").exists(), "Pilot was disabled; no automatic reactivation")
+        backend = app(config, config["backend"])
+        values = environment_entries(safe_containers(backend)[0])
+        require(all(values.get(name) == {"name": name, "value": value} for name, value in pilot_values(approval).items()), "Pilot API authorization settings drift")
+        verify_pilot_seed(config, approval)
+        job = require_pilot_job(config, approval)
+        attempts = sorted(work.glob("pilot-execution-attempt-*.json"))
+        for path in attempts:
+            receipt = private_json(path)
+            require(receipt["binding"] == binding, "Pilot attempt approval binding drift")
+            require((work / f"pilot-execution-result-{receipt['attempt']}.json").exists(), "Prior worker start outcome is unknown; inspect before any continuation")
+        require(len(attempts) < approval["limits"]["executions"], "Approved pilot execution allowance exhausted")
+        number = len(attempts) + 1
+        template = copy.deepcopy(job["properties"]["template"])
+        container = template["containers"][0]
+        container["command"] = ["/app/.venv/bin/python"]
+        container["args"] = ["-m", "backend.batch_worker", "--real-pilot", "--batch-id", approval["batch_id"], "--concurrency", "1", "--max-batches", "1", "--item-limit", str(item_limit)]
+        scope = approval.get("execution_scope", "full")
+        if scope == "internal_only":
+            container["env"] = [entry for entry in container.get("env", [])
+                                if entry["name"] not in PILOT_EXTERNAL_ENVIRONMENT_KEYS | {"WEBIQ_API_KEY"}]
+        merge_environment(container, {
+            **approval["environment"], **pilot_values(approval),
+            "DOCINTEL_REAL_PILOT_EXECUTION_SCOPE": scope,
+        })
+        template["containers"] = writable_containers(template["containers"])
+        pilot_window(approval)
+        fresh_job, running = active_executions(config)
+        require(not running and fresh_job == job, "Worker changed before pilot start; inspect rather than overwrite drift")
+        execution = work / f"pilot-execution-{number}.json"
+        save_once(execution, template)
+        save_once(work / f"pilot-execution-attempt-{number}.json", {"binding": binding, "attempt": number, "execution_sha256": fingerprint(template), "state": "start_attempted_completion_unknown"})
+        result = azure("containerapp", "job", "start", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"], "--yaml", str(execution))
+        require(isinstance(result, dict) and isinstance(result.get("name"), str) and result["name"], "Worker start outcome unknown; no automatic retry")
+        save_once(work / f"pilot-execution-result-{number}.json", {"binding": binding, "attempt": number, "execution_name": result["name"]})
+
+
+def pilot_disable(config, work):
+    with pilot_lock(work):
+        baseline = private_json(work / "pilot-enablement.json")
+        require(baseline["target"] == fingerprint(config), "Pilot disable target mismatch")
+        require(not active_executions(config)[1], "Stop the active worker explicitly before disabling pilot API")
+        backend = app(config, config["backend"])
+        containers = safe_containers(backend)
+        entries = environment_entries(containers[0])
+        actual = {name: entries.get(name) for name in PILOT_API_SETTINGS}
+        require(actual in (baseline["intended"], baseline["baseline"]), "Pilot-managed settings drift; refusing unsafe rollback")
+        if actual != baseline["baseline"]:
+            for name, entry in baseline["baseline"].items():
+                if entry is None:
+                    entries.pop(name, None)
+                else:
+                    entries[name] = entry
+            containers[0]["env"] = list(entries.values())
+            save_once(work / "pilot-disable-attempt.json", {"target": fingerprint(config), "approval_sha256": baseline["approval_sha256"]})
+            patch_pilot_backend(config, backend, containers, work)
+        if not (work / "pilot-disabled.json").exists():
+            save_once(work / "pilot-disabled.json", {"target": fingerprint(config), "approval_sha256": baseline["approval_sha256"]})
+
+
 def load_config(path):
     path = private_path(path)
     require(path.stat().st_mode & 0o077 == 0, "Target configuration must be owner-only (mode 600)")
     config = json.loads(path.read_text())
-    allowed = {"subscription", "tenant", "group", "environment", "registry", "storage", "frontend", "backend", "job", "container", "frontend_origin", "backend_origin", "api_client_id", "frontend_client_id", "frontend_image", "backend_image", "auth_secret_ref", "entra_secret_ref", "baseline_authenticated"}
+    allowed = {"subscription", "tenant", "group", "environment", "registry", "storage", "frontend", "backend", "job", "container", "frontend_origin", "backend_origin", "api_client_id", "api_principal_id", "pilot_operator_ids", "frontend_client_id", "frontend_image", "backend_image", "auth_secret_ref", "entra_secret_ref", "baseline_authenticated"}
     require(set(config) <= allowed, "Unknown/private-secret fields are forbidden in release configuration")
     for field in ("subscription", "tenant"):
         require(str(uuid.UUID(config[field])) == config[field], f"Invalid {field}")
+    if "api_principal_id" in config:
+        require(str(uuid.UUID(config["api_principal_id"])) == config["api_principal_id"], "Invalid API managed-identity principal ID")
     for field in ("group", "environment", "registry", "storage", "frontend", "backend", "job", "container", "auth_secret_ref", "entra_secret_ref"):
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{1,89}", config[field]), f"Invalid resource/reference name: {field}")
     for field in ("frontend_origin", "backend_origin"):
@@ -289,8 +834,25 @@ def publish_frontend(config, work, previous_work):
     publish_component(config, work, previous_work, "frontend")
 
 
+def require_unused_publication(work, kinds):
+    require(not (work / "images.json").exists() and not (work / "publication-progress.json").exists(), "Publication already attempted or accepted; no automatic retry")
+    for kind in kinds:
+        require(kind in {"backend", "frontend"}, "Unsupported publication component")
+        require(not (work / f"{kind}-publication-attempt.json").exists() and not (work / f"{kind}-publication-result.json").exists(), "Component publication already attempted; no automatic retry")
+
+
+def reserve_publication_attempt(work, kind, revision):
+    require(kind in {"backend", "frontend"}, "Unsupported publication component")
+    require(not (work / f"{kind}-publication-result.json").exists(), "Component publication already attempted; no automatic retry")
+    save_once(work / f"{kind}-publication-attempt.json", {
+        "revision": revision, "component": kind, "cpu": 2,
+        "timeout_seconds": 900, "status": "attempted",
+    })
+
+
 def publish_component(config, work, previous_work, kind):
     require(kind in {"backend", "frontend"}, "Unsupported publication component")
+    require_unused_publication(work, [kind])
     retained = "frontend" if kind == "backend" else "backend"
     source = verify_source(work)
     previous = private_path(previous_work)
@@ -311,12 +873,11 @@ def publish_component(config, work, previous_work, kind):
     require(checks["revision"] == smoke["revision"] == source["revision"], "Validation source mismatch")
     require(checks["lock_sha256"] == hashlib.sha256(command(["git", "show", source["revision"] + ":uv.lock"], cwd=ROOT)).hexdigest(), "Committed lock mismatch")
     require(smoke["passed"] is True and smoke["context_sha256"] == fingerprint(inventory) and smoke["modes_sha256"] == fingerprint(modes), "Runtime/context validation required")
-    attempt = work / (kind + "-publication-attempt.json")
-    require(not attempt.exists() and not (work / "images.json").exists(), "Component publication already attempted; no automatic retry")
-    save(attempt, {"revision": source["revision"], "timeout_seconds": 900, "status": "attempted"})
+    require_unused_publication(work, [kind])
     tag = "docintel/" + kind + ":" + source["revision"]
     build_directory = context if kind == "backend" else context / "frontend"
-    result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--timeout", "900", "--no-logs", "--file", str(context / kind / "Dockerfile"), "--image", tag, str(build_directory))
+    reserve_publication_attempt(work, kind, source["revision"])
+    result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--cpu", "2", "--timeout", "900", "--no-logs", "--file", str(context / kind / "Dockerfile"), "--image", tag, str(build_directory))
     save(work / (kind + "-publication-result.json"), {name: result.get(name) for name in ("runId", "status", "startTime", "finishTime")})
     require(result.get("status") == "Succeeded", "ACR build failed; no automatic retry")
     digest = azure("acr", "repository", "show", "--name", config["registry"], "--image", tag)["digest"]
@@ -458,11 +1019,35 @@ def run(options):
         return
     if options.action in OPERATIONS:
         require(options.approve == options.action, "Explicit approval for this operation is required")
+    approval = None
+    if options.action in {"pilot-start", "pilot-enable"}:
+        approval = load_pilot_approval(getattr(options, "pilot_approval", None), options.batch_id)
+        approved_operator(config, approval)
+    if options.action in {"pilot-upload-enable", "pilot-configure"}:
+        upload_path = getattr(options, "upload_approval", None)
+        real_path = getattr(options, "pilot_approval", None)
+        require(bool(upload_path) != bool(real_path), "Supply exactly one upload-approval or pilot-approval metadata file")
+        require(options.action == "pilot-configure" or upload_path, "Upload activation requires upload approval, not processing approval")
+        approval = load_upload_approval(upload_path, config) if upload_path else load_pilot_approval(real_path, options.batch_id)
+        approved_operator(config, approval)
+        bounded_metadata(approval)
     verify_target(config, allow_isolated=options.action == "rollback" and options.isolate_legacy_baseline)
     if options.action in {"provision", "seed", "deploy", "start", "update-worker"}:
         require_release_images(config, work)
     if options.action == "identity-check":
         identity_contract(config)
+    elif options.action == "pilot-configure":
+        pilot_configure(config, approval, work, "upload" if getattr(options, "upload_approval", None) else "real")
+    elif options.action == "pilot-upload-enable":
+        pilot_upload_enable(config, approval, work)
+    elif options.action == "pilot-upload-disable":
+        pilot_upload_disable(config, work)
+    elif options.action == "pilot-enable":
+        pilot_enable(config, approval, work)
+    elif options.action == "pilot-start":
+        pilot_start(config, approval, work, options.item_limit)
+    elif options.action == "pilot-disable":
+        pilot_disable(config, work)
     elif options.action == "publish-frontend":
         publish_frontend(config, work, options.previous_work)
     elif options.action == "publish-backend":
@@ -494,12 +1079,15 @@ def run(options):
         actual = {str(path.relative_to(work / "context")): hashlib.sha256(path.read_bytes()).hexdigest() for path in (work / "context").rglob("*") if path.is_file()}
         require(inventory == actual, "Build context drift")
         require(all(source["files"].get(relative) == digest for relative, digest in actual.items()), "Context differs from reviewed committed source")
+        require_unused_publication(work, ("backend", "frontend"))
         published = {"revision": source["revision"]}
         for kind in ("backend", "frontend"):
             context = work / "context" if kind == "backend" else work / "context/frontend"
             dockerfile = context / ("backend/Dockerfile" if kind == "backend" else "Dockerfile")
             tag = f"docintel/{kind}:{source['revision']}"
-            result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--timeout", "900", "--no-logs", "--file", str(dockerfile), "--image", tag, str(context))
+            reserve_publication_attempt(work, kind, source["revision"])
+            result = azure("acr", "build", "--subscription", config["subscription"], "--registry", config["registry"], "--platform", "linux/amd64", "--cpu", "2", "--timeout", "900", "--no-logs", "--file", str(dockerfile), "--image", tag, str(context))
+            save(work / (kind + "-publication-result.json"), {name: result.get(name) for name in ("runId", "status", "startTime", "finishTime")})
             require(result.get("status") == "Succeeded", "ACR build did not succeed; inspect the run before another attempt")
             digest = azure("acr", "repository", "show", "--name", config["registry"], "--image", tag)["digest"]
             published[kind] = config["registry"] + f".azurecr.io/docintel/{kind}@" + digest
@@ -592,7 +1180,7 @@ def run(options):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["plan", "stage", "package", "package-backend", "context", "identity-check", "capture", "publish", "publish-frontend", "publish-backend", "update-worker", "what-if", "provision", "seed", "deploy", "start", "stop", "rollback"])
+    parser.add_argument("action", choices=["plan", "stage", "package", "package-backend", "context", "identity-check", "capture", "publish", "publish-frontend", "publish-backend", "update-worker", "what-if", "provision", "seed", "deploy", "start", "stop", "rollback", "pilot-enable", "pilot-start", "pilot-disable", "pilot-upload-enable", "pilot-upload-disable", "pilot-configure"])
     parser.add_argument("--previous-work", type=Path)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--work", type=Path, required=True)
@@ -600,6 +1188,9 @@ def main():
     parser.add_argument("--package-access-approved", action="store_true")
     parser.add_argument("--approve", choices=sorted(OPERATIONS))
     parser.add_argument("--batch-id")
+    metadata = parser.add_mutually_exclusive_group()
+    metadata.add_argument("--pilot-approval", type=Path, help="Owner-only approved real-pilot processing packet")
+    metadata.add_argument("--upload-approval", type=Path, help="Owner-only approved source-upload metadata; never document bytes")
     parser.add_argument("--fixture", type=Path)
     parser.add_argument("--seed-via-backend", action="store_true", help="Seed only the verified synthetic fixture through the ready published backend managed identity; no public storage access or operator data grant")
     parser.add_argument("--item-limit", type=int, default=2)

@@ -254,7 +254,7 @@ def test_restrictive_context_preserves_private_permissions(tmp_path):
     assert (tmp_path / "context-modes.json").stat().st_mode & 0o777 == 0o600
 
 
-@pytest.mark.parametrize("defect", [None, "smoke", "mode", "backend", "failed_build"])
+@pytest.mark.parametrize("defect", [None, "smoke", "mode", "backend", "failed_build", "unknown_build"])
 @pytest.mark.parametrize("kind", ["frontend", "backend"])
 def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path, monkeypatch, defect, kind):
     retained = "frontend" if kind == "backend" else "backend"
@@ -282,9 +282,14 @@ def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path,
         calls.append(arguments)
         if arguments[:2] == ("acr", "build"):
             assert arguments[arguments.index("--timeout") + 1] == "900"
+            assert arguments[arguments.index("--cpu") + 1] == "2"
+            attempt = release.private_json(work / f"{kind}-publication-attempt.json")
+            assert attempt["cpu"] == 2 and attempt["timeout_seconds"] == 900
             assert arguments[arguments.index("--image") + 1].startswith("docintel/" + kind + ":")
             assert arguments[arguments.index("--file") + 1] == str(context / kind / "Dockerfile")
             assert arguments[-1] == str(context if kind == "backend" else context / "frontend")
+            if defect == "unknown_build":
+                raise ValueError("Synthetic unknown build outcome")
             return {"status": "Failed" if defect == "failed_build" else "Succeeded", "runId": "synthetic-run"}
         return {"digest": "sha256:" + "c" * 64}
     monkeypatch.setattr(release, "azure", azure)
@@ -295,18 +300,26 @@ def test_component_publication_preserves_other_image_and_refuses_retry(tmp_path,
     if defect:
         with pytest.raises(ValueError):
             release.publish_component(config, work, previous, kind)
-        assert len(calls) == (1 if defect == "failed_build" else 0)
+        assert len(calls) == (1 if defect in ("failed_build", "unknown_build") else 0)
     else:
         release.publish_component(config, work, previous, kind)
         receipt = json.loads((work / "images.json").read_text())
         assert receipt[retained] == previous_images[retained]
         assert receipt["preserved_" + retained]["revision"] == "b" * 40
         release.require_release_images({**config, kind + "_image": receipt[kind]}, work)
-    if defect in (None, "failed_build"):
+    if defect in (None, "failed_build", "unknown_build"):
         count = len(calls)
+        attempt_before = (work / f"{kind}-publication-attempt.json").read_bytes()
         with pytest.raises(ValueError, match="already attempted"):
             release.publish_component(config, work, previous, kind)
         assert len(calls) == count
+        from argparse import Namespace
+        monkeypatch.setattr(release, "load_config", lambda _: config)
+        monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
+        with pytest.raises(ValueError, match="already attempted"):
+            release.run(Namespace(action="publish", approve="publish", work=work, config=None))
+        assert len(calls) == count
+        assert (work / f"{kind}-publication-attempt.json").read_bytes() == attempt_before
     assert json.loads((previous / "images.json").read_text()) == previous_images
 
 
@@ -339,7 +352,7 @@ def test_packaging_requires_new_access_evidence_before_any_command(tmp_path, mon
         release.package(tmp_path, False)
 
 
-@pytest.mark.parametrize("build_status", ["Succeeded", "Failed"])
+@pytest.mark.parametrize("build_status", ["Succeeded", "Failed", "Unknown"])
 def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_path, monkeypatch, build_status):
     from argparse import Namespace
     config = {"registry": "synthetic", "subscription": "subscription"}
@@ -360,12 +373,17 @@ def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_p
     def azure(*args):
         if args[:2] == ("acr", "build"):
             builds.append(args)
+            kind = "backend" if len(builds) == 1 else "frontend"
+            attempt = release.private_json(tmp_path / f"{kind}-publication-attempt.json")
+            assert attempt["component"] == kind and attempt["cpu"] == 2 and attempt["timeout_seconds"] == 900
+            if build_status == "Unknown":
+                raise ValueError("Synthetic unknown build outcome")
             return {"status": build_status, "runId": "run-" + str(len(builds))}
         return {"digest": "sha256:" + "b" * 64}
     monkeypatch.setattr(release, "azure", azure)
     options = Namespace(action="publish", work=tmp_path, config=None, approve="publish")
-    if build_status == "Failed":
-        with pytest.raises(ValueError, match="did not succeed"):
+    if build_status in ("Failed", "Unknown"):
+        with pytest.raises(ValueError, match="did not succeed|unknown"):
             release.run(options)
         assert len(builds) == 1
         assert not (tmp_path / "images.json").exists()
@@ -378,6 +396,50 @@ def test_publication_uses_verified_absolute_dockerfiles_and_bounded_builds(tmp_p
         assert dockerfile.is_absolute() and dockerfile.is_file()
         assert dockerfile.is_relative_to(Path(arguments[-1]))
         assert arguments[arguments.index("--timeout") + 1] == "900"
+        assert arguments[arguments.index("--cpu") + 1] == "2"
+    count = len(builds)
+    attempts = {path.name: path.read_bytes() for path in tmp_path.glob("*-publication-attempt.json")}
+    with pytest.raises(ValueError, match="already attempted"):
+        release.run(options)
+    with pytest.raises(ValueError, match="already attempted"):
+        release.publish_component(config, tmp_path, None, "backend")
+    assert len(builds) == count
+    assert {path.name: path.read_bytes() for path in tmp_path.glob("*-publication-attempt.json")} == attempts
+
+
+def test_publication_attempt_reservation_is_atomic_and_component_scoped(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    barrier = threading.Barrier(4)
+
+    def reserve(kind):
+        barrier.wait()
+        try:
+            release.reserve_publication_attempt(tmp_path, kind, "a" * 40)
+            return kind
+        except ValueError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(reserve, ("backend", "backend", "frontend", "frontend")))
+    assert outcomes.count("backend") == outcomes.count("frontend") == 1
+    assert len(list(tmp_path.glob("*-publication-attempt.json"))) == 2
+    for kind in ("backend", "frontend"):
+        before = (tmp_path / f"{kind}-publication-attempt.json").read_bytes()
+        with pytest.raises(ValueError, match="already attempted"):
+            release.reserve_publication_attempt(tmp_path, kind, "b" * 40)
+        assert (tmp_path / f"{kind}-publication-attempt.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("legacy", ["backend-publication-attempt.json", "frontend-publication-result.json", "publication-progress.json", "images.json"])
+def test_publication_does_not_reset_or_migrate_existing_records(tmp_path, legacy):
+    content = {"legacy": "retained"}
+    release.save(tmp_path / legacy, content)
+    before = (tmp_path / legacy).read_bytes()
+    with pytest.raises(ValueError, match="already attempted"):
+        release.require_unused_publication(tmp_path, ("backend", "frontend"))
+    assert (tmp_path / legacy).read_bytes() == before
 
 
 @pytest.mark.parametrize("nonempty", [False, True])
@@ -517,3 +579,812 @@ def test_deploy_resumes_without_repatching_ready_backend(tmp_path, monkeypatch, 
         with pytest.raises(ValueError, match="not ready"):
             release.run(options)
         assert not mutations
+
+
+@pytest.fixture
+def pilot_release(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    import socket
+
+    monkeypatch.setattr(socket.socket, "connect", lambda *args: pytest.fail("Release tests must not contact services"))
+    config = {
+        "subscription": "11111111-1111-4111-8111-111111111111",
+        "tenant": "22222222-2222-4222-8222-222222222222",
+        "group": "synthetic-group", "registry": "synthetic", "storage": "synthetic",
+        "container": "batches", "backend": "backend", "frontend": "frontend", "job": "worker",
+        "api_client_id": "33333333-3333-4333-8333-333333333333",
+        "api_principal_id": "77777777-7777-4777-8777-777777777777",
+        "pilot_operator_ids": ["66666666-6666-4666-8666-666666666666"],
+        "frontend_client_id": "44444444-4444-4444-8444-444444444444",
+        "frontend_origin": "https://portal.synthetic.invalid",
+        "backend_origin": "https://backend.synthetic.invalid",
+        "auth_secret_ref": "auth-ref", "entra_secret_ref": "entra-ref",
+        "backend_image": "synthetic.azurecr.io/docintel/backend@sha256:" + "a" * 64,
+        "frontend_image": "synthetic.azurecr.io/docintel/frontend@sha256:" + "b" * 64,
+    }
+    now = datetime.now(timezone.utc)
+    approval = {
+        "schema_version": 1, "approved": True,
+        "id": "55555555-5555-4555-8555-555555555555",
+        "approved_by": "66666666-6666-4666-8666-666666666666",
+        "not_before": (now - timedelta(seconds=1)).isoformat(),
+        "expires_at": (now + timedelta(seconds=1100)).isoformat(),
+        "batch_id": "c" * 64, "owner": "synthetic-owner", "batch_sha256": "d" * 64,
+        "customer_processing_approved": True,
+        "identities": {
+            "api_principal_id": "77777777-7777-4777-8777-777777777777",
+            "worker_principal_id": "88888888-8888-4888-8888-888888888888",
+        },
+        "environment": {
+            "AZURE_CLIENT_ID": "",
+            "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT": "https://analysis.synthetic.invalid",
+            "LLM_ENDPOINT": "https://model.synthetic.invalid",
+            "LLM_DEPLOYMENT": "synthetic", "AOAI_API_VERSION": "synthetic-version",
+            "WEBSEARCH_PROVIDER": "webiq", "WEBIQ_ENDPOINT": "https://api.microsoft.ai/v3/search/web",
+        },
+        "limits": {**release.PILOT_LIMITS, "spend_microdollars": 1000000},
+        "unit_prices_usd": {name: "0.000001" for name in ("analysis_page", "input_token", "output_token", "search", "web_retrieval")},
+    }
+    prefix = f"/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.App/"
+    resources = {}
+    for kind in ("backend", "frontend"):
+        containers = release.desired_containers(config, kind, [{
+            "name": kind, "image": "old", "resources": {"cpu": 1, "memory": "2Gi"},
+            "env": [{"name": "PRESERVED", "value": "original"}, {"name": "WEBIQ_API_KEY", "secretRef": "existing-web-key"}],
+        }])
+        resources[kind] = {
+            "id": prefix + "containerApps/" + kind, "etag": "synthetic-etag",
+            "identity": {"type": "SystemAssigned", "principalId": approval["identities"]["api_principal_id"]},
+            "properties": {
+                "provisioningState": "Succeeded", "latestRevisionName": "ready", "latestReadyRevisionName": "ready",
+                "configuration": {"ingress": {"external": True}, "secrets": [{"name": "existing-web-key"}]},
+                "template": {"containers": containers, "volumes": [{"name": "retained"}]},
+            },
+        }
+    job = {
+        "id": prefix + "jobs/worker",
+        "identity": {"type": "SystemAssigned", "principalId": approval["identities"]["worker_principal_id"]},
+        "properties": {
+            "configuration": {"triggerType": "Manual", "replicaRetryLimit": 0, "replicaTimeout": 600, "manualTriggerConfig": {"parallelism": 1, "replicaCompletionCount": 1}},
+            "template": {"containers": copy.deepcopy(resources["backend"]["properties"]["template"]["containers"]), "volumes": [{"name": "worker-volume"}]},
+        },
+    }
+    work = tmp_path / "pilot"
+    source_files = {}
+    for name in ("uv.lock", "backend/Dockerfile", "frontend/Dockerfile"):
+        content = ("synthetic fixture " + name).encode()
+        for tree in ("source", "context"):
+            path = work / tree / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        source_files[name] = hashlib.sha256(content).hexdigest()
+    modes = {str(path.relative_to(work / "context")): path.stat().st_mode & 0o777 for path in (work / "context").rglob("*")}
+    release.save(work / "source.json", {"revision": "e" * 40, "files": source_files})
+    release.save(work / "context.json", source_files)
+    release.save(work / "context-modes.json", modes)
+    release.save(work / "clean-checks.json", {
+        "revision": "e" * 40, "lock_sha256": source_files["uv.lock"],
+        "backend": "clean_locked_install_offline_tests", "frontend": "clean_npm_ci_checks_build",
+    })
+    for kind in ("backend", "frontend"):
+        release.save(work / f"{kind}-smoke.json", {
+            "revision": "e" * 40, "passed": True, "network": "none",
+            "context_sha256": release.fingerprint(source_files), "modes_sha256": release.fingerprint(modes),
+            **({"startup": "health_200_anonymous_batch_401", "uid": 10001} if kind == "backend"
+               else {"running": True, "permission_failure": False, "probe_exit_code": 0}),
+        })
+    release.save(work / "images.json", {"revision": "e" * 40, "backend": config["backend_image"], "frontend": config["frontend_image"]})
+    release.save(work / "pilot-acceptance.json", {
+        "target": release.fingerprint(config), "revision": "e" * 40,
+        "backend_image": config["backend_image"], "frontend_image": config["frontend_image"],
+        "authenticated": True, "synthetic_accepted": True,
+    })
+    approval_path = work / "approval.json"
+    release.save(approval_path, approval)
+    state = SimpleNamespace(
+        config=config, approval=approval, work=work, approval_path=approval_path,
+        resources=resources, job=job, calls=[], console_calls=[], active=[],
+    )
+    monkeypatch.setattr(release, "app", lambda _, name: copy.deepcopy(resources[name]))
+    monkeypatch.setattr(release, "identity_contract", lambda _: None)
+    monkeypatch.setattr(release, "active_executions", lambda _: (copy.deepcopy(job), list(state.active)))
+
+    def azure(*arguments):
+        if arguments[:3] == ("containerapp", "revision", "show"):
+            name = arguments[arguments.index("-n") + 1]
+            return {"properties": {"healthState": "Healthy", "template": copy.deepcopy(resources[name]["properties"]["template"])}}
+        state.calls.append(arguments)
+        if arguments[:3] == ("containerapp", "job", "start"):
+            return {"name": "synthetic-execution-" + str(len(state.calls))}
+        assert arguments[:3] == ("rest", "--method", "PATCH")
+        assert "--headers" in arguments and arguments[-1] == "If-Match=synthetic-etag"
+        payload = json.loads(Path(arguments[arguments.index("--body") + 1][1:]).read_text())
+        resources["backend"]["properties"]["template"]["containers"] = payload["properties"]["template"]["containers"]
+        return {}
+
+    def console(arguments, code, marker):
+        state.console_calls.append((arguments, code, marker))
+        return (marker + "\n").encode()
+
+    monkeypatch.setattr(release, "azure", azure)
+    monkeypatch.setattr(release, "console_code", console)
+    return state
+
+
+def enable_test_pilot(state):
+    release.pilot_enable(state.config, state.approval, state.work)
+
+
+def internal_release_approval(state):
+    state.approval["execution_scope"] = "internal_only"
+    state.approval["customer_processing_approved"] = True
+    for name in ("search", "web_retrieval", "retrieval"):
+        state.approval["limits"][name] = 0
+    state.approval["environment"] = {
+        name: value for name, value in state.approval["environment"].items()
+        if name not in release.PILOT_EXTERNAL_ENVIRONMENT_KEYS
+    }
+    state.approval["unit_prices_usd"] = {
+        name: value for name, value in state.approval["unit_prices_usd"].items()
+        if name in {"analysis_page", "input_token", "output_token"}
+    }
+    release.save(state.approval_path, state.approval)
+
+
+def test_pilot_approval_matches_guard_schema_and_denies_unknown_secrets(pilot_release):
+    from backend.real_pilot import HARD_LIMITS, ENVIRONMENT_KEYS, EXTERNAL_ENVIRONMENT_KEYS
+    state = pilot_release
+    assert release.PILOT_LIMITS == HARD_LIMITS
+    assert release.PILOT_ENVIRONMENT_KEYS == ENVIRONMENT_KEYS
+    assert release.PILOT_EXTERNAL_ENVIRONMENT_KEYS == EXTERNAL_ENVIRONMENT_KEYS
+    assert release.load_pilot_approval(state.approval_path, state.approval["batch_id"]) == state.approval
+    state.approval["environment"]["WEBIQ_API_KEY"] = "never-allowed"
+    release.save(state.approval_path, state.approval)
+    with pytest.raises(ValueError, match="Unsupported"):
+        release.load_pilot_approval(state.approval_path, state.approval["batch_id"])
+    assert not state.calls
+
+
+def test_pilot_internal_only_approval_requires_no_web_prices_or_environment(pilot_release):
+    state = pilot_release
+    internal_release_approval(state)
+    assert release.load_pilot_approval(state.approval_path, state.approval["batch_id"]) == state.approval
+    assert state.approval["customer_processing_approved"] is True
+    assert set(state.approval["unit_prices_usd"]) == {"analysis_page", "input_token", "output_token"}
+    assert not set(state.approval["environment"]) & release.PILOT_EXTERNAL_ENVIRONMENT_KEYS
+
+
+@pytest.mark.parametrize("defect", ["search", "web_retrieval", "retrieval", "scope", "environment", "price"])
+def test_pilot_internal_only_packet_rejects_external_authority(pilot_release, defect):
+    state = pilot_release
+    internal_release_approval(state)
+    if defect in ("search", "web_retrieval", "retrieval"):
+        state.approval["limits"][defect] = 1
+    elif defect == "scope":
+        state.approval["execution_scope"] = "internal"
+    elif defect == "environment":
+        state.approval["environment"]["WEBIQ_ENDPOINT"] = "https://unverified.invalid"
+    else:
+        del state.approval["unit_prices_usd"]["analysis_page"]
+    release.save(state.approval_path, state.approval)
+    with pytest.raises(ValueError):
+        release.load_pilot_approval(state.approval_path, state.approval["batch_id"])
+    assert not state.calls
+
+
+@pytest.mark.parametrize("scope", ["full", "internal_only"])
+def test_pilot_packet_requires_customer_consent_in_every_scope(pilot_release, scope):
+    state = pilot_release
+    if scope == "internal_only":
+        internal_release_approval(state)
+    state.approval["customer_processing_approved"] = False
+    release.save(state.approval_path, state.approval)
+    with pytest.raises(ValueError, match="customer processing"):
+        release.load_pilot_approval(state.approval_path, state.approval["batch_id"])
+    assert not state.calls and not state.console_calls
+
+
+@pytest.mark.parametrize("defect", ["draft", "batch", "expired", "limits", "price", "permissions"])
+def test_pilot_invalid_approval_never_reaches_azure(pilot_release, monkeypatch, defect):
+    from argparse import Namespace
+    state = pilot_release
+    if defect == "draft":
+        state.approval["approved"] = False
+    elif defect == "batch":
+        state.approval["batch_id"] = "f" * 64
+    elif defect == "expired":
+        state.approval["expires_at"] = state.approval["not_before"]
+    elif defect == "limits":
+        state.approval["limits"]["executions"] = 3
+    elif defect == "price":
+        state.approval["unit_prices_usd"]["search"] = "0"
+    release.save(state.approval_path, state.approval)
+    if defect == "permissions":
+        state.approval_path.chmod(0o644)
+    monkeypatch.setattr(release, "load_config", lambda _: state.config)
+    monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: pytest.fail("Azure before approval validation"))
+    with pytest.raises(ValueError):
+        release.run(Namespace(action="pilot-start", approve="pilot-start", work=state.work, config=None, batch_id="c" * 64, pilot_approval=state.approval_path))
+    assert not state.calls
+
+
+def test_pilot_enable_changes_only_three_api_settings(pilot_release):
+    state = pilot_release
+    before = copy.deepcopy(state.resources)
+    enable_test_pilot(state)
+    containers = state.resources["backend"]["properties"]["template"]["containers"]
+    actual = release.environment_entries(containers[0])
+    original = release.environment_entries(before["backend"]["properties"]["template"]["containers"][0])
+    assert {name: entry for name, entry in actual.items() if name not in release.PILOT_API_SETTINGS} == original
+    assert {name: actual[name]["value"] for name in release.PILOT_API_SETTINGS} == release.pilot_values(state.approval)
+    assert "AZURE_CLIENT_ID" not in actual
+    assert actual["WEBIQ_API_KEY"] == {"name": "WEBIQ_API_KEY", "secretRef": "existing-web-key"}
+    assert state.resources["frontend"] == before["frontend"]
+    assert state.resources["backend"]["identity"] == before["backend"]["identity"]
+    assert state.resources["backend"]["properties"]["configuration"] == before["backend"]["properties"]["configuration"]
+    assert len(state.calls) == 1 and state.calls[0][:3] == ("rest", "--method", "PATCH")
+    assert len(state.console_calls) == 1
+    assert (state.work / "pilot-enabled.json").stat().st_mode & 0o077 == 0
+    with pytest.raises(ValueError, match="disabled"):
+        enable_test_pilot(state)
+    assert len(state.calls) == 1
+
+
+@pytest.mark.parametrize("field", ["authenticated", "synthetic_accepted", "revision", "backend_image", "target"])
+def test_pilot_requires_accepted_exact_source_images_and_auth_baseline(pilot_release, field):
+    state = pilot_release
+    receipt = release.private_json(state.work / "pilot-acceptance.json")
+    receipt[field] = False if field in ("authenticated", "synthetic_accepted") else "drifted"
+    release.save(state.work / "pilot-acceptance.json", receipt)
+    with pytest.raises(ValueError):
+        enable_test_pilot(state)
+    assert not state.calls and not state.console_calls
+
+
+@pytest.mark.parametrize("kind", ["backend", "frontend"])
+@pytest.mark.parametrize("defect", ["clean", "startup", "context", "modes", "revision", "lock"])
+def test_pilot_requires_clean_install_and_exact_runtime_smoke(pilot_release, kind, defect):
+    state = pilot_release
+    clean = release.private_json(state.work / "clean-checks.json")
+    smoke = release.private_json(state.work / f"{kind}-smoke.json")
+    if defect == "clean":
+        clean[kind] = "existing_interpreter_not_clean_install"
+    elif defect == "startup":
+        smoke["passed"] = False
+    elif defect == "context":
+        smoke["context_sha256"] = "wrong"
+    elif defect == "modes":
+        smoke["modes_sha256"] = "wrong"
+    elif defect == "revision":
+        smoke["revision"] = "f" * 40
+    else:
+        clean["lock_sha256"] = "wrong"
+    release.save(state.work / "clean-checks.json", clean)
+    release.save(state.work / f"{kind}-smoke.json", smoke)
+    with pytest.raises(ValueError):
+        enable_test_pilot(state)
+    assert not state.calls and not state.console_calls
+
+
+def test_pilot_requires_healthy_actual_published_revision(pilot_release, monkeypatch):
+    state = pilot_release
+    original = release.azure
+
+    def azure(*arguments):
+        result = original(*arguments)
+        if arguments[:3] == ("containerapp", "revision", "show"):
+            result["properties"]["healthState"] = "Unhealthy"
+        return result
+
+    monkeypatch.setattr(release, "azure", azure)
+    with pytest.raises(ValueError, match="not healthy"):
+        enable_test_pilot(state)
+    assert not state.calls and not state.console_calls
+
+
+@pytest.mark.parametrize("defect", ["active", "retry", "timeout", "replicas", "container", "image", "identity", "storage"])
+def test_pilot_worker_safety_guards_before_mutation(pilot_release, defect):
+    state = pilot_release
+    settings = state.job["properties"]["configuration"]
+    container = state.job["properties"]["template"]["containers"][0]
+    if defect == "active":
+        state.active.append({"name": "running"})
+    elif defect == "retry":
+        settings["replicaRetryLimit"] = 1
+    elif defect == "timeout":
+        settings["replicaTimeout"] = 1200
+    elif defect == "replicas":
+        settings["manualTriggerConfig"]["parallelism"] = 2
+    elif defect == "container":
+        state.job["properties"]["template"]["containers"].append(copy.deepcopy(container))
+    elif defect == "image":
+        container["image"] = "unapproved"
+    elif defect == "identity":
+        state.job["identity"]["principalId"] = state.approval["identities"]["api_principal_id"]
+    else:
+        release.merge_environment(container, {"DOCINTEL_BATCH_CONTAINER": "other"})
+    with pytest.raises(ValueError):
+        enable_test_pilot(state)
+    assert not state.calls
+
+
+def test_pilot_requires_matching_private_preseeded_configuration(pilot_release, monkeypatch):
+    state = pilot_release
+    monkeypatch.setattr(release, "console_code", lambda *args: b"no confirmation")
+    with pytest.raises(ValueError, match="preflight"):
+        enable_test_pilot(state)
+    assert not state.calls
+    assert not (state.work / "pilot-enablement.json").exists()
+    code, _ = release.remote_pilot_check_code(state.approval)
+    assert 'read_json(store, "configuration/real-pilot-approval.json")' in code
+    assert "write_json" not in code and "upload_blob" not in code
+    assert "checker._validate()" in code
+    assert state.approval["owner"] not in code
+
+
+@pytest.mark.parametrize("defect", [None, "approval", "batch", "ledger", "exhausted"])
+def test_pilot_remote_preflight_executes_without_writes(pilot_release, monkeypatch, capsys, defect):
+    from types import SimpleNamespace
+    from backend.batch_store import Missing
+    from backend.real_pilot import binding_digest, _sha256
+    state = pilot_release
+    batch = {
+        "id": state.approval["batch_id"], "owner": state.approval["owner"],
+        "valid": True, "product_count": 1, "attribute_reference": "synthetic.xlsx",
+        "input_hashes": {"manifest": "a" * 64, "attributes": "b" * 64},
+        "original_definitions": [{"attribute_id": "synthetic"}],
+        "items": [{
+            "item_key": "row-2", "errors": [],
+            "manifest": {"product": {"item_id": "synthetic", "vendor": "synthetic", "mpn": "synthetic"}},
+            "sources": [],
+        }],
+    }
+    state.approval["batch_sha256"] = binding_digest(batch)
+    code, marker = release.remote_pilot_check_code(state.approval)
+    records = {
+        "configuration/real-pilot-approval.json": copy.deepcopy(state.approval),
+        f"batches/{batch['id']}.json": batch,
+    }
+    if defect == "approval":
+        records["configuration/real-pilot-approval.json"]["owner"] = "different"
+    elif defect == "batch":
+        batch["items"][0]["manifest"]["product"]["mpn"] = "changed"
+    elif defect in ("ledger", "exhausted"):
+        records["budgets/real-pilot.json"] = {
+            "approval_sha256": "changed" if defect == "ledger" else _sha256(state.approval),
+            "executions": {"1": {}, "2": {}},
+        }
+
+    def read_bytes(key):
+        if key not in records:
+            raise Missing(key)
+        return json.dumps(records[key]).encode(), "version"
+
+    store = SimpleNamespace(read_bytes=read_bytes)
+    monkeypatch.setattr("backend.batch_store.configured_store", lambda: store)
+    # The generated preflight mutates only its disposable process environment.
+    monkeypatch.setenv("DOCINTEL_REAL_PILOT_ENABLED", "false")
+    monkeypatch.setenv("DOCINTEL_REAL_PILOT_OPERATOR_IDS", "")
+    if defect:
+        with pytest.raises((ValueError, AssertionError)):
+            exec(code, {})
+        assert marker not in capsys.readouterr().out
+    else:
+        exec(code, {})
+        assert marker in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("execution_scope", ["full", "internal_only"])
+def test_pilot_start_has_exact_cli_settings_and_bounded_immutable_attempts(pilot_release, execution_scope):
+    state = pilot_release
+    if execution_scope == "internal_only":
+        internal_release_approval(state)
+        release.merge_environment(state.job["properties"]["template"]["containers"][0], {
+            "WEBIQ_ENDPOINT": "https://unverified.invalid", "WEBSEARCH_PROVIDER": "unverified",
+            "AZURE_SEARCH_ENDPOINT": "https://unverified.invalid",
+            "DOCINTEL_REAL_PILOT_EXECUTION_SCOPE": "full",
+        })
+    enable_test_pilot(state)
+    baseline = copy.deepcopy(state.job)
+    for number in (1, 2):
+        release.pilot_start(state.config, state.approval, state.work, 2)
+        template = release.private_json(state.work / f"pilot-execution-{number}.json")
+        container = template["containers"][0]
+        assert container["command"] == ["/app/.venv/bin/python"]
+        assert container["args"] == ["-m", "backend.batch_worker", "--real-pilot", "--batch-id", state.approval["batch_id"], "--concurrency", "1", "--max-batches", "1", "--item-limit", "2"]
+        environment = release.environment_entries(container)
+        for name, value in {**state.approval["environment"], **release.pilot_values(state.approval)}.items():
+            assert environment[name] == {"name": name, "value": value}
+        assert environment["DOCINTEL_BATCH_LIVE_ENABLED"]["value"] == "false"
+        assert environment["DOCINTEL_REAL_PILOT_EXECUTION_SCOPE"]["value"] == execution_scope
+        if execution_scope == "full":
+            assert environment["WEBIQ_API_KEY"]["secretRef"] == "existing-web-key"
+        else:
+            assert not set(environment) & (release.PILOT_EXTERNAL_ENVIRONMENT_KEYS | {"WEBIQ_API_KEY"})
+        attempt = release.private_json(state.work / f"pilot-execution-attempt-{number}.json")
+        assert attempt["attempt"] == number
+        assert attempt["execution_sha256"] == release.fingerprint(template)
+        assert template["volumes"] == baseline["properties"]["template"]["volumes"]
+    assert state.job == baseline
+    with pytest.raises(ValueError, match="allowance exhausted"):
+        release.pilot_start(state.config, state.approval, state.work, 2)
+    assert len([call for call in state.calls if call[:3] == ("containerapp", "job", "start")]) == 2
+
+
+def test_release_scope_change_cannot_reset_bound_approval(pilot_release):
+    state = pilot_release
+    enable_test_pilot(state)
+    internal_release_approval(state)
+    with pytest.raises(ValueError, match="cannot reset"):
+        release.pilot_start(state.config, state.approval, state.work, 1)
+    assert not any(call[:3] == ("containerapp", "job", "start") for call in state.calls)
+
+
+@pytest.mark.parametrize("limit", [0, 5, True])
+def test_pilot_start_rejects_unbounded_item_limits(pilot_release, limit):
+    state = pilot_release
+    with pytest.raises(ValueError, match="slice"):
+        release.pilot_start(state.config, state.approval, state.work, limit)
+    assert not state.calls
+
+
+def test_pilot_start_unknown_outcome_is_not_retried_or_refunded(pilot_release, monkeypatch):
+    state = pilot_release
+    enable_test_pilot(state)
+    calls = []
+    original = release.azure
+
+    def fail(*arguments):
+        if arguments[:3] != ("containerapp", "job", "start"):
+            return original(*arguments)
+        calls.append(arguments)
+        raise ValueError("Synthetic lost response")
+
+    monkeypatch.setattr(release, "azure", fail)
+    with pytest.raises(ValueError, match="lost response"):
+        release.pilot_start(state.config, state.approval, state.work, 1)
+    assert (state.work / "pilot-execution-attempt-1.json").exists()
+    with pytest.raises(ValueError, match="outcome is unknown"):
+        release.pilot_start(state.config, state.approval, state.work, 1)
+    assert len(calls) == 1
+
+
+def test_pilot_approval_edit_cannot_reset_local_allowance(pilot_release):
+    state = pilot_release
+    enable_test_pilot(state)
+    state.approval["id"] = "99999999-9999-4999-8999-999999999999"
+    with pytest.raises(ValueError, match="cannot reset"):
+        release.pilot_start(state.config, state.approval, state.work, 1)
+    assert len(state.calls) == 1
+
+
+def test_pilot_disable_restores_only_managed_values_after_expiry(pilot_release):
+    state = pilot_release
+    baseline = copy.deepcopy(state.resources["backend"])
+    enable_test_pilot(state)
+    container = state.resources["backend"]["properties"]["template"]["containers"][0]
+    release.merge_environment(container, {"UNRELATED_NEW_SETTING": "retained"})
+    state.approval["expires_at"] = state.approval["not_before"]
+    release.pilot_disable(state.config, state.work)
+    actual = release.environment_entries(state.resources["backend"]["properties"]["template"]["containers"][0])
+    original = release.environment_entries(baseline["properties"]["template"]["containers"][0])
+    assert actual == {**original, "UNRELATED_NEW_SETTING": {"name": "UNRELATED_NEW_SETTING", "value": "retained"}}
+    assert (state.work / "pilot-disabled.json").exists()
+    count = len(state.calls)
+    release.pilot_disable(state.config, state.work)
+    assert len(state.calls) == count
+
+
+def test_pilot_disable_refuses_managed_setting_drift(pilot_release):
+    state = pilot_release
+    enable_test_pilot(state)
+    container = state.resources["backend"]["properties"]["template"]["containers"][0]
+    release.merge_environment(container, {"DOCINTEL_REAL_PILOT_OPERATOR_IDS": "unrelated-operator"})
+    with pytest.raises(ValueError, match="unsafe rollback"):
+        release.pilot_disable(state.config, state.work)
+    assert len(state.calls) == 1
+
+
+def test_pilot_disable_restores_existing_entries_exactly(pilot_release):
+    state = pilot_release
+    container = state.resources["backend"]["properties"]["template"]["containers"][0]
+    prior = {
+        "DOCINTEL_REAL_PILOT_ENABLED": "false",
+        "DOCINTEL_REAL_PILOT_OPERATOR_IDS": "prior-approved-operator",
+        "DOCINTEL_REAL_PILOT_WORKER_PRINCIPAL_ID": "prior-worker-binding",
+    }
+    release.merge_environment(container, prior)
+    enable_test_pilot(state)
+    release.pilot_disable(state.config, state.work)
+    current = release.environment_entries(state.resources["backend"]["properties"]["template"]["containers"][0])
+    assert {name: current[name]["value"] for name in release.PILOT_API_SETTINGS} == prior
+
+
+def test_pilot_enable_rejects_unknown_flag_secret_reference(pilot_release):
+    state = pilot_release
+    container = state.resources["backend"]["properties"]["template"]["containers"][0]
+    container["env"].append({"name": "DOCINTEL_REAL_PILOT_ENABLED", "secretRef": "unknown-flag"})
+    with pytest.raises(ValueError, match="disabled"):
+        enable_test_pilot(state)
+    assert not state.calls
+
+
+def test_pilot_local_lock_prevents_concurrent_release_actions(pilot_release):
+    state = pilot_release
+    with release.pilot_lock(state.work):
+        with pytest.raises(ValueError, match="in progress"):
+            enable_test_pilot(state)
+    assert not state.calls
+
+
+def test_synthetic_start_remains_separate_from_real_pilot(pilot_release, monkeypatch):
+    from argparse import Namespace
+    state = pilot_release
+    monkeypatch.setattr(release, "load_config", lambda _: state.config)
+    monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: None)
+    release.run(Namespace(action="start", approve="start", work=state.work, config=None, batch_id="f" * 64, item_limit=1))
+    execution = release.private_json(state.work / "execution.json")
+    assert "--synthetic-acceptance" in execution["containers"][0]["args"]
+    assert "--real-pilot" not in execution["containers"][0]["args"]
+    assert not any(entry["name"] == "DOCINTEL_REAL_PILOT_ENABLED" for entry in execution["containers"][0]["env"])
+    assert not state.console_calls
+
+
+@pytest.fixture
+def upload_release(pilot_release):
+    from backend.pilot_upload import registry_sha256
+    state = pilot_release
+    operator = state.approval["approved_by"]
+    source = {
+        "reference": "synthetic.pdf", "source_id": "synthetic-source",
+        "kind": "blob", "format": "pdf", "source_tier": "internal_pdf",
+        "enabled": True, "blob": "documents/synthetic.pdf", "sha256": "f" * 64,
+        "products": [{"item_id": "001", "vendor": "Synthetic", "mpn": "Part-1", "hierarchy_node": "Valve"}],
+    }
+    state.upload = {
+        "schema_version": 1, "approved": True,
+        "id": "99999999-9999-4999-8999-999999999999",
+        "approved_by": operator, "owner": state.config["tenant"] + "/" + operator,
+        "expires_at": state.approval["expires_at"],
+        "expected_registry_sha256": registry_sha256([]),
+        "sources": [source],
+        "documents": [{"source_id": source["source_id"], "filename": "synthetic.pdf", "bytes": 100, "sha256": source["sha256"]}],
+    }
+    state.upload_path = state.work / "upload-approval.json"
+    release.save(state.upload_path, state.upload)
+    return state
+
+
+def test_pilot_upload_metadata_uses_actual_schema_and_exact_owner(upload_release):
+    state = upload_release
+    assert release.load_upload_approval(state.upload_path, state.config) == state.upload
+    state.upload["owner"] = state.config["tenant"] + "/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    release.save(state.upload_path, state.upload)
+    with pytest.raises(ValueError, match="schema is invalid") as error:
+        release.load_upload_approval(state.upload_path, state.config)
+    assert "synthetic.pdf" not in str(error.value)
+    assert not state.calls
+
+
+@pytest.mark.parametrize("operators", [None, [], ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]])
+def test_pilot_approval_cannot_self_authorize_operator_allowlist(upload_release, operators):
+    state = upload_release
+    state.config["pilot_operator_ids"] = operators
+    for action in (release.pilot_upload_enable, release.pilot_enable):
+        with pytest.raises(ValueError, match="pilot_operator_ids|trusted target allowlist"):
+            action(state.config, state.upload if action == release.pilot_upload_enable else state.approval, state.work)
+    with pytest.raises(ValueError, match="pilot_operator_ids|trusted target allowlist"):
+        release.pilot_configure(state.config, state.upload, state.work, "upload")
+    assert not state.calls and not state.console_calls
+
+
+def test_pilot_upload_schema_unavailability_fails_closed(upload_release, monkeypatch):
+    state = upload_release
+
+    def unavailable(*args):
+        raise AttributeError("synthetic private schema mismatch")
+
+    monkeypatch.setattr("backend.pilot_upload.validate_upload_approval", unavailable)
+    with pytest.raises(ValueError, match="invalid or unavailable") as error:
+        release.load_upload_approval(state.upload_path, state.config)
+    assert "private schema" not in str(error.value)
+    assert not state.calls and not state.console_calls
+
+
+def test_pilot_upload_enable_needs_no_real_approval_or_batch_and_preserves_flags(upload_release):
+    state = upload_release
+    before = copy.deepcopy(state.resources["backend"])
+    release.pilot_upload_enable(state.config, state.upload, state.work)
+    current = release.environment_entries(state.resources["backend"]["properties"]["template"]["containers"][0])
+    original = release.environment_entries(before["properties"]["template"]["containers"][0])
+    assert {name: entry for name, entry in current.items() if name not in release.PILOT_UPLOAD_SETTINGS} == original
+    assert {name: current[name]["value"] for name in release.PILOT_UPLOAD_SETTINGS} == release.upload_values(state.upload)
+    assert "DOCINTEL_REAL_PILOT_ENABLED" not in current
+    assert "batches/" not in state.console_calls[0][1]
+    assert "write_json(store, key, candidate)" not in state.console_calls[0][1]
+    assert (state.work / "pilot-upload-enabled.json").exists()
+    assert not (state.work / "pilot-binding.json").exists()
+    assert not (state.work / "pilot-enablement.json").exists()
+
+
+def test_pilot_upload_disable_restores_only_upload_settings(upload_release):
+    state = upload_release
+    before = copy.deepcopy(state.resources["backend"]["properties"]["template"]["containers"][0])
+    release.pilot_upload_enable(state.config, state.upload, state.work)
+    container = state.resources["backend"]["properties"]["template"]["containers"][0]
+    release.merge_environment(container, {"UNRELATED": "retained"})
+    release.pilot_upload_disable(state.config, state.work)
+    current = release.environment_entries(state.resources["backend"]["properties"]["template"]["containers"][0])
+    assert current == {**release.environment_entries(before), "UNRELATED": {"name": "UNRELATED", "value": "retained"}}
+    assert (state.work / "pilot-upload-disabled.json").exists()
+
+
+@pytest.mark.parametrize("defect", ["real-enabled", "principal", "missing-principal", "server-mismatch"])
+def test_pilot_upload_activation_fails_before_mutation(upload_release, monkeypatch, defect):
+    state = upload_release
+    if defect == "real-enabled":
+        release.merge_environment(state.resources["backend"]["properties"]["template"]["containers"][0], {"DOCINTEL_REAL_PILOT_ENABLED": "true"})
+    elif defect == "principal":
+        state.resources["backend"]["identity"]["principalId"] = "different"
+    elif defect == "missing-principal":
+        del state.config["api_principal_id"]
+    else:
+        monkeypatch.setattr(release, "console_code", lambda *args: b"no match")
+    with pytest.raises(ValueError):
+        release.pilot_upload_enable(state.config, state.upload, state.work)
+    assert not state.calls
+
+
+@pytest.mark.parametrize("payload", [{"value": "x" * 65537}, {"value": "test" * 20000}])
+def test_pilot_configure_rejects_large_raw_metadata(payload):
+    with pytest.raises(ValueError, match="64 KiB"):
+        release.bounded_metadata(payload)
+
+
+def test_pilot_configure_rejects_large_compressed_metadata():
+    import random
+    import string
+    randomizer = random.Random(1)
+    payload = {"value": "".join(randomizer.choices(string.ascii_letters + string.digits, k=20000))}
+    with pytest.raises(ValueError, match="8 KiB"):
+        release.bounded_metadata(payload)
+
+
+@pytest.mark.parametrize("existing", ["missing", "identical", "different"])
+def test_pilot_configure_remote_append_only_upload_metadata(upload_release, monkeypatch, capsys, existing):
+    from backend.batch_store import Missing
+    state = upload_release
+    key = release.PILOT_CONFIGURATION_KEYS["upload"]
+    records = {}
+    if existing != "missing":
+        records[key] = copy.deepcopy(state.upload)
+    if existing == "different":
+        records[key]["id"] = state.approval["id"]
+    writes = []
+
+    class Store:
+        def read_bytes(self, name):
+            if name not in records:
+                raise Missing(name)
+            return json.dumps(records[name]).encode(), "v1"
+
+        def write_bytes(self, name, value, version=None):
+            assert name == key and version is None
+            writes.append(name)
+            records[name] = json.loads(value)
+            return "v1"
+
+    monkeypatch.setattr("backend.batch_store.configured_store", Store)
+    monkeypatch.setenv("DOCINTEL_REAL_PILOT_OPERATOR_IDS", "")
+    monkeypatch.setenv("DOCINTEL_REAL_PILOT_ENABLED", "false")
+    monkeypatch.setenv("DOCINTEL_PILOT_UPLOAD_ENABLED", "false")
+    code, marker = release.remote_metadata_code(state.upload, "upload", state.config["tenant"], write=True)
+    assert len(base64.b64encode(code.encode())) + 80 <= 16384
+    assert "documents/" not in code
+    if existing == "different":
+        with pytest.raises(AssertionError):
+            exec(code, {})
+        assert not writes and marker not in capsys.readouterr().out
+    else:
+        exec(code, {})
+        assert marker in capsys.readouterr().out
+        assert len(writes) == (1 if existing == "missing" else 0)
+        assert records[key] == state.upload
+
+
+def test_pilot_configure_pins_metadata_but_allows_identical_confirmation_retry(upload_release):
+    state = upload_release
+    for _ in range(2):
+        release.pilot_configure(state.config, state.upload, state.work, "upload")
+    assert len(state.console_calls) == 2
+    assert (state.work / "pilot-configure-upload-attempt.json").exists()
+    assert (state.work / "pilot-configured-upload.json").exists()
+    assert not state.calls
+    state.upload["documents"][0]["bytes"] += 1
+    with pytest.raises(ValueError, match="pinned"):
+        release.pilot_configure(state.config, state.upload, state.work, "upload")
+    assert len(state.console_calls) == 2
+
+
+def test_pilot_configure_fixed_keys_and_exclusive_metadata_files(upload_release, monkeypatch):
+    from argparse import Namespace
+    state = upload_release
+    with pytest.raises(ValueError, match="fixed"):
+        release.remote_metadata_code(state.upload, "configuration/other.json", state.config["tenant"], write=True)
+    monkeypatch.setattr(release, "load_config", lambda _: state.config)
+    monkeypatch.setattr(release, "verify_target", lambda *args, **kwargs: pytest.fail("No cloud check before metadata selection"))
+    with pytest.raises(ValueError, match="exactly one"):
+        release.run(Namespace(action="pilot-configure", approve="pilot-configure", work=state.work, config=None, pilot_approval=state.approval_path, upload_approval=state.upload_path))
+
+
+def test_pilot_configure_final_approval_uses_only_real_fixed_key(pilot_release):
+    state = pilot_release
+    release.pilot_configure(state.config, state.approval, state.work, "real")
+    code = state.console_calls[0][1]
+    assert 'key = "configuration/real-pilot-approval.json"' in code or "key = 'configuration/real-pilot-approval.json'" in code
+    assert "checker._validate_approval(candidate, verify_runtime=False)" in code
+    assert (state.work / "pilot-configured-real.json").exists()
+    assert not state.calls
+
+
+def test_pilot_configure_registry_drift_fails_before_any_metadata_write(upload_release, monkeypatch):
+    from backend.batch_store import Missing
+    state = upload_release
+    state.upload["expected_registry_sha256"] = "a" * 64
+
+    class ReadOnlyStore:
+        def read_bytes(self, name, **kwargs):
+            raise Missing(name)
+
+    monkeypatch.setattr("backend.batch_store.configured_store", ReadOnlyStore)
+    for name in ("DOCINTEL_REAL_PILOT_OPERATOR_IDS", "DOCINTEL_REAL_PILOT_ENABLED", "DOCINTEL_PILOT_UPLOAD_ENABLED"):
+        monkeypatch.setenv(name, "")
+    code, _ = release.remote_metadata_code(state.upload, "upload", state.config["tenant"], write=True)
+    with pytest.raises(ValueError):
+        exec(code, {})
+
+
+@pytest.mark.parametrize("batch_exists", [True, False])
+@pytest.mark.parametrize("execution_scope", ["full", "internal_only"])
+def test_pilot_configure_final_metadata_validates_intake_before_append(pilot_release, monkeypatch, capsys, batch_exists, execution_scope):
+    from backend.batch_store import Missing
+    from backend.real_pilot import binding_digest
+    state = pilot_release
+    if execution_scope == "internal_only":
+        internal_release_approval(state)
+    batch = {
+        "id": state.approval["batch_id"], "owner": state.approval["owner"],
+        "valid": True, "product_count": 1, "attribute_reference": "synthetic.xlsx",
+        "input_hashes": {"manifest": "a" * 64, "attributes": "b" * 64},
+        "original_definitions": [{"attribute_id": "synthetic"}],
+        "items": [{"item_key": "row-2", "errors": [], "manifest": {
+            "product": {"item_id": "synthetic", "vendor": "synthetic", "mpn": "synthetic"},
+        }, "sources": []}],
+    }
+    state.approval["batch_sha256"] = binding_digest(batch)
+    records = {f"batches/{batch['id']}.json": batch} if batch_exists else {}
+    writes = []
+
+    class Store:
+        def read_bytes(self, name):
+            if name not in records:
+                raise Missing(name)
+            return json.dumps(records[name]).encode(), "v1"
+
+        def write_bytes(self, name, content, version=None):
+            assert name == release.PILOT_CONFIGURATION_KEYS["real"] and version is None
+            writes.append(name)
+            records[name] = json.loads(content)
+            return "v1"
+
+    monkeypatch.setattr("backend.batch_store.configured_store", Store)
+    monkeypatch.setenv("DOCINTEL_REAL_PILOT_OPERATOR_IDS", "")
+    code, marker = release.remote_metadata_code(state.approval, "real", state.config["tenant"], write=True)
+    if batch_exists:
+        exec(code, {})
+        assert len(writes) == 1 and marker in capsys.readouterr().out
+    else:
+        with pytest.raises(Missing):
+            exec(code, {})
+        assert not writes and marker not in capsys.readouterr().out

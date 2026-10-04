@@ -33,6 +33,13 @@ RUN mkdir -p /app/backend/static/uploads /app/backend/static/images /app/backend
 # Verify the fastapi command is available
 RUN ls -la /app/.venv/bin/ && /app/.venv/bin/fastapi --version
 
+RUN groupadd --system --gid 10001 docintel \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home docintel \
+    && chmod -R a+rX /app \
+    && chown -R docintel:docintel /app/static /app/backend/static
+
+USER 10001:10001
+
 # Expose port
 EXPOSE 80
 

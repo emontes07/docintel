@@ -101,6 +101,8 @@ def sanitized_failure(error: Exception, stage: str) -> InferenceFailure:
 
 
 def source_evidence(source: OfflineSource, observed_at: datetime) -> list[Evidence]:
+    if source.excerpts is not None:
+        return [item.model_copy(deep=True) for item in source.excerpts]
     document = source.document
     if document is None:
         return []
@@ -115,12 +117,14 @@ def source_evidence(source: OfflineSource, observed_at: datetime) -> list[Eviden
             source_id=source.source_id,
             source_locator=locator,
             source_version=document.cache_key,
-            source_tier="internal_pdf",
+            source_tier=source.source_tier,
             content_kind="source_excerpt",
             text=text,
             observed_at=observed_at,
             provider_retrieved_at=source.provider_retrieved_at,
             source_published_at=source.source_published_at,
+            attribute_ids=source.attribute_ids,
+            qualification=source.qualification,
         ))
 
     for paragraph_index, paragraph in enumerate(document.paragraphs):
@@ -144,18 +148,47 @@ def validate_response(
         for evidence_id in candidate.evidence_ids:
             if evidence_id not in citations or citations[evidence_id].content_kind != "source_excerpt":
                 raise ValueError("Candidate must cite an available source excerpt")
+            scope = citations[evidence_id].attribute_ids
+            if scope is not None and candidate.attribute_id not in scope:
+                raise ValueError("Candidate exceeds the approved product/attribute applicability")
+        if candidate.supporting_quote is not None and (
+            not candidate.supporting_quote.strip() or not any(
+                candidate.supporting_quote in citations[key].text for key in candidate.evidence_ids
+            )
+        ):
+            raise ValueError("Supporting quotation must occur verbatim in cited evidence")
         literal = str(candidate.value)
         if isinstance(candidate.value, float) and candidate.value.is_integer():
             literal = str(int(candidate.value))
-        pattern = rf"(?<!\w){re.escape(literal)}(?!\w)"
-        if not any(re.search(pattern, citations[evidence_id].text, re.IGNORECASE)
-                   for evidence_id in candidate.evidence_ids):
+        literals = ("true", "yes") if candidate.value is True else ("false", "no") if candidate.value is False else (literal,)
+        pattern = rf"(?<!\w)(?:{'|'.join(re.escape(value) for value in literals)})(?!\w)"
+        supporting_text = [candidate.supporting_quote] if candidate.supporting_quote else [
+            citations[evidence_id].text for evidence_id in candidate.evidence_ids
+        ]
+        if not any(re.search(pattern, text, re.IGNORECASE) for text in supporting_text):
             raise ValueError("Candidates require literal value support in source excerpts")
         if candidate.unit and not any(
-            re.search(rf"(?<!\w){re.escape(candidate.unit)}(?!\w)", citations[evidence_id].text, re.IGNORECASE)
-            for evidence_id in candidate.evidence_ids
+            re.search(rf"(?<!\w){re.escape(candidate.unit)}(?!\w)", text, re.IGNORECASE)
+            for text in supporting_text
         ):
             raise ValueError("Candidates require explicit unit support in source excerpts")
+        if candidate.supporting_quote and re.search(r"\b(maximum|max)\b", candidate.attribute_id, re.IGNORECASE):
+            if re.search(r"\bworking\b", candidate.supporting_quote, re.IGNORECASE) and not re.search(
+                r"\b(maximum|max)\b", candidate.supporting_quote, re.IGNORECASE
+            ):
+                raise ValueError("Working rating does not establish a maximum rating")
+        if candidate.supporting_quote and candidate.attribute_id.casefold() in {"material", "primary material", "body material"}:
+            if re.search(r"\b(o-ring|seat|stem|seal|ball|pin|washer)s?\b", candidate.supporting_quote, re.IGNORECASE) and not re.search(
+                r"\b(body|primary material)\b", candidate.supporting_quote, re.IGNORECASE
+            ):
+                raise ValueError("A component material does not establish the product/body material")
+        if candidate.supporting_quote and type(candidate.value) is bool:
+            answer = "(?:true|yes)" if candidate.value else "(?:false|no)"
+            if not re.search(
+                rf"{re.escape(candidate.attribute_id)}\s*[:=]\s*{answer}(?!\w)",
+                candidate.supporting_quote, re.IGNORECASE,
+            ):
+                raise ValueError("Boolean proposals require an explicit labeled answer, not negation or missing evidence")
 
 
 class ReplayCompletion:
@@ -188,6 +221,7 @@ def run_enrichment(
     observed_at: datetime | None = None,
     web_provider: str | None = None,
     no_retries: bool = False,
+    qualified: bool = False,
 ) -> EnrichmentResult:
     if execution_mode not in ("offline_replay", "live_inference"):
         raise ExecutionConfigurationError("Unsupported execution_mode")
@@ -221,18 +255,20 @@ def run_enrichment(
         chunks = source_evidence(source, observed_at) if source is not None and not error else []
         evidence.extend(chunks)
         retrieval.append(RetrievalOutcome(
-            source_tier="internal_pdf", source_id=source_id,
+            source_tier=source.source_tier if source is not None else "internal_pdf", source_id=source_id,
             status="failed" if error else "success" if chunks else "no_evidence",
             error_code=error,
         ))
     if not manifest.source_ids:
         retrieval.append(RetrievalOutcome(source_tier="internal_pdf", status="not_attempted"))
     for tier in ("vendor_table", "manufacturer_web", "approved_web"):
-        retrieval.append(RetrievalOutcome(source_tier=tier, status="not_attempted"))
+        if not any(outcome.source_tier == tier for outcome in retrieval):
+            retrieval.append(RetrievalOutcome(source_tier=tier, status="not_attempted"))
 
     response = ExtractionResponse(candidates=[])
     extraction_error = None
     failure = None
+    invalid_attributes = set()
     model_call_status = "not_attempted"
     missing_attributes = any(attribute.attribute_id not in manifest.existing_values for attribute in manifest.attributes)
     skip_reason = "no_missing_attributes" if not missing_attributes else "no_eligible_evidence" if not evidence else None
@@ -270,7 +306,23 @@ def run_enrichment(
             stage = "structured_response_parsing"
             response = ExtractionResponse.model_validate(response.model_dump())
             stage = "evidence_validation"
-            validate_response(response, manifest, evidence)
+            if qualified:
+                accepted = []
+                for candidate in response.candidates:
+                    try:
+                        if not candidate.supporting_quote or not candidate.qualification or not candidate.qualification.strip():
+                            raise ValueError("Real proposals require quotations and applicability qualifications")
+                        validate_response(ExtractionResponse(candidates=[candidate]), manifest, evidence)
+                        accepted.append(candidate)
+                    except ValueError as error:
+                        invalid_attributes.add(candidate.attribute_id)
+                        extraction_error = "invalid_response"
+                        failure = sanitized_failure(error, stage)
+                response = ExtractionResponse(candidates=accepted)
+            else:
+                validate_response(response, manifest, evidence)
+        except ExecutionConfigurationError:
+            raise
         except Exception as error:
             extraction_error = "invalid_response" if stage != "client_initialization" and isinstance(error, (ValidationError, ValueError, LLMSchemaValidationError)) else "model_failed"
             failure = sanitized_failure(error, stage)
@@ -283,10 +335,12 @@ def run_enrichment(
         values = {(type(candidate.value).__name__, candidate.value, candidate.unit) for candidate in candidates}
         if attribute.attribute_id in manifest.existing_values:
             status = "existing"
-        elif extraction_error:
+        elif extraction_error and not invalid_attributes:
             status = "extraction_failed"
         elif candidates:
             status = "conflict" if len(values) > 1 else "proposed"
+        elif attribute.attribute_id in invalid_attributes:
+            status = "extraction_failed"
         else:
             status = "retrieval_failed" if retrieval_failed else "missing_evidence"
         results.append(AttributeResult(attribute_id=attribute.attribute_id, status=status, candidates=candidates))

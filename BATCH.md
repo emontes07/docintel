@@ -6,10 +6,15 @@
 
 ## Status and Scope
 
-This increment implements workbook intake, durable batch submission, a finite worker,
-item exceptions, qualified Excel export, and hosted reviewer-claim validation code.
-It is **not deployed or approved for customer processing**. No Azure resources,
-permissions, customer workbooks, pilot decisions, or AI budgets were changed.
+The hosted synthetic foundation was accepted on 2026-10-03; exact deployed
+provenance and receipts remain in the private release handover. Authentication,
+owner isolation, finite continuation, review separation, and user-confirmed native
+Excel download do not establish real-product accuracy.
+
+The multi-source increment adds customer workbook mapping, vendor-row evidence,
+attribute-level fallback, and a separately guarded `real_pilot` execution mode.
+It is **not approved for customer processing** merely by being implemented or
+passing offline tests. Prior live/build allowances remain exhausted.
 
 The portal starts at `/batches` (also the home page). Local `/pilot` remains a
 development-only workflow. Both use the same evidence/review component. Batch
@@ -52,34 +57,106 @@ No customer batch was submitted.
 
 ## Workbook Contract
 
-Manifest columns: `PIMITEM Number`, `Vendor Name`, `MPN`, `Hierarchy Node`,
-`PDF Tech Spec`, `Attributes to Fill`; all other columns are retained verbatim.
+Manifest identity/selection columns: `PIMITEM Number`, `Vendor Name`, `MPN`,
+`Hierarchy Node`, `Attributes to Fill`; all original columns are retained.
 The supplied `Party ID` is retained but not substituted for the product identifier.
 `Attributes to Fill` may be the exact uploaded-workbook reference, an exact
 attribute name, or a JSON array of names. PDF references are exact registry names
-or a JSON array of names. No URLs or filesystem paths are fetched from cells.
+or a JSON array of names. The same explicit registry association applies to
+`Vendor Tabular Data`, `Vendor Website`, `Distributors`, and `Other Web Sources`.
+Missing sources are valid; an unapproved reference is not silently fetched.
 
 Definitions require `node`, `potential_attribute_name`, and
-`potential_attribute_data_type`. `node` must exactly equal the manifest hierarchy.
-Add explicit `value_type` (`string`, `number`, `integer`, `boolean`) when the declared
-type is Enumerated or Multi-Select. Numeric definitions require a `unit` column;
-an explicit blank means dimensionless. `allowed_values` is an optional JSON array.
-Examples are preserved as input but NEVER used as allowed values or model answers.
-Multi-Select currently needs an explicitly approved scalar representation; native
-set-valued attributes are not supported by the reused enrichment contract.
-
-The supplied customer definition workbook lacks a complete machine-readable unit/
-enumeration contract. Exact hierarchy and typed mapping approval remains a gate;
-the system does not infer those mappings from example answers.
+`potential_attribute_data_type`. Hierarchy inheritance follows only explicit
+`parent_node` relationships, never guessed prefixes. Enumerated/Multi-Select
+guidance uses a scalar string unless an explicit supported `value_type` is given;
+examples are not exhaustive allowed values. Numeric definitions without unit
+guidance remain unresolved; an explicit blank unit means dimensionless.
+`source_basis` is definition context, not product evidence. Original definitions
+and their context remain in the export.
 
 Only data-only XLSX is accepted: one populated worksheet, row-1 unique headers,
 contiguous rows, at most 10,000 products/256 columns/10 MiB per workbook/50 MiB
 expanded content. Formulas, macros, external workbook links, merged cells, XML
-entities, formatted numeric/date cells, ambiguous addresses and blank row gaps
+entities, unsupported numeric/date formats, ambiguous addresses and blank row gaps
 are rejected rather than silently losing identifier or row provenance. Preserve
 identifiers as text. Original workbook bytes are retained privately, not exposed
-as public files. Supplementary vendor tables/websites remain retained inputs,
-not retrieved sources in this increment.
+as public files. Harmless cell styling is allowed; explicit text identifiers and
+supported zero-padding formats preserve leading zeros. Vendor evidence uses the
+same bounded XLSX reader with explicit sheet/header/MPN/vendor mapping and a
+separate 50,001-physical-row ceiling; only exact matched product rows become
+evidence, retaining original sheet, row, and cell addresses.
+
+## Separate Real-Pilot Execution
+
+### Approved source-copy intake
+
+An operator may separately authorize exact private PDF/XLSX copies through
+`configuration/pilot-source-upload.json`. The independent
+`DOCINTEL_PILOT_UPLOAD_ENABLED` switch defaults off, so source preparation does not
+enable paid processing. Only the verified approved owner in the trusted operator
+allowlist sees the upload section in the existing batch portal.
+
+The portal sends individual multipart uploads through the existing authenticated,
+same-origin batch proxy. The backend verifies approved source identity, filename,
+byte size and SHA-256, writes immutable private objects, and finalizes only after
+all approved documents verify. The registry merge preserves existing entries and
+rejects drift against the approved prior registry hash. An identical retry is
+safe; a different upload does not overwrite evidence.
+New source bindings remain owned by the verified upload owner after the temporary
+upload capability expires or is disabled. Other users cannot list these source
+references or bind them during workbook intake. Existing shared registry entries
+retain their previous behavior.
+
+This path is limited to the separately approved small pilot. It does not grant
+general document upload, storage access or customer-processing authority. It
+records `approved_copy_not_sharepoint_ingestion`, never successful SharePoint
+ingestion. Small approval metadata may be bootstrapped by guarded release tooling;
+multi-megabyte source bytes must not be sent through the synthetic console seeder.
+
+After source finalization, ordinary workbook validation creates the persisted
+batch while real processing remains disabled. Bind the separate real-pilot
+approval to that exact persisted batch before enabling and submitting paid work.
+
+### Attribute-level execution
+
+`evidence_only` and the prior narrowly bounded live path remain unchanged in
+authority. `real_pilot` requires a separate server switch (off by default), explicit
+submission consent, and an unexpired `configuration/real-pilot-approval.json`
+matching the exact batch, verified owner, inputs, definitions, sources, and
+applicability. The worker also requires `--real-pilot`, an explicit batch ID,
+one thread, and at most four products. It never scans real batches through the
+synthetic worker path.
+
+The singleton `budgets/real-pilot.json` binds the approval immutably and reserves
+each execution/analysis/model/search/retrieval before work. Unknown remote outcomes
+are not automatically retried; editing the approval ID does not replenish budgets.
+Upper-bound cost reservations and provider-reported usage are separate from
+actual billing. Approval includes service/identity bindings, token/page limits,
+unit-price ceilings, an absolute deadline, and customer-processing authorization
+distinct from WebIQ evaluation access.
+
+The cascade keeps supported internal PDF values, supplements gaps from exact
+vendor rows, then retrieves explicitly permitted manufacturer/other web evidence.
+It queries only remaining eligible attributes, keeps conflicting values for review,
+and preserves partial success when independent sources fail. A failed budget or
+authorization guard stops execution. Cached parses require exact source version,
+location, parser version, and content hash. A prior compatible full parse can be
+reused; new analyses cover at most the first five pages and retain that limitation.
+
+WebIQ uses the documented REST `webResults`/`content` contract. Its contextual
+passages are discovery data, not accepted product facts. Original HTTPS text/HTML
+is independently retrieved on exact approved hosts with bounded bytes, no
+redirects/cookies/bearer forwarding, and public-IP-pinned TLS. Original HTML byte
+hashes survive visible-text normalization; normalized positions are not invented
+PDF/table coordinates. Supplied website references and WebIQ-discovered supporting
+pages are labeled separately. External PDFs and cross-host redirects remain
+explicitly unsupported, not fabricated successes.
+
+Every real source needs explicit per-product applicability and requested-attribute
+scope. Every accepted candidate needs an exact supporting quotation and qualification.
+Literal validation, conservative scope checks, and model confidence are not
+measured product accuracy. Human review remains pending until performed.
 
 ## Storage and Execution
 
@@ -102,7 +179,12 @@ An operator must populate `configuration/sources.json` with this shape:
 
 Blob entries use `kind: "blob"`, `blob: "documents/<approved-key>.pdf"`, a 64-character
 lowercase `sha256`, and complete `products` associations. Duplicate source IDs or
-references fail validation. SharePoint entries cannot claim a local blob/hash.
+references fail validation. Disabled legacy SharePoint entries remain unresolved.
+An enabled real-pilot SharePoint entry needs exact resolved identity, approved
+location/hash, and successful metadata, byte, version, and integrity stages; it
+cannot claim a local Blob. Retained metadata 200/content 302/download 401 did not
+establish successful ingestion or a specific missing permission. Approved local
+copies have explicitly separate copy provenance.
 Registry/documents/compatible-cache upload is an operator task, not a portal upload
 capability. No customer documents have been uploaded by this increment.
 

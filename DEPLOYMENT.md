@@ -161,9 +161,19 @@ python3.13 scripts/release.py publish --config "$CFG" --work "$WORK" --approve p
 The tool builds the root/backend and frontend contexts separately in the approved
 registry, records immutable digests and requires the committed lock/source hashes
 to match clean checks. It never uses the inherited registry or mutable `latest`.
-Each ACR build has a 900-second timeout. Absolute Dockerfile paths point into the
+Each ACR build explicitly requests **two CPUs** (`--cpu 2`) and a **900-second**
+timeout (`--timeout 900`). Absolute Dockerfile paths point into the
 verified context; only successful builds produce digest/run-ID receipts. A failure
 stops publication without automatically repeating either build.
+Full and component publication share atomic, create-once
+`backend-publication-attempt.json` / `frontend-publication-attempt.json` records
+in the same prescribed private `$WORK`. Each record is persisted before its ACR
+request: at most one backend and one frontend attempt are permitted, including
+failed or unknown outcomes and concurrent/rerun commands. Existing attempts,
+results, progress or accepted publication records are not reset or migrated.
+This enforcement is **work-directory scoped**. A different directory is not renewed
+approval; never discard receipts or switch directories to evade a consumed
+allowance. Review an unknown outcome without repeating the paid request.
 Record those digests in the private target configuration before baseline capture.
 
 ### Provisioning And Deployment
@@ -222,6 +232,258 @@ resubmit a batch to bypass interrupted work. The template omits a batch ID so an
 unconfigured start exits before storage access. Cached synthetic evidence may yield
 no candidates; test rejection without claiming an unexercised candidate approval.
 DI, model calls, customer inputs and SharePoint retries remain out of scope.
+
+### Separately Approved Four-Product Real Pilot
+
+The existing `start` and `seed` actions remain synthetic-only. Real customer work
+uses separate `pilot-configure`, `pilot-upload-enable`, `pilot-upload-disable`,
+`pilot-enable`, `pilot-start`, and `pilot-disable` actions, each
+requiring its own exact `--approve` value. These commands are tooling, not evidence
+of an approved or completed execution. Do not run them until clean locked builds,
+accepted source images, authentication, access and the actual cost approval exist.
+
+Prepare these **owner-only, untracked private** files in the same approved `$WORK`
+directory; keep it for every continuation and rollback:
+
+* Existing `source.json` and `images.json` receipts must bind the exact reviewed
+  source and immutable backend/frontend images.
+* Actual `clean-checks.json`, `backend-smoke.json`, `frontend-smoke.json`,
+  `context.json` and `context-modes.json` are mandatory. The tool verifies the
+  published source/lock, clean backend locked-install and frontend npm-ci/build
+  results, and each component's passing offline startup smoke against the exact
+  context bytes and permissions. A preserved component follows its immutable
+  publication chain to that component's original validation receipts. Existing
+  interpreter test passes are not a substitute. Both deployed ready revisions
+  must also report `Healthy` and contain the exact accepted image digest.
+* `pilot-acceptance.json` records `target` (the release tool's `fingerprint` of the
+  exact target configuration), `revision` (matching `images.json`), `backend_image`,
+  `frontend_image`, `authenticated: true`, and `synthetic_accepted: true`. A verified
+  operator records these only after the corresponding hosted acceptance succeeds;
+  the tool never manufactures acceptance.
+* `$PILOT_APPROVAL` is the exact approval object documented in
+  `backend/real_pilot.py`, including verified operator UUID, separate API/worker
+  principal UUIDs, exact batch/owner/input binding, actual conservative per-unit
+  prices, positive microdollar spend ceiling, and a currently active interval of
+  no more than twenty minutes. An unapproved draft, missing price, wrong batch,
+  excess limit or expired packet cannot activate the pilot.
+
+The exact `pilot-acceptance.json` schema is the following six fields; extra fields
+are rejected. Values below describe the contract, not a completed receipt:
+
+```text
+target: SHA256(json.dumps(complete private target config, sort_keys=True).encode())
+revision: exact images.json revision
+backend_image: exact private config backend_image, including @sha256 digest
+frontend_image: exact private config frontend_image, including @sha256 digest
+authenticated: true only after verified hosted identity/owner-isolation acceptance
+synthetic_accepted: true only after verified bounded hosted synthetic acceptance
+```
+
+Reuse the **already accepted, completed two-product synthetic batch** after the
+new deployment: read its owner-isolated API records, verify unchanged immutable
+machine-result hashes and validate the existing export. Do not start new synthetic
+worker executions to refresh this evidence; the prior synthetic execution allowance
+is exhausted. Neither pilot activation nor its preflight implicitly starts a
+synthetic worker. The local acceptance booleans must reference the operator's real
+read-only verification results; they are not proof by themselves.
+
+**Bounded metadata bootstrap and authenticated upload:** the private target
+configuration must additionally include `api_principal_id`, the independently
+verified backend managed-identity principal UUID, distinct from its API registration
+`api_client_id`. It is compared to the actual existing backend identity. Include it
+before recording the target-bound acceptance receipt; this does not create or
+change an identity or grant.
+
+The target must also contain `pilot_operator_ids`, an independently reviewed list
+of one to four canonical operator UUIDs. Every upload/configuration/real-pilot
+activation checks `approved_by` against this allowlist before remote work. The
+approval packet cannot authorize its own new operator merely by naming one.
+This allowlist is part of the complete target fingerprint in acceptance; never
+populate it automatically from an unverified candidate approval.
+
+The owner-only upload approval uses the exact `backend/pilot_upload.py` schema:
+approval/operator UUIDs, owner `tenant-UUID/object-UUID` whose object UUID is the
+approver, active expiry, expected normalized registry SHA256, exact SourceBinding
+declarations and document source IDs/filenames/byte counts/hashes. Optional input
+hashes bind both workbooks. It contains **metadata only**, never PDF/XLSX bytes,
+credentials or unrestricted upload paths.
+
+```sh
+python3.13 scripts/release.py pilot-configure --config "$CFG" --work "$WORK" \
+  --upload-approval "$UPLOAD_APPROVAL" --approve pilot-configure
+python3.13 scripts/release.py pilot-upload-enable --config "$CFG" --work "$WORK" \
+  --upload-approval "$UPLOAD_APPROVAL" --approve pilot-upload-enable
+```
+
+`pilot-configure` accepts exactly one of `--upload-approval` or `--pilot-approval`.
+The only writable keys are `configuration/pilot-source-upload.json` and
+`configuration/real-pilot-approval.json`; there is no generic key/path option.
+It validates metadata against the corresponding backend schema, requires existing
+accepted source/images/runtime/authentication and the bound API identity, and
+uses the existing backend managed identity. Metadata is limited to 64 KiB raw JSON,
+8 KiB compressed/base64 and a 16 KiB complete console frame. Writes are append-only
+conditional creates: existing different metadata is refused; an identical retry
+can verify and confirm the same stored object. Private receipts pin the exact
+metadata hash. No data document is sent through the console.
+
+`pilot-upload-enable` verifies the actual stored upload approval hash through a
+small read-only console check. It changes only `DOCINTEL_PILOT_UPLOAD_ENABLED=true`
+and `DOCINTEL_REAL_PILOT_OPERATOR_IDS`; real-pilot processing must remain disabled.
+It needs neither a real batch nor a real-pilot approval. Upload the exact approved
+documents through the existing authenticated HTTPS batch API, finalize its bounded
+registry merge, and perform ordinary authenticated intake. No new permissions,
+storage firewall changes, resources, or secrets are involved.
+
+Then restore the upload settings before enabling processing:
+
+```sh
+python3.13 scripts/release.py pilot-upload-disable --config "$CFG" --work "$WORK" \
+  --approve pilot-upload-disable
+python3.13 scripts/release.py pilot-configure --config "$CFG" --work "$WORK" \
+  --pilot-approval "$PILOT_APPROVAL" --batch-id "$BATCH_ID" --approve pilot-configure
+```
+
+Upload disable restores only the two prior upload/operator entries, requires real
+processing still disabled, and refuses drift. Neither upload activation nor
+metadata bootstrap starts a worker. The synthetic seed's empty-container and
+overwrite protections remain unchanged.
+
+The preflight requires both the actual private approval record **and the persisted
+intake batch**, not merely a predicted batch ID. To avoid an activation dependency
+cycle, populate approved sources first through the separately approved authenticated
+upload path, run ordinary authenticated intake while real-pilot processing is still
+disabled, then seed/finalize the exact approval metadata and enable real-pilot
+submission. Preseeding approval metadata against a predicted ID does not remove
+the requirement to create and verify the identical intake record before activation.
+
+Activation performs a read-only console preflight on the accepted backend: it
+checks that the stored approval matches the local object, validates the exact
+stored batch binding, and rejects an incompatible/invalidated/exhausted server
+budget. Only a bounded confirmation marker returns; customer records and secrets
+are not printed. The console validation runs in its own process and does not
+persistently enable the API or reserve an execution.
+
+```sh
+python3.13 scripts/release.py pilot-enable --config "$CFG" --work "$WORK" \
+  --pilot-approval "$PILOT_APPROVAL" --batch-id "$BATCH_ID" --approve pilot-enable
+
+# After the authenticated owner queues that exact batch in real_pilot mode:
+python3.13 scripts/release.py pilot-start --config "$CFG" --work "$WORK" \
+  --pilot-approval "$PILOT_APPROVAL" --batch-id "$BATCH_ID" \
+  --item-limit 2 --approve pilot-start
+```
+
+`pilot-enable` requires an idle manual worker and accepted authentication/images.
+It adds only `DOCINTEL_REAL_PILOT_ENABLED=true`,
+`DOCINTEL_REAL_PILOT_OPERATOR_IDS` and
+`DOCINTEL_REAL_PILOT_WORKER_PRINCIPAL_ID` to the API, preserving its distinct
+identity, all authentication settings and every unrelated value/secret reference.
+Its immutable local baseline records exactly those three prior entries. It does
+not copy worker endpoints or managed-identity client settings into the API.
+
+`pilot-start` requires an idle job, zero retries, a 600-second timeout, one
+container/replica and the approved backend digest. Its per-execution override uses:
+
+```text
+/app/.venv/bin/python -m backend.batch_worker --real-pilot --batch-id <exact-id>
+  --concurrency 1 --max-batches 1 --item-limit <1..4, within approval>
+```
+
+The job's persistent template stays unchanged. The override sets real-pilot
+enablement, trusted operator/worker IDs and the exact approved nonsecret worker
+environment, including `AOAI_API_VERSION`; inherited secret references remain
+references. `AZURE_CLIENT_ID: ""` selects a matching system-assigned worker
+principal; a nonempty client UUID must match an attached user-assigned identity.
+No assumption is made that the API and worker have the same principal.
+
+Local `pilot-binding.json` pins the entire approval/target, and exclusive
+`pilot-execution-attempt-N.json` receipts consume each attempted start before its
+Azure request. At most `limits.executions` (hard ceiling two) are allowed. A lost
+response leaves an unknown attempt and blocks automatic continuation. Inspect it;
+do not delete receipts, change approval IDs or use a fresh work directory as a
+retry mechanism. These local receipts supplement—not replace—the authoritative
+immutable server ledger at `budgets/real-pilot.json`. The worker independently
+reserves its execution and every service attempt. Analysis remains two documents,
+ten total reserved pages; inference sixteen, searches eight, original-page
+retrievals twelve and internal retrievals four, within approved token/spend bounds.
+Actual usage is separate from conservative reservations and is never billing data.
+
+#### Explicit Internal-Only Approval Scope
+
+An independently approved internal-only fallback uses the same `real_pilot` batch
+mode and CLI, with **`execution_scope: "internal_only"` in the immutable approval**.
+Omitting this optional field retains the existing `"full"` behavior; it never
+selects fallback automatically based on a failed web request or missing credential.
+Any focused WebIQ entitlement check is a separate operator decision, not something
+the worker runs to choose its scope.
+
+For internal-only approval:
+
+* Set `limits.search`, `limits.web_retrieval` and `limits.retrieval` to **zero**.
+  The last field governs remote Graph/SharePoint retrieval; this fallback uses
+  only approved, hash-checked Blob PDF/XLSX copies.
+* `unit_prices_usd` contains exactly `analysis_page`, `input_token` and
+  `output_token`, with the same required positive conservative decimal-string
+  rates. No web/search price or WebIQ entitlement is required.
+* Omit `WEBSEARCH_PROVIDER`, `WEBIQ_ENDPOINT`, `AI_FOUNDRY_PROJECT_ENDPOINT`,
+  `BING_CONNECTION_ID`, `AZURE_SEARCH_ENDPOINT` and `AZURE_SEARCH_INDEX_NAME`
+  from the approved environment. Do not include credentials.
+  `customer_processing_approved` **must remain `true` in every scope**, including
+  internal-only: approved customer-data handling and DI/model prerequisites are
+  never bypassed. This common consent flag does **not** assert WebIQ entitlement
+  or authorize external calls when the scope/budgets prohibit them.
+* Retain the same DI/LLM endpoints/deployment/API-version, operator/owner/source
+  hashes, identity, expiry, page/token/spend and execution-budget guards.
+
+`pilot-start` sets `DOCINTEL_REAL_PILOT_EXECUTION_SCOPE` in the execution override
+and removes inherited web-service settings and the WebIQ key/reference from that
+override only. It does not modify the persistent job template or API settings.
+The server approval remains authoritative; a supplied runtime scope that disagrees
+with it is rejected.
+
+The worker skips all web and remote SharePoint bindings without constructing WebIQ,
+searching, fetching original pages or reserving prohibited calls. Website references
+remain bound input metadata, never evidence. PDF/vendor-row citations and unresolved
+attributes are retained truthfully; skipped-source provenance and consumption
+metadata include the scope and flow into the existing export's Provenance sheet.
+No frontend/API mode widening or new synthetic execution is involved.
+
+The entire scope-bearing approval remains hash-bound to the existing singleton
+ledger and local release binding. Changing scope, ID or batch after binding cannot
+reset allowance or automatically convert an already-used full approval. An existing
+incompatible approval/configuration is a stop condition, not permission to overwrite
+it or create a new work directory.
+
+For the real-pilot deployment named exactly `gpt-5` (whose original
+`2025-08-07` snapshot the operator must verify), the worker explicitly requests
+`reasoning_effort="minimal"` without increasing `max_completion_tokens=2048`.
+[Microsoft's reasoning-model documentation](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning)
+and the [original GPT-5 model reference](https://developers.openai.com/api/docs/models/gpt-5)
+confirm this support. The explicit request parameters are recorded in inference
+provenance/cache records and affect that deployment's cache identity. Generic
+clients, synthetic processing and other deployment defaults remain unchanged.
+The cap still includes reasoning and visible output, so minimal effort is not a
+guarantee of a usable response; an empty/invalid response remains a counted,
+non-retried failed attempt.
+
+The existing PDF request still selects `pages="1-5"` with a 120-second polling
+bound. Offline SDK tests verify those arguments, not server handling when a PDF
+has fewer pages. No undocumented out-of-range acceptance is assumed and no
+automatic alternate-page retry is authorized.
+
+After explicit completion/stop, restore only the three API settings, even if the
+approval has expired:
+
+```sh
+python3.13 scripts/release.py pilot-disable --config "$CFG" --work "$WORK" \
+  --approve pilot-disable
+```
+
+Disable refuses an active worker or changed pilot-managed settings. It preserves
+unrelated intervening configuration changes and does not delete results, budgets,
+identities or resources. Restoring the default-off API does not erase consumed
+allowances or permit automatic reactivation. A partial mutation or unexpected
+revision/configuration requires inspection rather than blind retries.
 
 ## Local Batch Development
 

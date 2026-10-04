@@ -2,7 +2,9 @@
 
 This diagnostic is not an enrichment adapter, attribute extractor, or customer-data
 validation. It imports no application code and does not enable or integrate the
-application's WebIQ provider. Application integration is outside this checkpoint.
+application's WebIQ provider. The separate application adapter now implements the
+documented bounded REST contract, but requires explicit per-call authorization;
+running this diagnostic does not authorize or enable a customer/pilot lookup.
 
 ## Authoritative Contract
 
@@ -18,7 +20,47 @@ MCP integration. They specify `POST https://api.microsoft.ai/v3/search/web` with
 `x-apikey` authentication, not the former speculative `/search` bearer-key contract.
 The response envelope is `webResults`, not `results`; grounding is `content`, not
 `snippet`. The prior statement that no standalone contract was established is superseded
-by these references; application integration is still intentionally unavailable.
+by these references. The application adapter was checked against the public
+https://webiq.microsoft.ai/llms-full.txt Web Search reference and the diagnostic's
+consumed schema. The individual web-reference URL currently renders the marketing
+landing page; the public full-text reference supplies the contract.
+
+### Application integration status
+
+`backend/core/websearch_webiq.py` now implements one `x-apikey` POST with explicit
+`authorized=True`, exact approved HTTPS result hosts, at most three results and
+2,000 characters per passage, phase timeouts at most 15 seconds, zero retries,
+no redirects, and no environment proxies. `WebIQSearchResult.content` is explicitly
+`provider_returned_passage_unverified`; legacy `snippet` remains empty. Empty
+results and sanitized failures remain distinct. No passage alone establishes an
+attribute fact, original-source authenticity, or verified quotation.
+
+`backend/core/websearch.py:fetch_original_page` separately retrieves one explicitly
+authorized, query-free HTTPS text/HTML source from an exact host allowlist. All DNS
+answers must be public; a single validated address is pinned for the connection
+while retaining TLS hostname verification and SNI. There are no redirects,
+credentials, cookies, proxies or retries. The response is capped at 262,144 bytes;
+oversize, compressed, binary/PDF, unsupported-encoding, or incomplete responses
+fail closed. It returns untrusted plain text, source URL, SHA-256 of original response
+bytes, original media type, byte size, and local retrieval time—not verified attributes.
+HTML uses stdlib-only static text normalization (`text_normalization=html_visible_text_v1`):
+script/style/template, navigation and other non-content subtrees, comments, and
+explicitly hidden elements are discarded; entities are decoded; paragraph, line-break
+and table-row boundaries become newlines. Plain text remains decoded source text
+(`decoded_plain_text`). The hash always covers the original bytes, not normalized text.
+Empty normalized content fails closed. No browser, external stylesheet, script, image,
+or other resource is loaded. This is not complete CSS/layout visibility evaluation or
+prompt-injection prevention; visible source instructions remain untrusted. Citation
+paragraph ordinals refer only to normalized text, not original page/table coordinates.
+Socket phase timeouts are not a total deadline; OS DNS resolution has its own
+resolver timeout. Offline mocked pinning tests are not a live network certification.
+
+Neither utility persists content. Legacy raw-content persistence remains forbidden.
+Any retention must occur only in the separately authorized private pilot evidence
+path, under its own storage policy; the caller owns public vendor/MPN query
+construction, unresolved-attribute selection, identity/support validation and budget
+reservation. No live WebIQ call, customer approval, production readiness, cloud
+configuration, or deployment is established by these synthetic integration tests.
 
 The reference calls `passage` model-selected query-contextual paragraph extractions.
 The diagnostic reports only presence and character counts, without displaying passages
