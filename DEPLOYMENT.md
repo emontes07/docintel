@@ -778,6 +778,43 @@ after a fatal guard error. Interrupted items are never automatically
 resubmitted. Correcting a prompt does not reopen a closed activation, replenish
 executions or authorize another build.
 
+### One final result-preserving execution exception
+
+The separate, server-installed `configuration/real-pilot-final-rerun.json`
+amendment can authorize one additional 600-second execution only after the
+original two executions and four inference requests. It does not modify the
+original approval, recovery amendment, prior audit or any original limit.
+It binds the exact consumed ledger, two selected failed item/result hashes,
+original recovery and compatible cached parses. Other products must remain
+deferred, existing proposals/reviews block this path, and new analysis and all
+external operations remain forbidden. Its activation is at most 20 minutes
+within the readiness-anchored 90-minute operating window; the worker requires all 600
+seconds still available. At most four further inference reservations can use
+the remaining original request, token and monetary capacity.
+
+The exception is charged in the original ledger before an immutable
+`operations/real-pilot-final-rerun.json` audit records prior item states.
+Original machine-result bytes stay at their original keys. New results use
+`results/<batch>/<item>/attempts/<amendment-sha256>.json`, and the current item
+points to that result; reviews are separately scoped to that same attempt.
+An interrupted, failed or completed exception cannot be retried automatically.
+The owner-bound detail includes attempt history, and exports include optional
+`Attempts` and chunked `Attempt Records` sheets retaining prior failures,
+consumption/provenance and machine results. The normal `Results` sheet shows
+only the current attempt. No candidate is approved by recovery or export.
+
+Final-rerun preparation is entirely offline and has no live clock. Commit and
+merge the reviewed source through validation-only CI, run the exact private gate
+against that merged revision, and verify the retained baseline, remaining ledger
+capacity and complete 90-minute monetary forecast first. Only a successful,
+create-once private readiness receipt starts the 45-minute publication and
+90-minute operating windows. A failed prerequisite must not create readiness.
+Readiness binds the reviewed source, CI, private gate and cost evidence; it
+cannot be renewed by repeating the command. Publication is sequential, backend
+then frontend, and each build still needs its full 900 seconds before submission.
+No Azure operation is permitted during preparation. No incomplete deployment may
+open processing, and unused exceptions do not renew elapsed windows.
+
 The existing PDF request still selects `pages="1-5"` with a 120-second polling
 bound. Offline SDK tests verify those arguments, not server handling when a PDF
 has fewer pages. No undocumented out-of-range acceptance is assumed and no

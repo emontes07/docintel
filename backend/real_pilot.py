@@ -88,6 +88,14 @@ APPROVAL_KEY = "configuration/real-pilot-approval.json"
 BUDGET_KEY = "budgets/real-pilot.json"
 RECOVERY_KEY = "configuration/real-pilot-recovery.json"
 RECOVERY_AUDIT_KEY = "operations/real-pilot-recovery.json"
+FINAL_RERUN_KEY = "configuration/real-pilot-final-rerun.json"
+FINAL_RERUN_AUDIT_KEY = "operations/real-pilot-final-rerun.json"
+FINAL_RERUN_FIELDS = {
+    "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
+    "ledger_sha256", "prior_recovery_sha256", "prior_execution_ids",
+    "selected_item_keys", "item_sha256", "result_sha256", "cached_documents",
+    "readiness_at", "operating_expires_at", "not_before", "expires_at",
+}
 RECOVERY_FIELDS = {
     "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
     "ledger_sha256", "not_before", "expires_at", "selected_item_keys",
@@ -234,6 +242,29 @@ def validate_recovery(recovery, approval, batch, ledger, store):
     return copy.deepcopy(checker.recovery)
 
 
+def validate_final_rerun(amendment, approval, batch, ledger, store):
+    """Read-only verification of the single result-preserving execution exception."""
+    class ReadOnlyCandidate:
+        def read_bytes(self, key):
+            if key == FINAL_RERUN_KEY:
+                return json.dumps(amendment).encode(), None
+            return store.read_bytes(key)
+
+    if (_sha256(read_json(store, APPROVAL_KEY)[0]) != _sha256(approval)
+            or _sha256(read_json(store, BUDGET_KEY)[0]) != _sha256(ledger)
+            or ledger.get("approval_sha256") != _sha256(approval)
+            or ledger.get("invalidated")):
+        raise ValueError("Final rerun original approval or consumption binding changed")
+    checker = RealPilotGuard.__new__(RealPilotGuard)
+    checker.store, checker.batch = ReadOnlyCandidate(), copy.deepcopy(batch)
+    try:
+        checker._validate_approval(approval, verify_runtime=False)
+        checker.verify_recovery(ledger)
+    except (KeyError, TypeError, AttributeError):
+        raise ValueError("Incomplete or malformed final rerun prerequisite") from None
+    return copy.deepcopy(checker.final_rerun)
+
+
 class RealPilotGuard:
     def __init__(self, store, batch_record):
         self.store = store
@@ -250,12 +281,90 @@ class RealPilotGuard:
         self.approval_sha256 = _sha256(approval)
         self.batch_sha256 = binding_digest(self.batch)
         self._approval = copy.deepcopy(approval)
-        self.recovery_sha256 = _sha256(self.recovery)
+        self.recovery_sha256 = _sha256(self.active_recovery)
         self._check_existing_binding(approval)
 
     @property
     def execution_scope(self):
         return approval_scope(self._approval)
+
+    @property
+    def active_recovery(self):
+        return self.final_rerun or self.recovery
+
+    def result_key(self, item_key):
+        root = f"results/{self.batch['id']}/{item_key}"
+        return f"{root}/attempts/{self.recovery_sha256}.json" if self.final_rerun else root + ".json"
+
+    def _final_rerun(self, approval):
+        try:
+            raw, _ = self.store.read_bytes(FINAL_RERUN_KEY)
+        except Missing:
+            return None
+        if len(raw) > 65536:
+            raise ValueError("Final rerun exceeds its metadata bound")
+        amendment = json.loads(raw)
+        if not isinstance(amendment, dict) or set(amendment) != FINAL_RERUN_FIELDS:
+            raise ValueError("Final rerun schema mismatch")
+        if (self.recovery is None or type(amendment["schema_version"]) is not int
+                or amendment["schema_version"] != 1 or amendment["approved"] is not True
+                or amendment["approved_by"] != approval["approved_by"]
+                or amendment["approval_sha256"] != _sha256(approval)
+                or amendment["batch_sha256"] != approval["batch_sha256"]
+                or amendment["prior_recovery_sha256"] != _sha256(self.recovery)
+                or amendment["selected_item_keys"] != self.recovery["selected_item_keys"]
+                or amendment["cached_documents"] != self.recovery["cached_documents"]
+                or approval_scope(approval) != "internal_only"
+                or approval["limits"]["executions"] != 2):
+            raise ValueError("Final rerun must bind the original approval, recovery and selected cached workload")
+        selected = set(amendment["selected_item_keys"])
+        prior = amendment["prior_execution_ids"]
+        if (not isinstance(prior, list) or len(prior) != 2 or len(set(prior)) != 2
+                or not isinstance(amendment["item_sha256"], dict)
+                or not isinstance(amendment["result_sha256"], dict)
+                or set(amendment["item_sha256"]) != selected
+                or set(amendment["result_sha256"]) != selected):
+            raise ValueError("Final rerun requires two prior executions and exact item/result bindings")
+        hashes = [amendment["ledger_sha256"], *prior,
+                  *amendment["item_sha256"].values(), *amendment["result_sha256"].values()]
+        if not all(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) for value in hashes):
+            raise ValueError("Final rerun requires exact SHA-256 bindings")
+        ready = _timestamp(amendment["readiness_at"])
+        deadline = _timestamp(amendment["operating_expires_at"])
+        start, end = _timestamp(amendment["not_before"]), _timestamp(amendment["expires_at"])
+        if ((deadline - ready).total_seconds() != 5400
+                or not ready <= start < end <= deadline):
+            raise ValueError("Final rerun activation must fit the readiness-anchored 90-minute operating window")
+        return amendment
+
+    def _final_states(self):
+        states = {}
+        amendment = self.final_rerun
+        for item in self.batch["items"]:
+            key = item["item_key"]
+            raw, version = self.store.read_bytes(f"items/{self.batch['id']}/{key}.json")
+            state = json.loads(raw)
+            if key not in amendment["selected_item_keys"]:
+                if state.get("state") != "deferred":
+                    raise ValueError("Final rerun must leave other products deferred")
+                continue
+            if (hashlib.sha256(raw).hexdigest() != amendment["item_sha256"][key]
+                    or state.get("state") != "unresolved" or state.get("result_key")):
+                raise ValueError("Final rerun prior item history changed")
+            result, _ = self.store.read_bytes(f"results/{self.batch['id']}/{key}.json")
+            parsed = json.loads(result)
+            if (hashlib.sha256(result).hexdigest() != amendment["result_sha256"][key]
+                    or not parsed.get("extraction_error")
+                    or any(attribute.get("candidates") for attribute in parsed["attributes"])):
+                raise ValueError("Final rerun requires unchanged immutable failed results without proposals")
+            try:
+                reviews, _ = read_json(self.store, f"reviews/{self.batch['id']}/{key}.json")
+            except Missing:
+                reviews = []
+            if reviews:
+                raise ValueError("Final rerun cannot change the result associated with existing reviews")
+            states[key] = (raw, version)
+        return states
 
     def _recovery(self, approval):
         try:
@@ -293,17 +402,17 @@ class RealPilotGuard:
         return recovery
 
     def check_recovery_item(self, item):
-        if self.recovery is not None:
+        if self.active_recovery is not None:
             selected = next((entry for entry in self.batch["items"]
                              if entry["item_key"] == item.get("item_key")), None)
             if (selected is None or _sha256(selected) != _sha256(item)
-                    or item["item_key"] not in self.recovery["selected_item_keys"]):
+                    or item["item_key"] not in self.active_recovery["selected_item_keys"]):
                 raise ValueError("Item is deferred or differs from the recovery binding")
 
     def check_recovery_cache(self, key):
-        if self.recovery is not None:
+        if self.active_recovery is not None:
             raw, _ = self.store.read_bytes(key)
-            if self.recovery["cached_documents"].get(key) != hashlib.sha256(raw).hexdigest():
+            if self.active_recovery["cached_documents"].get(key) != hashlib.sha256(raw).hexdigest():
                 raise ValueError("Recovery parse cache is missing, changed or not approved")
 
     def _recovery_states(self):
@@ -334,6 +443,27 @@ class RealPilotGuard:
 
     def verify_recovery(self, ledger):
         """Read-only preflight; no new allowance, recovery write or service call."""
+        if self.final_rerun is not None:
+            amendment = self.final_rerun
+            if (_sha256(ledger) != amendment["ledger_sha256"]
+                    or list(ledger["executions"]) != amendment["prior_execution_ids"]
+                    or ledger["attempted"]["inference"] != 4
+                    or ledger["reserved"]["input_tokens"] != 92854
+                    or ledger["reserved"]["output_tokens"] != 8192
+                    or ledger.get("recovery", {}).get("sha256") != amendment["prior_recovery_sha256"]
+                    or ledger.get("final_rerun")):
+                raise ValueError("Final rerun requires the exact consumed ledger, without resetting reservations")
+            prior_audit, _ = read_json(self.store, RECOVERY_AUDIT_KEY)
+            if prior_audit.get("recovery_sha256") != amendment["prior_recovery_sha256"]:
+                raise ValueError("Prior recovery audit binding changed")
+            for key in amendment["cached_documents"]:
+                self.check_recovery_cache(key)
+            self._final_states()
+            try:
+                self.store.read_bytes(FINAL_RERUN_AUDIT_KEY)
+            except Missing:
+                return
+            raise Conflict("Final rerun already attempted; no automatic retry")
         if self.recovery is None:
             return
         if (_sha256(ledger) != self.recovery["ledger_sha256"]
@@ -357,6 +487,30 @@ class RealPilotGuard:
             return
         with self._mutex, self.store.lease(BUDGET_KEY):
             _, ledger, _ = self._fresh_ledger()
+            if self.final_rerun is not None:
+                if ledger.get("final_rerun", {}).get("execution_id") != self._execution_id:
+                    raise Conflict("Final rerun execution exception is not reserved")
+                states = self._final_states()
+                audit = {
+                    "amendment": self.final_rerun, "amendment_sha256": self.recovery_sha256,
+                    "execution_id": self._execution_id, "recorded_at": _now().isoformat(),
+                    "prior_states": {
+                        key: {"base64": base64.b64encode(raw).decode(), "version": version}
+                        for key, (raw, version) in states.items()
+                    },
+                    "prior_result_sha256": self.final_rerun["result_sha256"],
+                }
+                fence()
+                write_json(self.store, FINAL_RERUN_AUDIT_KEY, audit)
+                for key, (raw, version) in states.items():
+                    state = {
+                        "id": key, "batch_id": self.batch["id"], "state": "recovery_ready",
+                        "requested_mode": "real_pilot", "recovery_sha256": self.recovery_sha256,
+                        "result_key": self.result_key(key), "previous_attempt": json.loads(raw),
+                    }
+                    fence()
+                    write_json(self.store, f"items/{self.batch['id']}/{key}.json", state, version)
+                return
             if ledger.get("recovery", {}).get("execution_id") != self._execution_id:
                 raise Conflict("Recovery worker execution is not reserved")
             states = self._recovery_states()
@@ -425,7 +579,8 @@ class RealPilotGuard:
         if operator not in {value.strip() for value in operators if value.strip()}:
             raise ValueError("Real-pilot approving operator is not server-verified")
         self.recovery = self._recovery(approval)
-        window = self.recovery or approval
+        self.final_rerun = self._final_rerun(approval)
+        window = self.active_recovery or approval
         original_start, original_end = _timestamp(approval["not_before"]), _timestamp(approval["expires_at"])
         if self.recovery is not None and not 0 < (original_end - original_start).total_seconds() <= 1200:
             raise ValueError("Original real-pilot approval window exceeds 1200 seconds")
@@ -555,6 +710,8 @@ class RealPilotGuard:
             raise ValueError("Real-pilot budget has been invalidated")
         if ledger.get("recovery") and ledger["recovery"]["sha256"] != _sha256(self.recovery):
             raise ValueError("Real-pilot recovery changed after budget use")
+        if ledger.get("final_rerun") and ledger["final_rerun"]["sha256"] != _sha256(self.final_rerun):
+            raise ValueError("Final rerun changed after budget use")
 
     def _fresh_ledger(self):
         try:
@@ -565,7 +722,7 @@ class RealPilotGuard:
             approval = self._validate(verify_runtime=True)
             if _sha256(approval) != self.approval_sha256:
                 raise ValueError("Real-pilot approval changed")
-            if _sha256(self.recovery) != self.recovery_sha256:
+            if _sha256(self.active_recovery) != self.recovery_sha256:
                 raise ValueError("Real-pilot recovery changed")
             self._check_existing_binding(approval)
         except (ValueError, Missing):
@@ -606,11 +763,23 @@ class RealPilotGuard:
                 raise ValueError("Worker must explicitly select real_pilot mode")
             if key in ledger["executions"]:
                 raise Conflict("Real-pilot execution already attempted; no automatic retry")
-            if len(ledger["executions"]) >= approval["limits"]["executions"]:
+            limit = approval["limits"]["executions"] + (1 if self.final_rerun else 0)
+            if len(ledger["executions"]) >= limit:
                 raise ValueError("Real-pilot execution budget exhausted")
             self.verify_recovery(ledger)
+            if self.final_rerun and (_timestamp(self.final_rerun["expires_at"]) - _now()).total_seconds() < 600:
+                raise ValueError("Final rerun requires the full 600-second execution window")
             ledger["executions"][key] = {"started_at": _now().isoformat()}
-            if self.recovery is not None:
+            if self.final_rerun is not None:
+                ledger["final_rerun"] = {
+                    "sha256": self.recovery_sha256, "execution_id": key,
+                    "baseline_sha256": self.final_rerun["ledger_sha256"],
+                    "inference_before": ledger["attempted"]["inference"],
+                    "not_before": self.final_rerun["not_before"], "expires_at": self.final_rerun["expires_at"],
+                    "selected_item_keys": self.final_rerun["selected_item_keys"],
+                    "additional_execution_exception": 1,
+                }
+            elif self.recovery is not None:
                 ledger["recovery"] = {
                     "sha256": self.recovery_sha256, "execution_id": key,
                     "baseline_sha256": self.recovery["ledger_sha256"],
@@ -680,7 +849,8 @@ class RealPilotGuard:
                     raise ValueError("Recovery permits only selected-item inference; new analysis is forbidden")
                 if max_input_tokens + max_output_tokens > 30000:
                     raise RealPilotBudgetExceeded("recovery_request_tokens", max_input_tokens + max_output_tokens, 30000)
-                if ledger["attempted"]["inference"] >= 4:
+                baseline = ledger.get("final_rerun", {}).get("inference_before", 0) if self.final_rerun else 0
+                if ledger["attempted"]["inference"] >= baseline + 4:
                     raise RealPilotBudgetExceeded("recovery_inference", 1, 0)
             if self._execution_id not in ledger["executions"]:
                 raise Conflict("Real-pilot worker execution is not reserved")
@@ -764,4 +934,6 @@ class RealPilotGuard:
         output["usage_reporting_complete"] = output["unknown_usage_reservations"] == 0
         if ledger.get("recovery"):
             output["recovery"] = ledger["recovery"]
+        if ledger.get("final_rerun"):
+            output["final_rerun"] = ledger["final_rerun"]
         return copy.deepcopy(output)
