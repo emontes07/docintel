@@ -638,8 +638,9 @@ def load_config(path):
     return config
 
 
-def app(config, name):
-    return azure("containerapp", "show", "--subscription", config["subscription"], "-g", config["group"], "-n", name)
+def app(config, name, *, timeout=None):
+    options = {} if timeout is None else {"timeout": timeout}
+    return azure("containerapp", "show", "--subscription", config["subscription"], "-g", config["group"], "-n", name, **options)
 
 
 def verify_target(config, allow_isolated=False):
@@ -839,10 +840,11 @@ def patch_app(config, kind, containers, work, *, ingress=UNCHANGED_INGRESS):
     azure("rest", "--method", "PATCH", "--url", "https://management.azure.com" + resource + "?api-version=2024-03-01", "--body", "@" + str(body))
 
 
-def active_executions(config):
-    job = azure("containerapp", "job", "show", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"])
+def active_executions(config, *, timeout=None):
+    options = {} if timeout is None else {"timeout": timeout}
+    job = azure("containerapp", "job", "show", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"], **options)
     require(job["properties"]["configuration"]["triggerType"] == "Manual", "Refusing a scheduled or event-driven job")
-    executions = azure("containerapp", "job", "execution", "list", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"])
+    executions = azure("containerapp", "job", "execution", "list", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"], **options)
     return job, [entry for entry in executions if entry["properties"]["status"] not in TERMINAL]
 
 
@@ -927,7 +929,7 @@ def package(work, approved, backend_only=False):
     command(["uv", "lock", "--directory", str(source)], env=environment)
     check_lock(tomllib.loads(baseline.read_text()), tomllib.loads((source / "uv.lock").read_text()))
     command(["uv", "sync", "--locked", "--python", "3.13", "--directory", str(source)], env=environment)
-    command([str(work / ".clean-venv/bin/python"), "-m", "pytest", "tests/test_batch.py", "tests/test_batch_api.py", "tests/test_workbooks.py", "tests/test_release.py", "tests/test_pilot.py", "tests/test_pilot_api.py", "tests/test_pilot_server.py", "-q"], cwd=source, env=environment)
+    command([str(work / ".clean-venv/bin/python"), "-m", "pytest", "tests/test_batch.py", "tests/test_batch_api.py", "tests/test_workbooks.py", "tests/test_release.py", "tests/test_release_continuation.py", "tests/test_pilot.py", "tests/test_pilot_api.py", "tests/test_pilot_server.py", "-q"], cwd=source, env=environment)
     if not backend_only:
         frontend = source / "frontend"
         command(["npm", "ci", "--no-audit", "--no-fund"], cwd=frontend, env=environment)
@@ -1022,6 +1024,7 @@ def validate_publication_supplemental(approval, config, work, revision):
 
 
 def require_unused_publication(work, kinds, replacement=None, supplemental=None):
+    require_standard_release_work(work)
     require(replacement is None or supplemental is None, "Replacement and supplemental approvals are mutually exclusive")
     require(not (work / "images.json").exists() and not (work / "publication-progress.json").exists(), "Publication already attempted or accepted; no automatic retry")
     require(not any((work / name).exists() for name in SUPPLEMENTAL_PUBLICATION_RECORDS), "Supplemental publication already attempted; no automatic retry")
@@ -1035,7 +1038,14 @@ def require_unused_publication(work, kinds, replacement=None, supplemental=None)
         require(not (work / f"{stem}-attempt.json").exists() and not (work / f"{stem}-result.json").exists(), "Component publication already attempted; no automatic retry")
 
 
+def require_standard_release_work(work):
+    require(not any((directory / "continuation-baseline.json").exists()
+                    for directory in (work, *work.parents)),
+            "Pinned continuation history requires pilot_continuation.py; a context child is not a fresh allowance")
+
+
 def reserve_publication_attempt(work, kind, revision, *, replacement=None, config=None, supplemental=None):
+    require_standard_release_work(work)
     require(kind in {"backend", "frontend"}, "Unsupported publication component")
     require(replacement is None or supplemental is None, "Replacement and supplemental approvals are mutually exclusive")
     replacing = kind == "backend" and replacement is not None
@@ -1254,9 +1264,19 @@ def build_publication(config, work, kind, revision, *, replacement=None, supplem
         validate_publication_upload(upload_metadata, now=now, valid_until=valid_until)
         require(private_json(work / "metadata-preflight-result.json")["shape"] == publication_upload_metadata(upload_metadata), "Preflight metadata binding changed")
     attempt = reserve_publication_attempt(work, kind, revision, replacement=replacement, config=config, supplemental=supplemental)
-    stem = attempt.name.removesuffix("-attempt.json")
     authorization = supplemental if supplemental is not None else replacement
     expires = datetime.fromisoformat(authorization["expires_at"]) if authorization is not None else None
+    return execute_publication(
+        config, work, kind, revision, attempt, expires=expires,
+        upload_metadata=upload_metadata, validate_upload_window=supplemental is not None,
+    )
+
+
+def execute_publication(config, work, kind, revision, attempt, *, expires=None,
+                        upload_metadata=None, validate_upload_window=False):
+    """Execute an already reserved attempt; callers own the immutable authority."""
+    require(attempt.is_file(), "Publication must be reserved before requesting upload metadata")
+    stem = attempt.name.removesuffix("-attempt.json")
     deadline = time.monotonic() + min(1200, (expires - datetime.now(timezone.utc)).total_seconds() if expires else 1200)
     resource = f"https://management.azure.com/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.ContainerRegistry/registries/{config['registry']}"
     archive = work / (stem + "-context.tar.gz")
@@ -1283,8 +1303,8 @@ def build_publication(config, work, kind, revision, *, replacement=None, supplem
         save_once(work / (stem + "-upload-metadata.json"), publication_upload_metadata(upload))
         if expires is not None:
             require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no next upload/queue action")
-        if supplemental is not None:
-            now, valid_until = supplemental_upload_window(supplemental)
+        if validate_upload_window:
+            now, valid_until = supplemental_upload_window({"expires_at": expires.isoformat()})
             validate_publication_upload(upload, now=now, valid_until=valid_until)
         source = upload_publication_context(upload, archive, remaining(120))
         body = publication_request(kind, revision, source)
@@ -1300,8 +1320,8 @@ def build_publication(config, work, kind, revision, *, replacement=None, supplem
             "expires_at": expires.isoformat() if expires else None,
         }
         require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no run submitted")
-        if supplemental is not None:
-            now, valid_until = supplemental_upload_window(supplemental)
+        if validate_upload_window:
+            now, valid_until = supplemental_upload_window({"expires_at": expires.isoformat()})
             validate_publication_upload(upload, now=now, valid_until=valid_until)
         save_once(work / (stem + "-submission.json"), submission)
         attempt_id = private_json(attempt)["attempt_id"]
@@ -1493,6 +1513,8 @@ def run(options):
     if options.action in {"package", "package-backend"}:
         package(work, options.package_access_approved, backend_only=options.action == "package-backend")
         return
+    if options.action in (OPERATIONS - {"stop"}) | {"capture"}:
+        require_standard_release_work(work)
     config = load_config(options.config)
     if options.action == "plan":
         print("No Azure operation performed. Gates: reviewed private source; consistent committed lock; clean checks; approved digests; Entra scope/consent; secret references; rollback policy.")

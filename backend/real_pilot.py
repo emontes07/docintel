@@ -45,8 +45,18 @@ requires a separately reviewed operational procedure, not automatic rollover.
 ``retrieval`` counts Graph/internal source attempts separately (maximum four);
 it has no assumed billable price or token/page allowance. ``web_retrieval`` is the
 canonical operation name for the twelve-fetch web ceiling.
+
+The fixed ``configuration/real-pilot-recovery.json`` is a separate, explicitly
+approved amendment, never a replacement approval or allowance. It binds the
+original approval, batch, one consumed execution, exact pre-inference ledger,
+two interrupted item records and compatible cached parses. Its later window is
+at most 1200 seconds. Only four selected-item inference requests are permitted,
+each reserving at most 30000 input-plus-output tokens. New analysis is forbidden.
+The remaining execution is charged before an immutable history audit and fenced
+conditional status recovery; every other batch item is explicitly deferred.
 """
 
+import base64
 import copy
 import hashlib
 import json
@@ -76,6 +86,13 @@ class RealPilotBudgetExceeded(ValueError):
 
 APPROVAL_KEY = "configuration/real-pilot-approval.json"
 BUDGET_KEY = "budgets/real-pilot.json"
+RECOVERY_KEY = "configuration/real-pilot-recovery.json"
+RECOVERY_AUDIT_KEY = "operations/real-pilot-recovery.json"
+RECOVERY_FIELDS = {
+    "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
+    "ledger_sha256", "not_before", "expires_at", "selected_item_keys",
+    "interrupted_sha256", "cached_documents", "prior_execution_id",
+}
 HARD_LIMITS = {
     "products": 4,
     "executions": 2,
@@ -194,6 +211,29 @@ def current_environment():
     return result
 
 
+def validate_recovery(recovery, approval, batch, ledger, store):
+    """Validate a proposed recovery against live bytes without any write methods."""
+    class ReadOnlyCandidate:
+        def read_bytes(self, key):
+            if key == RECOVERY_KEY:
+                return json.dumps(recovery).encode(), None
+            return store.read_bytes(key)
+
+    if (_sha256(read_json(store, APPROVAL_KEY)[0]) != _sha256(approval)
+            or _sha256(read_json(store, BUDGET_KEY)[0]) != _sha256(ledger)
+            or ledger.get("approval_sha256") != _sha256(approval)
+            or ledger.get("invalidated")):
+        raise ValueError("Recovery original approval or consumption binding changed")
+    checker = RealPilotGuard.__new__(RealPilotGuard)
+    checker.store, checker.batch = ReadOnlyCandidate(), copy.deepcopy(batch)
+    try:
+        checker._validate_approval(approval, verify_runtime=False)
+        checker.verify_recovery(ledger)
+    except (KeyError, TypeError, AttributeError):
+        raise ValueError("Incomplete or malformed recovery prerequisite") from None
+    return copy.deepcopy(checker.recovery)
+
+
 class RealPilotGuard:
     def __init__(self, store, batch_record):
         self.store = store
@@ -210,11 +250,144 @@ class RealPilotGuard:
         self.approval_sha256 = _sha256(approval)
         self.batch_sha256 = binding_digest(self.batch)
         self._approval = copy.deepcopy(approval)
+        self.recovery_sha256 = _sha256(self.recovery)
         self._check_existing_binding(approval)
 
     @property
     def execution_scope(self):
         return approval_scope(self._approval)
+
+    def _recovery(self, approval):
+        try:
+            raw, _ = self.store.read_bytes(RECOVERY_KEY)
+        except Missing:
+            return None
+        if len(raw) > 65536:
+            raise ValueError("Real-pilot recovery exceeds its metadata bound")
+        recovery = json.loads(raw)
+        if not isinstance(recovery, dict) or set(recovery) != RECOVERY_FIELDS:
+            raise ValueError("Real-pilot recovery schema mismatch")
+        if (type(recovery["schema_version"]) is not int or recovery["schema_version"] != 1
+                or recovery["approved"] is not True
+                or recovery["approved_by"] != approval["approved_by"]
+                or recovery["approval_sha256"] != _sha256(approval)
+                or recovery["batch_sha256"] != approval["batch_sha256"]
+                or approval_scope(approval) != "internal_only"):
+            raise ValueError("Real-pilot recovery approval/batch/operator binding mismatch")
+        selected = recovery["selected_item_keys"]
+        if (not isinstance(selected, list) or len(selected) != 2
+                or not all(isinstance(key, str) for key in selected)
+                or len(set(selected)) != 2
+                or not set(selected) <= {item["item_key"] for item in self.batch["items"]}):
+            raise ValueError("Recovery requires exactly two existing selected items")
+        interrupted = recovery["interrupted_sha256"]
+        caches = recovery["cached_documents"]
+        if (not isinstance(interrupted, dict) or set(interrupted) != set(selected)
+                or not isinstance(caches, dict) or not 1 <= len(caches) <= 2
+                or not all(re.fullmatch(r"parses/[a-f0-9]{64}\.json", key) for key in caches)):
+            raise ValueError("Recovery must bind interrupted states and existing parse caches")
+        hashes = [recovery["ledger_sha256"], recovery["prior_execution_id"],
+                  *interrupted.values(), *caches.values()]
+        if not all(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) for value in hashes):
+            raise ValueError("Recovery requires exact SHA-256 bindings")
+        return recovery
+
+    def check_recovery_item(self, item):
+        if self.recovery is not None:
+            selected = next((entry for entry in self.batch["items"]
+                             if entry["item_key"] == item.get("item_key")), None)
+            if (selected is None or _sha256(selected) != _sha256(item)
+                    or item["item_key"] not in self.recovery["selected_item_keys"]):
+                raise ValueError("Item is deferred or differs from the recovery binding")
+
+    def check_recovery_cache(self, key):
+        if self.recovery is not None:
+            raw, _ = self.store.read_bytes(key)
+            if self.recovery["cached_documents"].get(key) != hashlib.sha256(raw).hexdigest():
+                raise ValueError("Recovery parse cache is missing, changed or not approved")
+
+    def _recovery_states(self):
+        states = {}
+        for item in self.batch["items"]:
+            key = item["item_key"]
+            for prefix in ("results", "reviews"):
+                try:
+                    self.store.read_bytes(f"{prefix}/{self.batch['id']}/{key}.json")
+                except Missing:
+                    pass
+                else:
+                    raise ValueError("Recovery cannot overwrite existing machine results or reviews")
+            path = f"items/{self.batch['id']}/{key}.json"
+            try:
+                raw, version = self.store.read_bytes(path)
+            except Missing:
+                if key in self.recovery["selected_item_keys"]:
+                    raise ValueError("Recovery requires the original interrupted item state") from None
+                states[key] = (None, None)
+                continue
+            if (key not in self.recovery["selected_item_keys"]
+                    or hashlib.sha256(raw).hexdigest() != self.recovery["interrupted_sha256"][key]
+                    or json.loads(raw).get("state") != "interrupted"):
+                raise ValueError("Recovery item history changed or a deferred item was already attempted")
+            states[key] = (raw, version)
+        return states
+
+    def verify_recovery(self, ledger):
+        """Read-only preflight; no new allowance, recovery write or service call."""
+        if self.recovery is None:
+            return
+        if (_sha256(ledger) != self.recovery["ledger_sha256"]
+                or list(ledger["executions"]) != [self.recovery["prior_execution_id"]]
+                or ledger["attempted"]["inference"] != 0
+                or ledger["reserved"]["input_tokens"] != 0
+                or ledger["reserved"]["output_tokens"] != 0):
+            raise ValueError("Recovery requires the exact prior pre-inference consumption snapshot")
+        for key in self.recovery["cached_documents"]:
+            self.check_recovery_cache(key)
+        self._recovery_states()
+        try:
+            self.store.read_bytes(RECOVERY_AUDIT_KEY)
+        except Missing:
+            return
+        raise Conflict("Recovery was already attempted; no automatic retry")
+
+    def prepare_recovery(self, fence):
+        """Called under the batch lease, after charging the final worker slice."""
+        if self.recovery is None:
+            return
+        with self._mutex, self.store.lease(BUDGET_KEY):
+            _, ledger, _ = self._fresh_ledger()
+            if ledger.get("recovery", {}).get("execution_id") != self._execution_id:
+                raise Conflict("Recovery worker execution is not reserved")
+            states = self._recovery_states()
+            audit = {
+                "recovery_sha256": self.recovery_sha256,
+                "recovery": self.recovery, "execution_id": self._execution_id,
+                "recorded_at": _now().isoformat(),
+                "prior_states": {
+                    key: {"base64": base64.b64encode(raw).decode(), "version": version}
+                    for key, (raw, version) in states.items() if raw is not None
+                },
+            }
+            fence()
+            write_json(self.store, RECOVERY_AUDIT_KEY, audit)
+            for item in self.batch["items"]:
+                key = item["item_key"]
+                raw, version = states[key]
+                state = {
+                    "id": key, "batch_id": self.batch["id"],
+                    "recovery_sha256": self.recovery_sha256,
+                    "requested_mode": "real_pilot",
+                }
+                if raw is not None:
+                    state.update(state="recovery_ready", previous_attempt=json.loads(raw))
+                else:
+                    state.update(
+                        state="deferred", deferred_at=_now().isoformat(),
+                        error="Deferred by the two-product recovery scope; no enrichment attempted.",
+                    )
+                fence()
+                write_json(self.store, f"items/{self.batch['id']}/{key}.json", state, version)
 
     def _invalidate_existing(self, reason):
         with self.store.lease(BUDGET_KEY):
@@ -251,7 +424,14 @@ class RealPilotGuard:
         operators = os.environ.get("DOCINTEL_REAL_PILOT_OPERATOR_IDS", "").split(",")
         if operator not in {value.strip() for value in operators if value.strip()}:
             raise ValueError("Real-pilot approving operator is not server-verified")
-        start, end = _timestamp(approval["not_before"]), _timestamp(approval["expires_at"])
+        self.recovery = self._recovery(approval)
+        window = self.recovery or approval
+        original_start, original_end = _timestamp(approval["not_before"]), _timestamp(approval["expires_at"])
+        if self.recovery is not None and not 0 < (original_end - original_start).total_seconds() <= 1200:
+            raise ValueError("Original real-pilot approval window exceeds 1200 seconds")
+        start, end = _timestamp(window["not_before"]), _timestamp(window["expires_at"])
+        if self.recovery is not None and start < original_end:
+            raise ValueError("Recovery window must follow the original approval window")
         if not 0 < (end - start).total_seconds() <= 1200 or not start <= _now() < end:
             raise ValueError("Real-pilot approval is not active or exceeds 1200 seconds")
         if approval["customer_processing_approved"] is not True:
@@ -373,6 +553,8 @@ class RealPilotGuard:
             raise ValueError("Real-pilot approval changed after first budget use")
         if ledger.get("invalidated"):
             raise ValueError("Real-pilot budget has been invalidated")
+        if ledger.get("recovery") and ledger["recovery"]["sha256"] != _sha256(self.recovery):
+            raise ValueError("Real-pilot recovery changed after budget use")
 
     def _fresh_ledger(self):
         try:
@@ -383,6 +565,8 @@ class RealPilotGuard:
             approval = self._validate(verify_runtime=True)
             if _sha256(approval) != self.approval_sha256:
                 raise ValueError("Real-pilot approval changed")
+            if _sha256(self.recovery) != self.recovery_sha256:
+                raise ValueError("Real-pilot recovery changed")
             self._check_existing_binding(approval)
         except (ValueError, Missing):
             if ledger is not None and not ledger.get("invalidated"):
@@ -390,6 +574,8 @@ class RealPilotGuard:
                 write_json(self.store, BUDGET_KEY, ledger, version)
             raise
         if ledger is None:
+            if self.recovery is not None:
+                raise ValueError("Recovery cannot create a fresh consumption ledger")
             ledger = {
                 "schema_version": 1, "approval_id": self.approval_id,
                 "execution_scope": self.execution_scope,
@@ -422,13 +608,22 @@ class RealPilotGuard:
                 raise Conflict("Real-pilot execution already attempted; no automatic retry")
             if len(ledger["executions"]) >= approval["limits"]["executions"]:
                 raise ValueError("Real-pilot execution budget exhausted")
+            self.verify_recovery(ledger)
             ledger["executions"][key] = {"started_at": _now().isoformat()}
+            if self.recovery is not None:
+                ledger["recovery"] = {
+                    "sha256": self.recovery_sha256, "execution_id": key,
+                    "baseline_sha256": self.recovery["ledger_sha256"],
+                    "not_before": self.recovery["not_before"], "expires_at": self.recovery["expires_at"],
+                    "selected_item_keys": self.recovery["selected_item_keys"],
+                }
             write_json(self.store, BUDGET_KEY, ledger, version)
             self._execution_id = key
         return key
 
     def operation_key(self, item, *, tier, source_version, prompt_version):
         """Bind an action to the exact approved item; never include a retry nonce."""
+        self.check_recovery_item(item)
         selected = next((entry for entry in self.batch["items"] if entry["item_key"] == item.get("item_key")), None)
         if selected is None or _sha256(selected) != _sha256(item):
             raise ValueError("Real-pilot operation item is not approved")
@@ -480,6 +675,13 @@ class RealPilotGuard:
             approval, ledger, version = self._fresh_ledger()
             if approval_scope(approval) == "internal_only" and operation in EXTERNAL_OPERATIONS:
                 raise ValueError("External operations are forbidden by internal-only approval")
+            if self.recovery is not None:
+                if operation != "inference" or item_key not in self.recovery["selected_item_keys"]:
+                    raise ValueError("Recovery permits only selected-item inference; new analysis is forbidden")
+                if max_input_tokens + max_output_tokens > 30000:
+                    raise RealPilotBudgetExceeded("recovery_request_tokens", max_input_tokens + max_output_tokens, 30000)
+                if ledger["attempted"]["inference"] >= 4:
+                    raise RealPilotBudgetExceeded("recovery_inference", 1, 0)
             if self._execution_id not in ledger["executions"]:
                 raise Conflict("Real-pilot worker execution is not reserved")
             if key in ledger["reservations"]:
@@ -560,4 +762,6 @@ class RealPilotGuard:
             reservation["actual_usage"] is None for reservation in ledger["reservations"].values()
         )
         output["usage_reporting_complete"] = output["unknown_usage_reservations"] == 0
+        if ledger.get("recovery"):
+            output["recovery"] = ledger["recovery"]
         return copy.deepcopy(output)

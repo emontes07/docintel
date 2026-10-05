@@ -803,3 +803,352 @@ def test_actual_private_four_product_prompt_bounds():
         total += (len((record["system"] + COMPACT_PROMPT_INSTRUCTIONS).encode()) + len(compact.encode())
                   + len(json.dumps(record["schema"]).encode()) + 4096)
     assert total <= 200000
+
+
+@pytest.fixture
+def recovery_case(configured, monkeypatch):
+    from backend import real_pilot
+    from backend.batch_worker import PARSER_VERSION, digest
+
+    store, record, approval = configured
+    pacing_clock = [0.0]
+    monkeypatch.setattr("backend.batch_worker.monotonic", lambda: pacing_clock[0])
+    monkeypatch.setattr("backend.batch_worker.sleep", lambda delay: pacing_clock.__setitem__(0, pacing_clock[0] + delay))
+    two_items(configured)
+    for index in (3, 4):
+        item = copy.deepcopy(record["items"][0])
+        item.update(item_key=f"row-{index + 1}", row=index + 1)
+        item["manifest"]["product"].update(item_id=f"00{index}", mpn=f"PART-00{index}")
+        item["original"].update({"PIMITEM Number": f"00{index}", "MPN": f"PART-00{index}"})
+        record["items"].append(item)
+    record["product_count"] = approval["limits"]["products"] = 4
+    approval["batch_sha256"] = binding_digest(record)
+    _, version = read_json(store, f"batches/{record['id']}.json")
+    write_json(store, f"batches/{record['id']}.json", record, version)
+    internal_only(configured, monkeypatch)
+    guard = RealPilotGuard(store, record)
+    prior_execution = guard.before_execution("prior-failed-worker")
+    reservation = guard.reserve(
+        "analysis", guard.operation_key(record["items"][0], tier="analysis",
+                                       source_version="original", prompt_version="original"),
+        item_key="row-2", analysis_pages=5,
+    )
+    guard.record_usage(reservation["reservation_id"], analysis_pages=1)
+    interrupted, caches = {}, {}
+    for item in record["items"][:2]:
+        state = {"state": "interrupted", "started_at": "preserved-original-time",
+                 "error": "Prior execution failed before inference"}
+        key = f"items/{record['id']}/{item['item_key']}.json"
+        write_json(store, key, state)
+        interrupted[item["item_key"]] = digest(store.read_bytes(key)[0])
+        binding = item["sources"][0]
+        location = "batchblob:///" + binding["blob"]
+        cache = "parses/" + digest((location + binding["sha256"] + PARSER_VERSION + ":pages=1-5").encode()) + ".json"
+        text = f"Synthetic {item['manifest']['product']['mpn']}; Body Material: brass"
+        document = ParsedDocument(
+            source=location, cache_key="sha256:" + binding["sha256"],
+            parsed_at=datetime.now(timezone.utc), raw_text=text,
+            paragraphs=[ParsedParagraph(text=text, page_number=1)],
+        )
+        write_json(store, cache, {
+            "parser_version": PARSER_VERSION, "origin": "prior_synthetic_fixture_analysis",
+            "document": document.model_dump(mode="json"),
+            "document_sha256": digest(document.model_dump_json().encode()),
+        })
+        caches[cache] = digest(store.read_bytes(cache)[0])
+    original_ledger = read_json(store, real_pilot.BUDGET_KEY)[0]
+    start = datetime.fromisoformat(approval["expires_at"]) + timedelta(seconds=1)
+    recovery = {
+        "schema_version": 1, "approved": True, "approved_by": approval["approved_by"],
+        "approval_sha256": real_pilot._sha256(approval), "batch_sha256": approval["batch_sha256"],
+        "ledger_sha256": real_pilot._sha256(original_ledger), "prior_execution_id": prior_execution,
+        "not_before": start.isoformat(), "expires_at": (start + timedelta(minutes=20)).isoformat(),
+        "selected_item_keys": ["row-2", "row-3"],
+        "interrupted_sha256": interrupted, "cached_documents": caches,
+    }
+    write_json(store, real_pilot.RECOVERY_KEY, recovery)
+    monkeypatch.setattr(real_pilot, "_now", lambda: start + timedelta(seconds=1))
+    return store, record, approval, recovery, original_ledger
+
+
+def test_recovery_runs_only_selected_cached_items_preserving_history(recovery_case, monkeypatch):
+    import base64
+    from backend import real_pilot
+    from backend.workbooks import read_workbook
+
+    store, record, approval, recovery, previous = recovery_case
+    analyses, _, _, calls = install_services(monkeypatch)
+    original_approval = store.read_bytes(real_pilot.APPROVAL_KEY)[0]
+    run_batch(store, record["id"], concurrency=1, item_limit=2)
+    assert not analyses and len(calls) == 2
+    ledger = read_json(store, real_pilot.BUDGET_KEY)[0]
+    assert len(ledger["executions"]) == 2
+    assert ledger["attempted"]["analysis"] == 1
+    assert ledger["reserved"]["analysis_pages"] == 5
+    assert all(ledger["executions"][key] == value for key, value in previous["executions"].items())
+    assert all(ledger["reservations"][key] == value for key, value in previous["reservations"].items())
+    assert store.read_bytes(real_pilot.APPROVAL_KEY)[0] == original_approval
+    audit = read_json(store, real_pilot.RECOVERY_AUDIT_KEY)[0]
+    for item in record["items"][:2]:
+        key = item["item_key"]
+        state = read_json(store, f"items/{record['id']}/{key}.json")[0]
+        raw = base64.b64decode(audit["prior_states"][key]["base64"])
+        assert hashlib.sha256(raw).hexdigest() == recovery["interrupted_sha256"][key]
+        assert state["previous_attempt"] == json.loads(raw)
+    for item in record["items"][2:]:
+        state = read_json(store, f"items/{record['id']}/{item['item_key']}.json")[0]
+        assert state["state"] == "deferred" and "started_at" not in state
+        assert not store.keys(f"results/{record['id']}/{item['item_key']}")
+    batch = read_json(store, f"batches/{record['id']}.json")[0]
+    assert batch["state"] == "deferred"
+    assert batch["progress"]["finished"] == batch["progress"]["deferred"] == 2
+    exported = read_workbook(BatchService(store).export(record["id"], record["owner"]))
+    assert [row["State"] for row in exported["Errors"]][-2:] == ["deferred", "deferred"]
+    with pytest.raises(Missing):
+        BatchService(store).export(record["id"], "another-owner")
+    before = store.read_bytes(real_pilot.BUDGET_KEY)[0]
+    run_batch(store, record["id"], concurrency=1, item_limit=2)
+    assert store.read_bytes(real_pilot.BUDGET_KEY)[0] == before
+
+
+@pytest.mark.parametrize("failure", ["changed_cache", "changed_state", "existing_result", "existing_review", "changed_ledger", "wrong_limit"])
+def test_recovery_preflight_denials_do_not_consume_worker(recovery_case, failure):
+    from backend import real_pilot
+
+    store, record, _, recovery, _ = recovery_case
+    if failure == "changed_cache":
+        path = next(iter(recovery["cached_documents"]))
+        _, version = store.read_bytes(path)
+        store.write_bytes(path, b"{}", version)
+    elif failure == "changed_state":
+        path = f"items/{record['id']}/row-2.json"
+        _, version = read_json(store, path)
+        write_json(store, path, {"state": "interrupted", "changed": True}, version)
+    elif failure in {"existing_result", "existing_review"}:
+        prefix = "results" if failure == "existing_result" else "reviews"
+        write_json(store, f"{prefix}/{record['id']}/row-2.json", {})
+    elif failure == "changed_ledger":
+        ledger, version = read_json(store, real_pilot.BUDGET_KEY)
+        ledger["actual_billed_microdollars"] = 1
+        write_json(store, real_pilot.BUDGET_KEY, ledger, version)
+    before = store.read_bytes(real_pilot.BUDGET_KEY)[0]
+    with pytest.raises(ValueError):
+        run_batch(store, record["id"], concurrency=1, item_limit=4 if failure == "wrong_limit" else 2)
+    assert store.read_bytes(real_pilot.BUDGET_KEY)[0] == before
+    assert not store.keys(real_pilot.RECOVERY_AUDIT_KEY)
+    assert read_json(store, f"items/{record['id']}/row-2.json")[0]["state"] == "interrupted"
+
+
+def test_recovery_guard_forbids_analysis_external_and_deferred_item(recovery_case):
+    from backend import real_pilot
+
+    store, record, *_ = recovery_case
+    guard = RealPilotGuard(store, record)
+    guard.before_execution("last-worker")
+    before = store.read_bytes(real_pilot.BUDGET_KEY)[0]
+    with pytest.raises(ValueError, match="deferred"):
+        guard.operation_key(record["items"][2], tier="pdf", source_version="x", prompt_version="x")
+    for operation in ("analysis", "search", "web_retrieval", "retrieval"):
+        key = guard.operation_key(record["items"][0], tier=operation, source_version="x", prompt_version="x")
+        with pytest.raises(ValueError):
+            guard.reserve(operation, key, item_key="row-2", analysis_pages=5 if operation == "analysis" else 0)
+    assert store.read_bytes(real_pilot.BUDGET_KEY)[0] == before
+
+
+def test_recovery_fatal_guard_preserves_next_interrupted_history(recovery_case, monkeypatch):
+    from backend import real_pilot
+    from backend.extract import ExecutionConfigurationError
+
+    store, record, _, recovery, _ = recovery_case
+    install_services(monkeypatch)
+    def fatal(*args, **kwargs):
+        raise ValueError("Authorization changed")
+    monkeypatch.setattr(RealPilotGuard, "reserve", fatal)
+    with pytest.raises(ExecutionConfigurationError):
+        run_batch(store, record["id"], concurrency=1, item_limit=2)
+    second = read_json(store, f"items/{record['id']}/row-3.json")[0]
+    assert second["state"] == "recovery_ready"
+    assert second["previous_attempt"]["state"] == "interrupted"
+    assert "started_at" not in second
+    assert not store.keys("results/")
+    ledger = read_json(store, real_pilot.BUDGET_KEY)[0]
+    assert len(ledger["executions"]) == 2 and ledger["attempted"]["inference"] == 0
+    with pytest.raises(ValueError, match="execution budget exhausted"):
+        run_batch(store, record["id"], concurrency=1, item_limit=2)
+
+
+def test_recovery_caps_inference_without_resetting_original_allowances(recovery_case):
+    from backend import real_pilot
+
+    store, record, _, recovery, previous = recovery_case
+    guard = RealPilotGuard(store, record)
+    guard.before_execution("last-worker")
+    for index in range(4):
+        key = guard.operation_key(record["items"][index % 2], tier="pdf", source_version=str(index), prompt_version="x")
+        guard.reserve("inference", key, item_key=record["items"][index % 2]["item_key"],
+                      max_input_tokens=100, max_output_tokens=2048)
+    before = store.read_bytes(real_pilot.BUDGET_KEY)[0]
+    key = guard.operation_key(record["items"][0], tier="pdf", source_version="excess", prompt_version="x")
+    with pytest.raises(real_pilot.RealPilotBudgetExceeded, match="recovery_inference"):
+        guard.reserve("inference", key, item_key="row-2", max_input_tokens=100, max_output_tokens=2048)
+    assert store.read_bytes(real_pilot.BUDGET_KEY)[0] == before
+
+
+def test_recovery_validation_is_read_only_and_requires_current_bindings(recovery_case):
+    from backend import real_pilot
+
+    store, batch, approval, recovery, ledger = recovery_case
+    before = {key: store.read_bytes(key) for key in store.keys("")}
+    assert real_pilot.validate_recovery(recovery, approval, batch, ledger, store) == recovery
+    bad = {**recovery, "approved": False}
+    with pytest.raises(ValueError):
+        real_pilot.validate_recovery(bad, approval, batch, ledger, store)
+    assert before == {key: store.read_bytes(key) for key in store.keys("")}
+
+
+def test_recovery_pacing_and_per_request_capacity(recovery_case, monkeypatch):
+    from backend import real_pilot
+
+    store, record, *_ = recovery_case
+    guard = RealPilotGuard(store, record)
+    guard.before_execution("last-worker")
+    processor = RealBatchProcessor(store, record, guard)
+    clock, delays = [0.0], []
+    monkeypatch.setattr("backend.batch_worker.monotonic", lambda: clock[0])
+    def wait(delay):
+        delays.append(delay)
+        clock[0] += delay
+    monkeypatch.setattr("backend.batch_worker.sleep", wait)
+    for index in range(4):
+        key = processor.key(record["items"][0], "inference", str(index))
+        processor.reserve_real("inference", key, item_key="row-2", max_input_tokens=100, max_output_tokens=2048)
+    assert delays == [61, 61, 61]
+    before = store.read_bytes(real_pilot.BUDGET_KEY)[0]
+    key = processor.key(record["items"][0], "inference", "too-large")
+    with pytest.raises(real_pilot.RealPilotBudgetExceeded, match="recovery_request_tokens"):
+        guard.reserve("inference", key, item_key="row-2", max_input_tokens=28000, max_output_tokens=2048)
+    assert store.read_bytes(real_pilot.BUDGET_KEY)[0] == before
+
+
+@pytest.mark.parametrize("change", ["operator", "approval", "window", "selection"])
+def test_recovery_cannot_change_authority_or_expand_scope(recovery_case, change):
+    from backend import real_pilot
+
+    store, batch, approval, recovery, ledger = recovery_case
+    candidate = copy.deepcopy(recovery)
+    if change == "operator":
+        candidate["approved_by"] = "99999999-9999-4999-8999-999999999999"
+    elif change == "approval":
+        candidate["approval_sha256"] = "f" * 64
+    elif change == "window":
+        candidate["expires_at"] = (datetime.fromisoformat(candidate["not_before"]) + timedelta(seconds=1201)).isoformat()
+    else:
+        candidate["selected_item_keys"].append("row-4")
+    before = {key: store.read_bytes(key) for key in store.keys("")}
+    with pytest.raises(ValueError):
+        real_pilot.validate_recovery(candidate, approval, batch, ledger, store)
+    assert before == {key: store.read_bytes(key) for key in store.keys("")}
+
+
+def test_recovery_cache_loss_after_start_cannot_trigger_new_analysis(recovery_case, monkeypatch):
+    from backend.extract import ExecutionConfigurationError
+
+    store, record, _, recovery, previous = recovery_case
+    analyses, _, _, calls = install_services(monkeypatch)
+    started = [False]
+    original_read = store.read_bytes
+    original_call = RealBatchProcessor.__call__
+    def read(key, *args, **kwargs):
+        if started[0] and key in recovery["cached_documents"]:
+            raise Missing(key)
+        return original_read(key, *args, **kwargs)
+    def execute(processor, item, mode):
+        started[0] = True
+        return original_call(processor, item, mode)
+    monkeypatch.setattr(store, "read_bytes", read)
+    monkeypatch.setattr(RealBatchProcessor, "__call__", execute)
+    with pytest.raises(ExecutionConfigurationError, match="authorization or consumption guard"):
+        run_batch(store, record["id"], concurrency=1, item_limit=2)
+    assert not analyses and not calls
+    ledger = read_json(store, "budgets/real-pilot.json")[0]
+    assert ledger["reservations"] == previous["reservations"]
+    assert ledger["attempted"]["analysis"] == 1 and ledger["attempted"]["inference"] == 0
+    second = read_json(store, f"items/{record['id']}/row-3.json")[0]
+    assert second["state"] == "recovery_ready" and "started_at" not in second
+
+
+def test_recovery_fences_history_writes_after_lease_loss(recovery_case, monkeypatch):
+    from contextlib import contextmanager
+    from backend import real_pilot
+
+    store, record, *_ = recovery_case
+    original_lease = store.lease
+    def lost():
+        raise Conflict("Batch lease lost")
+    @contextmanager
+    def lease(key):
+        with original_lease(key) as renew:
+            yield lost if key == record["id"] else renew
+    monkeypatch.setattr(store, "lease", lease)
+    with pytest.raises(Conflict, match="Batch lease lost"):
+        run_batch(store, record["id"], concurrency=1, item_limit=2)
+    assert len(read_json(store, real_pilot.BUDGET_KEY)[0]["executions"]) == 2
+    assert not store.keys(real_pilot.RECOVERY_AUDIT_KEY)
+    assert not store.keys("results/")
+    for key in ("row-2", "row-3"):
+        assert read_json(store, f"items/{record['id']}/{key}.json")[0]["state"] == "interrupted"
+
+
+def test_recovery_api_reports_deferral_and_keeps_owner_review_boundary(recovery_case, monkeypatch):
+    from fastapi.testclient import TestClient
+    from backend.batch_api import development_app
+    from backend.batch_auth import actor
+
+    store, record, *_ = recovery_case
+    install_services(monkeypatch)
+    run_batch(store, record["id"], concurrency=1, item_limit=2)
+    monkeypatch.setattr("backend.batch_api.service", lambda: BatchService(store))
+    monkeypatch.setitem(development_app.dependency_overrides, actor, lambda: record["owner"])
+    client = TestClient(development_app)
+    base = f"/api/v1/batches/{record['id']}"
+    assert client.get(base).json()["state"] == "deferred"
+    detail = client.get(base + "/items/row-4")
+    assert detail.status_code == 200
+    assert detail.json()["state"] == "deferred" and detail.json()["machine_result"] is None
+    assert client.get(base + "/items/row-2").json()["previous_attempt"]["state"] == "interrupted"
+    assert client.get(base + "/export").status_code == 200
+    assert client.post(base + "/items/row-4/reviews", json={
+        "attribute_id": "Body Material", "decision": "approve", "reason": "Synthetic test",
+    }).status_code == 422
+    assert not store.keys("reviews/")
+    monkeypatch.setitem(development_app.dependency_overrides, actor, lambda: "another-owner")
+    for suffix in ("", "/items", "/items/row-2", "/items/row-4", "/export"):
+        assert client.get(base + suffix).status_code == 404
+
+
+def test_actual_private_two_product_recovery_prompt_bounds():
+    path = os.environ.get("DOCINTEL_TEST_SUBSET_PROMPTS")
+    if not path:
+        pytest.skip("Requires exact private two-product recovery payload captures")
+    records = json.loads(Path(path).read_text())
+    assert len(records) == 4
+    keys = {record["item_key"] for record in records}
+    assert len(keys) == 2
+    assert len({record["user"]["product"]["item_id"] for record in records}) == 2
+    total = 0
+    for key in keys:
+        stages = [record for record in records if record["item_key"] == key]
+        assert len(stages) == 2
+        assert stages[0]["user"]["attributes"] == stages[1]["user"]["attributes"]
+        assert [{entry["source_tier"] for entry in record["user"]["evidence"]}
+                for record in stages] == [{"internal_pdf"}, {"vendor_table"}]
+    for record in records:
+        compact, references = compact_inference_prompt(json.dumps(record["user"]))
+        assert expand_prompt_evidence(json.loads(compact)) == sorted(
+            record["user"]["evidence"], key=lambda entry: entry["evidence_id"])
+        assert sorted(references.values()) == sorted(entry["evidence_id"] for entry in record["user"]["evidence"])
+        bound = (len((record["system"] + COMPACT_PROMPT_INSTRUCTIONS).encode()) + len(compact.encode())
+                 + len(json.dumps(record["schema"]).encode()) + 4096)
+        assert bound + 2048 <= 30000
+        total += bound
+    assert total <= 200000 and 4 * 2048 <= 32768
