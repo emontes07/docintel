@@ -55,6 +55,45 @@ unconditional repeatability pass: the user reported two Retry clicks whose cause
 and restarted operations remain uncorrelated. See Browser Repeatability below.
 No customer batch was submitted.
 
+## Stopped-attempt Reconciliation (Operator-only, No Execution)
+
+`BatchService.reconcile_interrupted` is a status-only helper, not an API route,
+worker invocation, retry, or new recovery allowance. Rehearse it offline against
+an isolated store first. A trusted operator from the existing real-pilot operator
+allowlist must pin the stopped execution/closed-processing, zero-active-manual-worker,
+and successful-stop timing receipt bundle. The helper checks the exact batch,
+immutable worker image, final-rerun audit, consumed ledger execution, and item
+timestamps; it does **not** fetch or independently authenticate control-plane
+receipts. Their trusted provenance and internal/hosted execution correlation must
+be verified out of band. An elapsed timeout alone is not stop evidence.
+
+The call requires `expected` entries for `batch`, `item`, `ledger`, and
+`execution_audit`, each with the current store `version` and raw-byte `sha256`.
+`evidence` has `execution_id`, `execution`, `worker`, and `timing` entries;
+`evidence_sha256` pins its sorted, ASCII, compact JSON encoding. Both processing
+switches must remain disabled. Batch and budget leases plus conditional writes
+protect the operation. An immutable intent precedes the writes; an immutable
+applied receipt records their resulting hashes/versions. Repeat the **same**
+request after an interrupted write; never silently refresh stale pins.
+
+Only the bound running item becomes `interrupted`, with remote completion
+explicitly unknown. The batch also becomes `interrupted` to prevent worker
+continuation; queued/deferred siblings are untouched. No machine result or finish
+time is invented. Prior attempts, result pointers, diagnostic sidecars, immutable
+results, approval/configuration and consumed budgets remain unchanged. An existing
+current-attempt result, another running item, changed state/version, untrusted
+operator, ambiguous identity, or active worker evidence causes refusal.
+
+Private rehearsal is opt-in:
+`DOCINTEL_RECONCILIATION_PRIVATE_WORK=<private-receipt-directory>` with
+`pytest tests/test_interrupted_reconciliation.py`. It reads the four local final
+postclosure/worker receipts and reconstructs a memory-only SQLite store. API
+snapshots do not contain original raw object bytes or ETags: successful rehearsal
+does not authorize or establish hosted readiness. A later hosted reconciliation
+requires separate explicit authorization, fresh trusted stopped/closed evidence
+and exact hosted versions, and invocation of this helper only—never a worker,
+processor, guard, deployment, or replenished execution budget.
+
 ## Workbook Contract
 
 Manifest identity/selection columns: `PIMITEM Number`, `Vendor Name`, `MPN`,
@@ -154,9 +193,41 @@ pages are labeled separately. External PDFs and cross-host redirects remain
 explicitly unsupported, not fabricated successes.
 
 Every real source needs explicit per-product applicability and requested-attribute
-scope. Every accepted candidate needs an exact supporting quotation and qualification.
-Literal validation, conservative scope checks, and model confidence are not
+scope. Every accepted candidate needs a grounded supporting quotation and qualification.
+Normalized validation, conservative scope checks, and model confidence are not
 measured product accuracy. Human review remains pending until performed.
+
+### Grounded quote and value normalization
+
+The verifier uses Unicode NFKC, case folding, whitespace collapse, and
+punctuation/hyphen token boundaries. Words cannot be dropped, reordered or
+paraphrased. Decimal points, fraction slashes, numeric signs, percentages and
+comparison operators retain their meaning; token boundaries prevent matching
+`50` inside `500` or a part identifier. No fuzzy or edit-distance matching is used.
+
+A quote may span consecutive **cited** paragraphs on the same page or cells in
+the same table region. Source identity, version, page and region must match;
+an uncited intervening fragment breaks the match. Citation order is immaterial,
+but missing/unknown citations remain errors. Neighbors are never silently cited.
+
+Vendor row JSON is decoded into addressed **cell values**: sheet names, column
+headers, addresses and JSON keys are not value evidence. Quotes may span cells
+of the same row in column order; proposed values must match a cell, not a
+concatenation of unrelated cells. Documented vendor-only format equivalences
+include inch marks/`in`/`inch`/`inches`, decimal/thousands formatting, and exact
+rational equivalents such as `5/8"` = `0.625 in` or `1 1/2 in` = `1.5 in`.
+No physical-unit conversion, rounding or inferred unit is allowed. Definition
+types, enumerations, missing-unit clarification, component/maximum-rating scope,
+and explicitly labeled boolean-answer checks still apply.
+
+Each new accepted candidate has an ordered `verification` record on its
+attribute: verifier version, quote/value/unit matches, normalization rules,
+original evidence IDs/locators, matched vendor addresses and normalized-match
+hashes. This is server-computed, never part of the model's response schema.
+The owner page and Excel `Results` / `Evidence verification JSON` show it.
+Historical results without these records remain unchanged and are labeled
+unrecorded rather than retrospectively certified. Reproduction responses are
+not recovered provider output or product-accuracy evidence.
 
 ## Storage and Execution
 

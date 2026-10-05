@@ -6,6 +6,8 @@ DOCINTEL_TEST_FINAL_RECEIPT is an exclusively created, private JSON receipt.
 DOCINTEL_TEST_FINAL_BASELINE binds that receipt to an existing release baseline
 and requires the tested backend and this gate to match its committed revision.
 All model responses are REPRODUCTION ONLY, never product findings or live output.
+This historical pre-final snapshot does not establish current postclosure capacity
+or authorize another execution. Receipts stay beside that private snapshot.
 """
 
 import base64
@@ -26,6 +28,7 @@ from backend import batch_worker as worker, real_pilot
 from backend.batch import BatchService
 from backend.batch_store import Conflict, Missing, read_json, write_json
 from backend.core.config import settings
+from backend.core.instructions import product_extraction_system_message
 from backend.core.llm import LLM_API_VERSION
 from backend.extract import ExecutionConfigurationError
 from backend.models.enrichment import EnrichmentResult
@@ -308,16 +311,22 @@ def install_reproduction_client(monkeypatch, captures=None, *, invalid=False):
 
         def complete_structured(self, system, user, schema, **kwargs):
             payload = json.loads(user)
+            schema_bytes = len(json.dumps(schema.model_json_schema()).encode())
+            assert system == product_extraction_system_message + worker.COMPACT_PROMPT_INSTRUCTIONS
             if captures is not None:
                 capture = captures[len(calls)]
                 expected, _ = worker.compact_inference_prompt(json.dumps(capture["user"]))
                 unchanged = stable(payload) == stable(json.loads(expected))
                 assert unchanged, "Full real prompt changed beyond regenerated timestamps"
-                assert system == capture["system"] + worker.COMPACT_PROMPT_INSTRUCTIONS
                 assert len(user.encode()) == len(expected.encode())
                 assert schema.model_json_schema() == capture["schema"]
             calls.append({"system_sha256": sha(system.encode()), "user_sha256": sha(user.encode()),
-                          "user_bytes": len(user.encode()), "source_tier": payload["evidence_groups"][0]["source_tier"]})
+                          "user_bytes": len(user.encode()), "system_bytes": len(system.encode()),
+                          "schema_bytes": schema_bytes, "framing_reserve": 4096,
+                          "input_tokens": len(system.encode()) + len(user.encode()) + schema_bytes + 4096,
+                          "output_tokens": kwargs["max_completion_tokens"],
+                          "captured_system_sha256": sha(capture["system"].encode()) if captures is not None else None,
+                          "source_tier": payload["evidence_groups"][0]["source_tier"]})
             candidates = []
             # Keep all PDF-tier attributes unresolved so the next exact captured
             # vendor prompt is preserved, rather than substituting a smaller one.
@@ -326,11 +335,18 @@ def install_reproduction_client(monkeypatch, captures=None, *, invalid=False):
                                  if entry["value_type"] == "string" and not entry["unit"]
                                  and not entry["allowed_values"]
                                  and not re.search(r"material|max", entry["attribute_id"], re.I))
-                evidence = next(row for row in payload["evidence"]
-                                if (payload["evidence_groups"][row[1]]["attribute_ids"] is None
-                                    or attribute["attribute_id"] in payload["evidence_groups"][row[1]]["attribute_ids"])
-                                and re.search(r"\b[A-Za-z]{4,}\b", payload["evidence_texts"][row[2]]))
-                text = payload["evidence_texts"][evidence[2]]
+                def source_texts(row):
+                    text = payload["evidence_texts"][row[2]]
+                    if payload["evidence_groups"][row[1]]["source_tier"] == "vendor_table" and text.lstrip().startswith("{"):
+                        return [cell["value"] for cell in json.loads(text)["cells"]]
+                    return [text]
+
+                evidence, text = next(
+                    (row, text) for row in payload["evidence"]
+                    if (payload["evidence_groups"][row[1]]["attribute_ids"] is None
+                        or attribute["attribute_id"] in payload["evidence_groups"][row[1]]["attribute_ids"])
+                    for text in source_texts(row) if re.search(r"\b[A-Za-z]{4,}\b", text)
+                )
                 candidates.append({
                     "attribute_id": attribute["attribute_id"],
                     "value": re.search(r"\b[A-Za-z]{4,}\b", text).group(),
@@ -345,6 +361,30 @@ def install_reproduction_client(monkeypatch, captures=None, *, invalid=False):
 
     monkeypatch.setattr(worker, "LLMClient", Client)
     return calls
+
+
+def test_reproduction_vendor_quote_uses_cell_content_and_full_request_bound(monkeypatch):
+    from backend.models.enrichment import ExtractionResponse
+
+    calls = install_reproduction_client(monkeypatch)
+    text = json.dumps({
+        "sheet": "Synthetic", "row": 2,
+        "cells": [{"cell": "A2", "column": "Connection", "value": "threaded"}],
+    })
+    payload = {
+        "attributes": [{"attribute_id": "Connection", "value_type": "string", "unit": None, "allowed_values": []}],
+        "evidence": [["E1", 0, 0, "row=2"]],
+        "evidence_groups": [{"source_tier": "vendor_table", "attribute_ids": ["Connection"]}],
+        "evidence_texts": [text],
+    }
+    system = product_extraction_system_message + worker.COMPACT_PROMPT_INSTRUCTIONS
+    user = json.dumps(payload)
+    response = worker.LLMClient().complete_structured(system, user, ExtractionResponse, max_completion_tokens=2048)
+    assert response.candidates[0].supporting_quote == response.candidates[0].value == "threaded"
+    assert calls[0]["input_tokens"] == (
+        len(system.encode()) + len(user.encode()) + len(json.dumps(ExtractionResponse.model_json_schema()).encode()) + 4096
+    )
+    assert calls[0]["output_tokens"] == 2048
 
 
 def assert_append_only(store, batch, amendment, before, *, invalid=False):
@@ -598,7 +638,8 @@ def test_exact_private_final_rerun_acceptance(monkeypatch):
         ledger = assert_append_only(store, batch, amendment, before, invalid=invalid)
         reserved = {key: ledger["reserved"][key] - consumed["reserved"][key]
                     for key in ("input_tokens", "output_tokens", "analysis_pages", "microdollars")}
-        assert reserved["input_tokens"] == 94078 and reserved["output_tokens"] == 8192
+        assert reserved["input_tokens"] == sum(call["input_tokens"] for call in calls)
+        assert reserved["output_tokens"] == sum(call["output_tokens"] for call in calls) == 8192
         assert reserved["analysis_pages"] == 0 and ledger["attempted"]["inference"] == 8
         for item_key in selected:
             detail = BatchService(store).detail(batch["id"], item_key, batch["owner"])
@@ -614,6 +655,11 @@ def test_exact_private_final_rerun_acceptance(monkeypatch):
                 assert candidate["evidence_ids"] and all(
                     evidence[reference]["source_tier"] == "vendor_table"
                     for reference in candidate["evidence_ids"]
+                )
+                assert any(
+                    candidate["supporting_quote"] == cell["value"]
+                    for reference in candidate["evidence_ids"]
+                    for cell in json.loads(evidence[reference]["text"])["cells"]
                 )
             assert any(source["parsing"] == "cache" for source in detail["provenance"])
             assert not any(source["parsing"] == "fresh_analysis" for source in detail["provenance"])
@@ -641,11 +687,14 @@ def test_exact_private_final_rerun_acceptance(monkeypatch):
     receipt_path = os.environ.get("DOCINTEL_TEST_FINAL_RECEIPT")
     if receipt_path:
         path = Path(receipt_path)
-        assert path.resolve().is_relative_to(Path.cwd()), "Receipt must stay in the workspace"
+        private_root = Path(paths["SNAPSHOT"]).resolve().parent
+        assert path.parent.resolve() == private_root, "Receipt must stay beside the private snapshot"
+        assert not private_root.is_relative_to(Path(__file__).resolve().parents[1]), "Private receipts must stay outside Git"
         scope = {key: value for key, value in amendment.items()
                  if key not in {"not_before", "expires_at", "readiness_at", "operating_expires_at"}}
         receipt = {
             "schema_version": 1, "passed": True, "no_live_operations": True,
+            "historical_pre_final_reproduction": True, "current_capacity_acceptance": False,
             "window_policy": {"publication_seconds": 2700, "operating_seconds": 5400, "processing_seconds": 1200},
             "reproduction_only": True, "product_findings": False, "live_calls": 0,
             "production_run_batch": True, "real_guard_reservations": True,
@@ -665,6 +714,6 @@ def test_exact_private_final_rerun_acceptance(monkeypatch):
         baseline_path = os.environ.get("DOCINTEL_TEST_FINAL_BASELINE")
         if baseline_path:
             receipt.update(release_bindings(baseline_path, approval))
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(os.path.relpath(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(receipt, stream, indent=2)

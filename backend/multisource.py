@@ -67,6 +67,7 @@ def run_cascade(
         for current in result.attributes:
             target = attributes[current.attribute_id]
             target.candidates.extend(current.candidates)
+            target.verification.extend(current.verification)
             values = {(type(candidate.value).__name__, candidate.value, candidate.unit) for candidate in target.candidates}
             if values:
                 target.status = "conflict" if len(values) > 1 else "proposed"

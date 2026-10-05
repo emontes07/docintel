@@ -237,6 +237,7 @@ def incremental_state(final_state, monkeypatch):
             "operation": "inference", "actual_usage": {"input_tokens": 1000, "output_tokens": 100, "analysis_pages": 0},
         } for index in range(4)},
     }
+    state.read_model_usage = final.read_model_usage
     monkeypatch.setattr(final, "read_model_usage", lambda *args, **kwargs: copy.deepcopy(state.model_usage))
     return state
 
@@ -260,6 +261,34 @@ def enabled(state):
     deployed(state)
     final.configure(state.work, state.config, state.decision, state.recovery)
     final.enable(state.work, state.config, state.decision)
+
+
+def worker_polls(state, monkeypatch, statuses=("Running", "Succeeded")):
+    original = release.azure
+    polls = []
+
+    def azure(*args, **kwargs):
+        if args[:4] == ("containerapp", "job", "execution", "list"):
+            assert not (state.work / "final-closed.json").exists()
+            assert len(polls) < len(statuses), "Observation must finish without retrying the worker"
+            status = statuses[len(polls)]
+            polls.append(status)
+            started = final.instant(final.receipt(state.work, "worker-attempt", state.decision)["attempted_at"])
+            state.clock = started + timedelta(seconds=10 * len(polls))
+            if isinstance(status, Exception):
+                raise status
+            execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
+            return [{"name": execution, "properties": {
+                "status": status, "startTime": started.isoformat(),
+                "endTime": state.clock.isoformat() if status in release.TERMINAL else None,
+            }}]
+        if args[:3] == ("containerapp", "job", "stop"):
+            pytest.fail("Telemetry must never issue a worker stop")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(release, "azure", azure)
+    monkeypatch.setattr(final, "sleep", lambda _: None)
+    return polls
 
 
 def test_offline_contract_never_replenishes_prior_history(final_state):
@@ -402,7 +431,7 @@ def test_incremental_meter_counts_only_completed_final_builds(incremental_state)
     assert (state.work / "final-cost-evidence.json").read_bytes() == state.legacy_financial_bytes
 
 
-def test_incremental_missing_build_runtime_is_unknown_not_forecast(incremental_state, monkeypatch):
+def test_incremental_missing_build_runtime_warns_without_blocking(incremental_state, monkeypatch, capsys):
     state = incremental_state
     make_ready(state)
     original = release.execute_publication
@@ -413,105 +442,86 @@ def test_incremental_missing_build_runtime_is_unknown_not_forecast(incremental_s
         return value
 
     monkeypatch.setattr(release, "execute_publication", execute)
-    with pytest.raises(ValueError, match="usage remains unknown"):
-        final.publish(state.work, state.config, state.decision)
+    final.publish(state.work, state.config, state.decision)
     value, _ = final.latest_cost(state.work, state.decision)
     assert value["components"]["backend"]["microdollars"] is None
-    assert value["unknown_components"] == ["backend"]
-    assert not (state.work / "final-frontend-attempt.json").exists()
+    assert value["unknown_components"] == ["backend", "frontend"]
+    assert final.receipt(state.work, "published", state.decision)
+    assert not (state.work / "final-cost-stop.json").exists()
+    assert "WARNING" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("measured,stop", [(5000000, False), (5000001, True)])
-def test_incremental_threshold_is_strict_and_stop_survives_next_action(incremental_state, measured, stop):
+@pytest.mark.parametrize("measured,warning", [(5000000, False), (5000001, True)])
+def test_incremental_threshold_warns_without_latching_or_blocking(incremental_state, measured, warning, capsys):
     state = incremental_state
     make_ready(state)
-    if stop:
-        with pytest.raises(final.CostStop):
-            final.record_cost(state.work, state.decision, {"model": {"microdollars": measured, "complete": True}})
-        with pytest.raises(final.CostStop):
-            final.publish(state.work, state.config, state.decision)
-        assert not state.model_metadata_calls and not state.published
-    else:
-        final.record_cost(state.work, state.decision, {"model": {"microdollars": measured, "complete": True}})
-        final.require_incremental_open(state.work, state.decision)
+    final.record_cost(state.work, state.decision, {"model": {"microdollars": measured, "complete": True}})
+    assert ("WARNING" in capsys.readouterr().err) is warning
+    assert not (state.work / "final-cost-stop.json").exists()
+    final.publish(state.work, state.config, state.decision)
+    assert state.published == ["backend", "frontend"]
+    assert state.decision["cost"]["limit_microdollars"] == 5000000
 
 
-def test_incremental_acr_poller_cancels_exact_existing_run(incremental_state, monkeypatch):
+@pytest.mark.parametrize("malformed", [False, True])
+def test_incremental_acr_poller_is_warning_only(incremental_state, monkeypatch, malformed, capsys):
     state = incremental_state
     make_ready(state)
     run_id = "only-reserved-run"
     calls = []
     properties = {"runId": run_id, "status": "Running", "agentConfiguration": {"cpu": 2},
                   "startTime": (state.clock - timedelta(seconds=26000)).isoformat()}
+    if malformed:
+        properties["startTime"] = "invalid timestamp"
 
     def azure(*args, **kwargs):
         calls.append(args)
         return {"properties": properties}
 
-    def execute(config, work, kind, revision, attempt, **kwargs):
-        release.save_once(work / f"final-{kind}-queued.json", {
-            "runId": run_id, "attempt_sha256": final.raw_sha(attempt),
-        })
-        url = (f"https://management.azure.com/subscriptions/{config['subscription']}/resourceGroups/"
-               f"{config['group']}/providers/Microsoft.ContainerRegistry/registries/"
-               f"{config['registry']}/runs/{run_id}?api-version={release.PUBLICATION_API_VERSION}")
-        return release.azure("rest", "--method", "GET", "--url", url)
-
-    monkeypatch.setattr(release, "execute_publication", execute)
     monkeypatch.setattr(release, "azure", azure)
-    with pytest.raises(final.CostStop, match="measured_direct_cost"):
-        final.publish_component(state.work, state.config, state.decision, "backend", {})
-    assert len(calls) == 2 and calls[1][:3] == ("rest", "--method", "POST")
-    assert f"/runs/{run_id}/cancel?" in calls[1][4]
-    assert final.receipt(state.work, "backend-stop-attempt", state.decision)["runId"] == run_id
-    assert not (state.work / "final-frontend-attempt.json").exists()
+    attempt = state.work / "final-backend-attempt.json"
+    release.save_once(attempt, final.binding(state.decision, state.work))
+    release.save_once(state.final_child / "final-backend-queued.json", {
+        "runId": run_id, "attempt_sha256": final.raw_sha(attempt),
+    })
+    url = (f"https://management.azure.com/subscriptions/{state.config['subscription']}/resourceGroups/"
+           f"{state.config['group']}/providers/Microsoft.ContainerRegistry/registries/"
+           f"{state.config['registry']}/runs/{run_id}?api-version={release.PUBLICATION_API_VERSION}")
+    with final.publication_meter(state.work, state.config, state.decision, "backend"):
+        assert release.azure("rest", "--method", "GET", "--url", url) == {"properties": properties}
+    assert calls == [("rest", "--method", "GET", "--url", url)]
+    assert release.azure is azure
+    assert not (state.work / "final-backend-stop-attempt.json").exists()
+    assert not (state.work / "final-cost-stop.json").exists()
+    assert "WARNING" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("unknown,overrun", [(False, False), (True, False), (False, True)])
-def test_incremental_worker_meter_closes_and_stops_only_existing_worker(incremental_state, monkeypatch, unknown, overrun):
+def test_incremental_worker_meter_warns_and_closes_only_at_completion(incremental_state, monkeypatch, unknown, overrun, capsys):
     state = incremental_state
     deployed(state)
-    original = release.azure
+    polls = worker_polls(state, monkeypatch)
     if unknown:
         state.model_usage["reservations"]["0"]["actual_usage"] = None
     if overrun:
         state.model_usage["reservations"]["0"]["actual_usage"]["input_tokens"] = 6000000
 
-    def azure(*args, **kwargs):
-        if args[:4] == ("containerapp", "job", "execution", "list"):
-            attempted = final.receipt(state.work, "worker-attempt", state.decision)
-            started = final.instant(attempted["attempted_at"])
-            state.clock = started + timedelta(seconds=10)
-            execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
-            return [{"name": execution, "properties": {
-                "status": "Running" if overrun else "Succeeded",
-                "startTime": started.isoformat(), "endTime": None if overrun else state.clock.isoformat(),
-            }}]
-        if args[:3] == ("containerapp", "job", "stop"):
-            state.calls.append(args)
-            return {}
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(release, "azure", azure)
-    if unknown or overrun:
-        with pytest.raises(ValueError, match="unknown|operating stop"):
-            final.activate(state.work, state.config, state.decision, state.recovery)
-    else:
-        final.activate(state.work, state.config, state.decision, state.recovery)
+    final.activate(state.work, state.config, state.decision, state.recovery)
     value, _ = final.latest_cost(state.work, state.decision)
     assert value["components"]["model"]["microdollars"] == (6003400 if overrun else 3300 if unknown else 4400)
-    assert value["components"]["worker"]["microdollars"] == 300
-    assert value["measured_known_microdollars"] == (6007700 if overrun else 7600 if unknown else 8700)
+    assert value["components"]["worker"]["microdollars"] == 600
+    assert value["measured_known_microdollars"] == (6008000 if overrun else 7900 if unknown else 9000)
     assert value["components"]["model"]["unknown_reservations"] == (["0"] if unknown else [])
     assert final.receipt(state.work, "closed", state.decision)
     release.require_real_pilot_off(state.resources["backend"])
     stops = [call for call in state.calls if call[:3] == ("containerapp", "job", "stop")]
-    assert len(stops) == int(overrun)
-    if overrun:
-        execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
-        assert stops[0][stops[0].index("--job-execution-name") + 1] == execution
-        with pytest.raises(final.CostStop):
-            final.start(state.work, state.config, state.decision)
+    assert not stops and len(polls) == 2
+    assert not (state.work / "final-cost-stop.json").exists()
+    final.observe(state.work, state.config, state.decision)
+    assert len(polls) == 2
+    assert "WARNING" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="closed"):
+        final.start(state.work, state.config, state.decision)
 
 
 def test_incremental_all_missing_usage_is_null_not_reserved_spend(incremental_state):
@@ -530,36 +540,291 @@ def test_incremental_all_missing_usage_is_null_not_reserved_spend(incremental_st
     assert not (state.work / "final-cost-stop.json").exists()
 
 
-def test_incremental_usage_query_failure_stops_worker_and_preserves_unknown(incremental_state, monkeypatch):
+def test_incremental_marker_failure_warns_and_recovers_without_stopping(incremental_state, monkeypatch, capsys):
     state = incremental_state
     deployed(state)
     original = release.azure
+    polls = []
 
     def azure(*args, **kwargs):
         if args[:4] == ("containerapp", "job", "execution", "list"):
+            assert not (state.work / "final-closed.json").exists()
+            if polls:
+                previous, _ = final.latest_cost(state.work, state.decision)
+                assert previous["components"]["model"]["microdollars"] is None
+                assert previous["components"]["model"]["observation"] == "usage_unavailable"
+            polls.append(args)
             attempted = final.receipt(state.work, "worker-attempt", state.decision)
             first = final.instant(attempted["attempted_at"])
-            state.clock = first + timedelta(seconds=10)
+            state.clock = first + timedelta(seconds=10 * len(polls))
             execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
-            return [{"name": execution, "properties": {"status": "Running", "startTime": first.isoformat()}}]
+            return [{"name": execution, "properties": {
+                "status": "Running" if len(polls) == 1 else "Succeeded",
+                "startTime": first.isoformat(), "endTime": state.clock.isoformat() if len(polls) == 2 else None,
+            }}]
         if args[:3] == ("containerapp", "job", "stop"):
+            pytest.fail("A usage probe must never stop the worker")
+        return original(*args, **kwargs)
+
+    def usage(*args, **kwargs):
+        if len(polls) == 1:
+            raise ValueError("Remote console did not confirm the expected marker")
+        return copy.deepcopy(state.model_usage)
+
+    monkeypatch.setattr(release, "azure", azure)
+    monkeypatch.setattr(final, "read_model_usage", usage)
+    monkeypatch.setattr(final, "sleep", lambda _: None)
+    final.activate(state.work, state.config, state.decision, state.recovery)
+    value, _ = final.latest_cost(state.work, state.decision)
+    assert len(polls) == 2
+    assert value["components"]["worker"]["microdollars"] == 600
+    assert value["components"]["model"]["microdollars"] == 4400
+    assert not value["unknown_components"]
+    assert not (state.work / "final-cost-stop.json").exists()
+    assert not (state.work / "final-worker-stop-attempt.json").exists()
+    assert final.receipt(state.work, "closed", state.decision)
+    assert final.receipt(state.work, "worker-terminal", state.decision)["status"] == "Succeeded"
+    assert "WARNING" in capsys.readouterr().err
+
+
+def test_incremental_real_usage_reader_recovers_from_console_marker_failure(incremental_state, monkeypatch):
+    state = incremental_state
+    deployed(state)
+    polls = worker_polls(state, monkeypatch)
+    console_calls = []
+
+    def console(args, code, marker, *, timeout=None):
+        if not marker.startswith("DOCINTEL_FINAL_USAGE_OK:"):
+            return (marker + "\n").encode()
+        console_calls.append(args)
+        assert 0 < timeout <= 30
+        if len(polls) == 1:
+            raise ValueError("Remote console did not confirm the expected marker")
+        value = {**state.model_usage, "recovery_sha256": final.sha(state.recovery)}
+        return ("DOCINTEL_FINAL_USAGE:" + base64.b64encode(json.dumps(value).encode()).decode()
+                + "\n" + marker + "\n").encode()
+
+    monkeypatch.setattr(final, "read_model_usage", state.read_model_usage)
+    monkeypatch.setattr(release, "console_code", console)
+    final.activate(state.work, state.config, state.decision, state.recovery)
+    assert len(console_calls) == len(polls) == 2
+    value, _ = final.latest_cost(state.work, state.decision)
+    assert value["components"]["model"]["microdollars"] == 4400
+    assert not value["unknown_components"]
+    assert final.receipt(state.work, "closed", state.decision)
+
+
+@pytest.mark.parametrize("defect", ["payload", "tokens", "runtime", "record", "corrupt_receipt"])
+def test_incremental_telemetry_errors_never_escape_into_early_cleanup(incremental_state, monkeypatch, defect, capsys):
+    state = incremental_state
+    deployed(state)
+    polls = worker_polls(state, monkeypatch)
+    secret = "synthetic-secret-do-not-log"
+    original_compute, original_save = final.worker_compute, release.save_once
+    corrupted = []
+
+    def usage(*args, **kwargs):
+        value = copy.deepcopy(state.model_usage)
+        if len(polls) == 1:
+            if defect == "payload":
+                return {secret: secret}
+            if defect == "tokens":
+                value["reservations"]["0"]["actual_usage"]["input_tokens"] = -1
+            if defect == "corrupt_receipt":
+                path = sorted(state.work.glob("final-direct-cost-*.json"))[-1]
+                path.write_text(secret)
+                corrupted.append(path)
+        return value
+
+    def compute(*args):
+        if defect == "runtime" and len(polls) == 1:
+            raise ValueError(secret)
+        return original_compute(*args)
+
+    def save(path, value):
+        if defect == "record" and len(polls) == 1 and path.name.startswith("final-direct-cost-"):
+            raise OSError(secret)
+        return original_save(path, value)
+
+    monkeypatch.setattr(final, "read_model_usage", usage)
+    monkeypatch.setattr(final, "worker_compute", compute)
+    monkeypatch.setattr(release, "save_once", save)
+    final.activate(state.work, state.config, state.decision, state.recovery)
+    assert len(polls) == 2
+    assert final.receipt(state.work, "closed", state.decision)
+    assert final.receipt(state.work, "worker-terminal", state.decision)["status"] == "Succeeded"
+    warnings = list(state.work.glob("final-monitoring-warning-*.json"))
+    assert warnings
+    assert all(secret not in path.read_text() for path in warnings)
+    assert secret not in capsys.readouterr().err
+    assert all(path.read_text() == secret for path in corrupted)
+    if defect != "corrupt_receipt":
+        assert not final.latest_cost(state.work, state.decision)[0]["unknown_components"]
+
+
+def test_incremental_missing_usage_retains_last_known_then_recovers(incremental_state, monkeypatch):
+    state = incremental_state
+    deployed(state)
+    polls = worker_polls(state, monkeypatch, ("Running", "Running", "Succeeded"))
+
+    def usage(*args, **kwargs):
+        if len(polls) == 2:
+            raise ValueError("Remote console did not confirm the expected marker")
+        if len(polls) == 3:
+            previous, _ = final.latest_cost(state.work, state.decision)
+            model = previous["components"]["model"]
+            assert model["last_known_only"] and not model["complete"]
+            assert model["microdollars"] == 4400
+        return copy.deepcopy(state.model_usage)
+
+    monkeypatch.setattr(final, "read_model_usage", usage)
+    final.activate(state.work, state.config, state.decision, state.recovery)
+    model = final.latest_cost(state.work, state.decision)[0]["components"]["model"]
+    assert model["complete"] and "last_known_only" not in model
+    assert model["microdollars"] == 4400 and len(polls) == 3
+
+
+def test_incremental_legacy_cost_stop_is_retained_but_never_controls_worker(incremental_state, monkeypatch):
+    state = incremental_state
+    deployed(state)
+    path = state.work / "final-cost-stop.json"
+    release.save_once(path, {**final.binding(state.decision, state.work),
+                             "reason": "measured_direct_cost_exceeds_incremental_5_usd",
+                             "measured_known_microdollars": 6000000})
+    prior_stop = path.read_bytes()
+    final.record_cost(state.work, state.decision, {"model": {"microdollars": 6000000, "complete": True}})
+    polls = worker_polls(state, monkeypatch)
+    final.activate(state.work, state.config, state.decision, state.recovery)
+    assert len(polls) == 2 and path.read_bytes() == prior_stop
+    assert not (state.work / "final-worker-stop-attempt.json").exists()
+    assert all((state.work / name).read_bytes() == content for name, content in state.retained.items())
+    assert state.job["properties"]["configuration"]["replicaTimeout"] == 600
+    assert state.job["properties"]["configuration"]["replicaRetryLimit"] == 0
+    assert state.decision["policy"] == final.INCREMENTAL_POLICY
+    assert state.decision["cost"]["limit_microdollars"] == 5000000
+
+
+@pytest.mark.parametrize("unwritable", [False, True])
+def test_monitoring_warnings_are_sanitized_append_only_and_nonfatal(incremental_state, monkeypatch, capsys, unwritable):
+    state = incremental_state
+    make_ready(state)
+    original = release.save_once
+    secret = "synthetic-token-and-console-output\nBearer secret"
+
+    def save(path, value):
+        if unwritable and path.name.startswith("final-monitoring-warning-"):
+            raise OSError(secret)
+        original(path, value)
+
+    monkeypatch.setattr(release, "save_once", save)
+    final.monitoring_warning(state.work, state.decision, "usage_unavailable", ValueError(secret))
+    retained = {path: path.read_bytes() for path in state.work.glob("final-monitoring-warning-*.json")}
+    final.monitoring_warning(state.work, state.decision, secret, type(secret, (Exception,), {})(secret))
+    assert all(path.read_bytes() == content for path, content in retained.items())
+    warnings = list(state.work.glob("final-monitoring-warning-*.json"))
+    assert len(warnings) == (0 if unwritable else 2)
+    for path in warnings:
+        assert path.stat().st_mode & 0o077 == 0
+        value = release.private_json(path)
+        assert value["observation_only"] and not value["worker_stop_requested"]
+        assert value["error_type"] in {"ValueError", "Exception"}
+        assert secret not in path.read_text()
+    output = capsys.readouterr().err
+    assert output.count("WARNING") == 2 and secret not in output
+    assert ("Durable warning unavailable" in output) is unwritable
+    assert not state.calls and not (state.work / "final-cost-stop.json").exists()
+
+
+@pytest.mark.parametrize("status_error", [
+    ValueError("Remote console did not confirm the expected marker"),
+    OSError("synthetic worker-status probe unavailable"),
+])
+def test_worker_status_probe_recovers_without_early_closure(final_state, monkeypatch, status_error):
+    state = final_state
+    deployed(state)
+    polls = worker_polls(state, monkeypatch, (status_error, "Succeeded"))
+    final.activate(state.work, state.config, state.decision, state.recovery)
+    assert len(polls) == 2 and final.receipt(state.work, "closed", state.decision)
+    assert final.receipt(state.work, "worker-terminal", state.decision)["status"] == "Succeeded"
+    assert list(state.work.glob("final-monitoring-warning-*.json"))
+
+
+@pytest.mark.parametrize("observation", ["unavailable", "overbudget"])
+def test_incremental_monitoring_never_extends_authorization_window(incremental_state, monkeypatch, observation):
+    state = incremental_state
+    deployed(state)
+    original = release.azure
+    polls = []
+
+    def azure(*args, **kwargs):
+        if args[:4] == ("containerapp", "job", "execution", "list"):
+            assert not (state.work / "final-closed.json").exists()
+            started = final.instant(final.receipt(state.work, "worker-attempt", state.decision)["attempted_at"])
+            state.clock = started + timedelta(seconds=10) if not polls else final.instant(state.recovery["expires_at"])
+            polls.append(args)
+            execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
+            return [{"name": execution, "properties": {"status": "Running", "startTime": started.isoformat()}}]
+        if args[:3] == ("containerapp", "job", "stop"):
+            assert state.clock >= final.instant(state.recovery["expires_at"])
             state.calls.append(args)
             return {}
         return original(*args, **kwargs)
 
+    def usage(*args, **kwargs):
+        if observation == "unavailable":
+            raise ValueError("Remote console did not confirm the expected marker")
+        value = copy.deepcopy(state.model_usage)
+        value["reservations"]["0"]["actual_usage"]["input_tokens"] = 6000000
+        return value
+
+    monkeypatch.setattr(release, "azure", azure)
+    monkeypatch.setattr(final, "read_model_usage", usage)
+    monkeypatch.setattr(final, "sleep", lambda _: None)
+    with pytest.raises(ValueError, match="observation expired"):
+        final.activate(state.work, state.config, state.decision, state.recovery)
+    assert len(polls) == 2
+    stops = [args for args in state.calls if args[:3] == ("containerapp", "job", "stop")]
+    assert len(stops) == 1
+    assert stops[0][stops[0].index("--job-execution-name") + 1] == final.receipt(
+        state.work, "worker-result", state.decision)["execution_name"]
+    assert final.receipt(state.work, "worker-stop-attempt", state.decision)["reason"] == "authorization_window_expired"
+    assert final.receipt(state.work, "closed", state.decision)
+    assert not (state.work / "final-cost-stop.json").exists()
+
+
+def test_observer_has_no_client_side_worker_timeout(incremental_state, monkeypatch):
+    state = incremental_state
+    deployed(state)
+    original = release.azure
+    polls = []
+
+    def azure(*args, **kwargs):
+        if args[:4] == ("containerapp", "job", "execution", "list"):
+            started = final.instant(final.receipt(state.work, "worker-attempt", state.decision)["attempted_at"])
+            state.clock = started + timedelta(seconds=601 + len(polls))
+            assert state.clock < final.instant(state.recovery["expires_at"])
+            polls.append(args)
+            execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
+            return [{"name": execution, "properties": {
+                "status": "Running" if len(polls) == 1 else "Failed", "startTime": started.isoformat(),
+            }}]
+        if args[:3] == ("containerapp", "job", "stop"):
+            pytest.fail("Only the server may enforce the worker's 600-second timeout")
+        return original(*args, **kwargs)
+
     def unavailable(*args, **kwargs):
-        raise ValueError("synthetic usage observation unavailable")
+        raise ValueError("Remote console did not confirm the expected marker")
 
     monkeypatch.setattr(release, "azure", azure)
     monkeypatch.setattr(final, "read_model_usage", unavailable)
-    with pytest.raises(ValueError, match="observation unavailable"):
+    monkeypatch.setattr(final, "sleep", lambda _: None)
+    with pytest.raises(ValueError, match="terminated unsuccessfully"):
         final.activate(state.work, state.config, state.decision, state.recovery)
-    value, _ = final.latest_cost(state.work, state.decision)
-    assert value["components"]["worker"]["microdollars"] == 300
-    assert value["components"]["model"]["microdollars"] is None
-    assert value["components"]["model"]["observation"] == "usage_unavailable"
-    assert len([call for call in state.calls if call[:3] == ("containerapp", "job", "stop")]) == 1
+    assert len(polls) == 2
+    assert final.receipt(state.work, "worker-terminal", state.decision)["status"] == "Failed"
     assert final.receipt(state.work, "closed", state.decision)
+    assert state.job["properties"]["configuration"]["replicaTimeout"] == 600
+    assert not (state.work / "final-worker-stop-attempt.json").exists()
 
 
 def test_readiness_clock_starts_after_all_offline_preparation(final_state, monkeypatch):
@@ -1131,7 +1396,7 @@ def test_expired_guard_never_queues_or_installs_amendment(final_case, monkeypatc
 
 @pytest.mark.parametrize("failure", [
     None, "configure", "enable_before", "enable_unknown", "start_unknown",
-    "observe_unknown", "worker_failed", "timeout",
+    "observe_window_expired", "worker_failed", "timeout",
 ])
 def test_activation_always_closes_in_finally(final_state, monkeypatch, failure):
     state = final_state
@@ -1143,10 +1408,11 @@ def test_activation_always_closes_in_finally(final_state, monkeypatch, failure):
             state.calls.append(args)
             raise ValueError("synthetic start outcome unknown")
         if args[:4] == ("containerapp", "job", "execution", "list"):
-            if failure == "observe_unknown":
+            if failure == "observe_window_expired":
+                state.clock = final.instant(state.recovery["expires_at"])
                 raise ValueError("synthetic observation failure")
             if failure == "timeout":
-                state.clock += timedelta(seconds=600)
+                state.clock = final.instant(state.recovery["expires_at"])
             execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
             status = "Running" if failure == "timeout" else "Failed" if failure == "worker_failed" else "Succeeded"
             return [{"name": execution, "properties": {"status": status, "startTime": "synthetic", "endTime": "synthetic"}}]
@@ -1181,9 +1447,10 @@ def test_activation_always_closes_in_finally(final_state, monkeypatch, failure):
     release.require_real_pilot_off(state.resources["backend"])
     assert state.resources["backend"]["properties"]["template"]["containers"][0]["image"].endswith("7" * 64)
     stops = [call for call in state.calls if call[:3] == ("containerapp", "job", "stop")]
-    assert len(stops) == (1 if failure == "timeout" else 0)
-    if failure == "timeout":
+    assert len(stops) == (1 if failure in {"timeout", "observe_window_expired"} else 0)
+    if stops:
         assert stops[0][stops[0].index("--job-execution-name") + 1] == final.receipt(
             state.work, "worker-result", state.decision)["execution_name"]
-    with pytest.raises(ValueError, match="closed"):
+    denial = "processing window" if failure in {"timeout", "observe_window_expired"} else "closed"
+    with pytest.raises(ValueError, match=denial):
         final.activate(state.work, state.config, state.decision, state.recovery)

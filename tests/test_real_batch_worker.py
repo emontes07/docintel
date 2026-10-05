@@ -392,7 +392,7 @@ def test_vendor_rows_supplement_pdf_before_web_without_variant_leakage(configure
                 assert "wrong-variant" not in evidence["text"]
                 return ExtractionResponse(candidates=[Candidate(
                     attribute_id="Inlet", value="threaded", evidence_ids=[evidence["evidence_id"]],
-                    supporting_quote='"value": "threaded"', qualification="Exact synthetic row and inlet field.",
+                    supporting_quote="threaded", qualification="Exact synthetic row and inlet field.",
                 )])
             return super().complete_structured(system, user, schema, **kwargs)
 
@@ -1261,16 +1261,18 @@ def test_diagnostic_survives_interruption_before_machine_result_and_large_export
     assert json.loads("".join(row["Sanitized diagnostic JSON"] for row in exported["Diagnostics"])) == diagnostic.model_dump(mode="json")
 
 
-def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
-    """Real full payloads; fabricated responses; capacity projection is not authorization."""
+def test_actual_private_two_product_response_contract(monkeypatch):
+    """Historical response-contract fixture, not a real reservation or capacity gate."""
     import base64
     import re
     from pydantic import ValidationError
     from backend.core.llm import LLMSchemaValidationError
     from backend.core.config import settings
+    from backend.core.instructions import product_extraction_system_message
     from backend.extract import run_enrichment
     from backend.models.enrichment import Evidence, LiveBundle, OfflineSource
     from backend.workbooks import read_workbook
+    from tests.test_interrupted_reconciliation import MemorySQLiteStore
 
     prompt_path = os.environ.get("DOCINTEL_TEST_SUBSET_PROMPTS")
     snapshot_path = os.environ.get("DOCINTEL_TEST_CONSUMPTION_SNAPSHOT")
@@ -1288,7 +1290,8 @@ def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
     approval = read("configuration/real-pilot-approval.json")
     consumed = read("budgets/real-pilot.json")
     batch = read(f"batches/{approval['batch_id']}.json")
-    captures = json.loads(Path(prompt_path).read_text())
+    prompt_bytes = Path(prompt_path).read_bytes()
+    captures = json.loads(prompt_bytes)
     assert len(captures) == 4 and len({row["item_key"] for row in captures}) == 2
     assert consumed["attempted"]["inference"] == 4
     assert consumed["reserved"]["input_tokens"] == 92854
@@ -1306,12 +1309,7 @@ def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
     outcomes = []
     planning = []
     for mode in ("canonical", "whitespace_case", "original", "multiple", "unknown", "schema", "quotation"):
-        case_home = tmp_path / mode
-        case_home.mkdir()
-        store = SQLiteStore.__new__(SQLiteStore)
-        store.path = case_home / "batches.sqlite3"
-        with store.connect() as connection:
-            connection.execute("CREATE TABLE records (key TEXT PRIMARY KEY, value BLOB NOT NULL, version TEXT NOT NULL)")
+        store = MemorySQLiteStore()
         projected = copy.deepcopy(consumed)
 
         def reserve(operation, key, **limits):
@@ -1335,15 +1333,22 @@ def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
             operation_key=lambda item, **kwargs: hashlib.sha256(json.dumps([item["item_key"], kwargs], sort_keys=True).encode()).hexdigest(),
         )
         processor = RealBatchProcessor(store, batch, guard)
-        for capture_index, capture in enumerate(captures):
+        for capture in captures:
             original = capture["user"]
             compact, references = compact_inference_prompt(json.dumps(original))
             attribute = next(entry for entry in original["attributes"]
                              if entry["value_type"] == "string" and entry["unit"] is None
                              and not entry["allowed_values"] and not re.search(r"material|max", entry["attribute_id"], re.I))
-            evidence = next(entry for entry in original["evidence"]
-                            if (entry["attribute_ids"] is None or attribute["attribute_id"] in entry["attribute_ids"])
-                            and re.search(r"\b[A-Za-z]{4,}\b", entry["text"]))
+            def source_texts(entry):
+                if entry["source_tier"] == "vendor_table" and entry["text"].lstrip().startswith("{"):
+                    return [cell["value"] for cell in json.loads(entry["text"])["cells"]]
+                return [entry["text"]]
+
+            evidence, quote_text = next(
+                (entry, text) for entry in original["evidence"]
+                if entry["attribute_ids"] is None or attribute["attribute_id"] in entry["attribute_ids"]
+                for text in source_texts(entry) if re.search(r"\b[A-Za-z]{4,}\b", text)
+            )
             reference = next(key for key, value in references.items() if value == evidence["evidence_id"])
             expected_ids = [evidence["evidence_id"]]
             second_evidence = next((
@@ -1369,7 +1374,7 @@ def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
                     pass
 
                 def complete_structured(self, system, user, schema, **kwargs):
-                    assert user == compact and system == capture["system"] + COMPACT_PROMPT_INSTRUCTIONS
+                    assert user == compact and system == product_extraction_system_message + COMPACT_PROMPT_INSTRUCTIONS
                     ids = [reference]
                     if mode == "whitespace_case":
                         ids = [" \t" + reference.lower() + "\n"]
@@ -1382,9 +1387,9 @@ def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
                         ids = ["E999999", "SECRET-DIAGNOSTIC-REDACTION-CHECK"]
                     payload = {"candidates": [{
                         "attribute_id": attribute["attribute_id"],
-                        "value": re.search(r"\b[A-Za-z]{4,}\b", evidence["text"]).group(),
+                        "value": re.search(r"\b[A-Za-z]{4,}\b", quote_text).group(),
                         "evidence_ids": ids if mode != "schema" else "SECRET-DIAGNOSTIC-REDACTION-CHECK",
-                        "supporting_quote": evidence["text"] if mode != "quotation" else "SECRET-DIAGNOSTIC-REDACTION-CHECK",
+                        "supporting_quote": quote_text if mode != "quotation" else "SECRET-DIAGNOSTIC-REDACTION-CHECK",
                         "qualification": "REPRODUCTION ONLY, not recovered model output or a product finding.",
                     }]}
                     raw = json.dumps(payload)
@@ -1422,10 +1427,7 @@ def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
                 assert not result.validation_diagnostics
             pressure = next(attribute for attribute in result.attributes if attribute.attribute_id == "Pressure Rating")
             assert pressure.status == "definition_clarification_needed" and not pressure.candidates
-            export_store = SQLiteStore.__new__(SQLiteStore)
-            export_store.path = case_home / f"export-{capture_index}.sqlite3"
-            with export_store.connect() as connection:
-                connection.execute("CREATE TABLE records (key TEXT PRIMARY KEY, value BLOB NOT NULL, version TEXT NOT NULL)")
+            export_store = MemorySQLiteStore()
             write_json(export_store, f"batches/{batch['id']}.json", batch)
             write_json(export_store, f"items/{batch['id']}/{item['item_key']}.json", {
                 "state": "unresolved", "error": "REPRODUCTION ONLY, not a live result",
@@ -1447,14 +1449,19 @@ def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
                 assert restored == result.validation_diagnostics[0].model_dump(mode="json")
             outcomes.append({"item_key": capture["item_key"], "source_tier": sources[0].source_tier,
                              "mode": mode, "accepted": bool(candidates), "owner_export_verified": True})
+            export_store.connection.close()
+        store.connection.close()
     total_input = sum(row["input"] for row in planning)
     total_output = sum(row["output"] for row in planning)
     assert len(planning) == 4 and total_input <= remaining["input"] and total_output <= remaining["output"]
     assert Path(snapshot_path).read_bytes() == snapshot_bytes
+    assert Path(prompt_path).read_bytes() == prompt_bytes
     receipt_path = os.environ.get("DOCINTEL_TEST_SUBSET_DIAGNOSTIC_RECEIPT")
     if receipt_path:
         receipt = {
             "reproduction_only": True, "recovered_output": False, "live_calls": 0,
+            "historical_response_contract_only": True, "current_capacity_acceptance": False,
+            "budget_reserve_mocked": True,
             "worker_authorization_simulated": False, "worker_executions_remaining": 0,
             "consumption_snapshot_sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
             "full_request_reservations": planning, "remaining_before_projection": remaining,
@@ -1465,9 +1472,12 @@ def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
             "representative_responses": outcomes,
         }
         path = Path(receipt_path)
-        with path.open("x") as stream:
+        private_root = Path(snapshot_path).resolve().parent
+        assert path.parent.resolve() == private_root
+        assert not private_root.is_relative_to(Path(__file__).resolve().parents[1])
+        descriptor = os.open(os.path.relpath(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
             json.dump(receipt, stream, indent=2)
-        path.chmod(0o600)
 
 
 def test_failure_to_persist_diagnostic_stops_execution_without_refunding(configured, monkeypatch):

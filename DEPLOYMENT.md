@@ -826,11 +826,30 @@ under this amendment, not blocking cumulative forecast maxima.
 
 For that amended basis, meter only this rerun's observed build/worker durations
 and recorded model usage at the verified rates. Missing usage remains unknown,
-not zero. Check between operations and during worker observation; a measured
-compute-plus-model estimate above $5 stops further operations and closes temporary
-processing. This is an operating allowance with polling delay, not a hard Azure
-billing cap. A release-helper-only correction can retain the exact previously
-validated application source and build context.
+not zero; retain a last-known amount as incomplete until telemetry recovers.
+Cost/usage and worker-status probes are **observation-only**: console marker
+failures, malformed/unavailable telemetry, observed server-limit discrepancies,
+and compute-plus-model estimates above the unchanged $5 allowance produce clear
+warnings, never a worker-stop command, early processing closure, or a cost-stop
+latch. Observation continues for the same execution until actual completion or
+the independently authorized activation/operating window. The observer does not
+impose a client-side 600-second timeout: it can await a delayed terminal status
+past that point while the job enforces its own timeout. Unknown usage
+does not turn successful worker completion into a failure.
+
+Warnings are sanitized (no raw exception, console output or credentials) and
+saved append-only as owner-only `final-monitoring-warning-*.json` receipts, with
+a stderr warning; persistence failure is also reported without controlling the
+worker. Historical cost-stop receipts remain untouched but are not control
+inputs. None of this changes the allowance, authority hashes, remaining ledger,
+single-use attempts, or consumed/closed execution restrictions. Hard request and
+token limits remain enforced by the server-side guard, and worker timeout by the
+job's 600-second limit. Independent window expiry still stops only the reserved
+execution and activation still restores temporary authorization at completion or
+expiry. This operating allowance is not a hard Azure billing cap. A
+release-helper-only correction can retain the exact previously validated
+application source and build context; it does not create readiness or authorize
+another execution.
 
 The existing PDF request still selects `pages="1-5"` with a 120-second polling
 bound. Offline SDK tests verify those arguments, not server handling when a PDF
