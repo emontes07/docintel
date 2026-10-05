@@ -752,6 +752,300 @@ identities or resources. Restoring the default-off API does not erase consumed
 allowances or permit automatic reactivation. A partial mutation or unexpected
 revision/configuration requires inspection rather than blind retries.
 
+#### One Backend-Only Cached-Subset Continuation (Not Yet Authorized)
+
+`scripts/pilot_continuation.py` is a **single-use, pilot-specific** path. Code,
+passing tests, a completed rehearsal, and the examples below do **not** authorize
+cloud activity. Obtain the user's explicit continuation decision first. Do not
+use ordinary `publish-backend`, `update-worker`, `pilot-enable` or `pilot-start`
+to bypass prior publication receipts, the closed window, or historical worker
+executions. Do not run another synthetic worker.
+
+The owner-only private file
+`~/Library/Application Support/DocIntel/continuation-root.json` independently
+pins the existing release root. Its exact fields are `schema_version: 1`,
+absolute `work_root`, canonical `history_sha256`, `original_receipts`, `cost_audit`, and
+`component_floors_microdollars`. `original_receipts` maps exactly `target.json`,
+`images.json`, and `real-pilot-approval.json` to their original **raw** SHA-256
+file hashes. The three positive, privately reviewed component floors use the
+same consumed/build/worker field names as the cost decision below. Hashes,
+customer/product identifiers, release paths, image digests and account pricing
+receipts belong in private metadata, never public code, branches or documentation.
+The tool does not create or overwrite this independently reviewed root pin.
+`cost_audit` contains exactly the authoritative **latest** financial forecast
+receipt's private JSON basename (`name`) and raw `sha256`. Preserve superseded
+audits but do not substitute one for the final forecast; every decision must
+use the same authoritative reference pinned here.
+
+It requires the original owner-only `target.json`, immutable
+`real-pilot-approval.json`, first worker attempt/result, disable receipts, and
+original authenticated/synthetic acceptance. Backend/frontend digests must
+match the privately pinned original publication and target receipts. It never
+edits the target file to substitute the new backend digest.
+
+The only new context is the fixed `cached-subset-continuation-v1` child. Its central
+`continuation-baseline.json` hashes the original publication receipts (including
+failed/replacement/supplemental attempts), worker accounting, rollback baselines,
+and pilot receipts, and pins the exact root path and raw root-pin hash. Repointing
+the private pin or copying receipts to another root is rejected.
+The child is not an independent allowance. Neither moving
+to another root nor changing a decision ID is supported; there is no new ID.
+All new action receipts use exclusive creation, and one **root-level**
+`continuation-attempt.json` is reserved **before** requesting ACR upload metadata.
+Every later step pins the same complete decision. An absent result after a
+metadata/upload/build/start timeout is an unknown outcome, **not a retry token**.
+Inspect the existing ACR run or worker execution; never resubmit.
+Once the baseline is pinned, standard release mutations also refuse that root
+and its descendants; the existing explicitly approved `stop` remains available.
+
+**Local preparation, with no publication or service calls:**
+
+```sh
+WORK="<original-private-release-root>"
+PY="<approved-Python-interpreter>"
+"$PY" scripts/pilot_continuation.py prepare --work "$WORK" --revision "$REVIEWED_FULL_COMMIT"
+```
+
+`prepare` exports a committed source and curates its context only. Before
+publication, install reviewed owner-only `clean-checks.json` and
+`backend-smoke.json` under the fixed child using the existing approved validation
+workflow. They must bind that exact committed source, unchanged dependency locks,
+context bytes/modes, clean locked backend tests, offline `/health`/anonymous-401
+startup, and UID 10001. Frontend source/locks must remain unchanged. Old receipts
+must not be relabeled to claim that the new backend was tested.
+
+The private decision JSON (`$CONTINUATION_DECISION`) has exactly these fields:
+
+| Field | Required value/binding |
+| --- | --- |
+| `schema_version`, `approved`, `approved_by` | `1`, explicit `true`, original authorized operator |
+| `target` | Existing release `fingerprint(target.json)`, unchanged |
+| `approval_sha256` | Backend canonical `_sha256` of the **original** approval |
+| `history_sha256`, `source_revision` | Values in central `continuation-baseline.json` |
+| `validation_sha256` | Backend canonical hash of `{filename: raw_file_sha256}` for the child's fixed `source.json`, `context.json`, `context-modes.json`, `clean-checks.json`, `backend-smoke.json`; binds the exact reviewed validation receipts |
+| `publication_not_before`, `publication_expires_at` | Aware timestamps; at most 1200 seconds for the one publication, at least 900 seconds remaining before metadata/upload/queue |
+| `policy` | Exactly the constant `POLICY` in the helper: one backend build, CPU 2/900s; one last worker, 600s/two items; max four new inference calls; zero new analysis/search/web/internal retrieval; original $10 ceiling |
+| `selection` | Exactly `ledger_sha256`, `prior_execution_id`, `selected_item_keys`, `interrupted_sha256`, `cached_documents` |
+| `cost` | Exactly five positive integer amounts: `consumed_component_upper_microdollars`, `build_upper_microdollars`, `worker_upper_microdollars`, `inference_upper_microdollars`, `incidental_forecast_microdollars`; plus `evidence_sha256` |
+
+`selection` binds the canonical original singleton ledger snapshot, its single
+existing execution key, exactly two existing selected item keys, raw SHA-256 of
+each original interrupted status, and one/two existing `parses/<sha256>.json`
+objects by raw SHA-256. It does not replace a batch, source, workbook, owner,
+approval, ledger, status, machine result, or review.
+
+`cost.evidence_sha256` is the raw file hash of the independently reviewed,
+owner-only `$WORK/continuation-cost-evidence.json`. That evidence must account
+for **all** previous successful/failed/unknown publication and worker consumption,
+original service reservations, and conservative future build/worker/model
+bounds, with rate sources, units, exclusions, and observation time. Unknown cost
+is not zero. Prior consumed **components** are not a proven total consumed upper
+bound. Retain the independently reviewed private floors for successful ACR,
+retained DI, failed worker and historical failed-publication contingency, plus
+the one proposed build and worker. The root pin binds those floors; public code
+does not embed account-specific accounting. These planning floors do not
+establish monetary readiness or account for incidentals.
+
+The evidence must explicitly set `money_ready: true`, `decision.money: "GO"` and
+`approved_guard_price_basis_retained: true`, and provide a verified
+nonnegative integer `incidental_forecast_microdollars` equal to the decision's
+explicit fifth component. Its `schema_version` is `1`,
+`assurance` is `"conservative_forecast_not_billing_cap"`, and
+`approval_granted` is `false`: monetary evidence is not execution authorization.
+Integer `original_total_microdollars`, `total_forecast_microdollars`, and
+`remaining_contingency_microdollars` must equal the unchanged total, sum of all
+five components, and their difference. Incidental forecasts cannot be hidden
+inside the consumed-component field or omitted from the arithmetic. A retained
+`decision.money: "NO-GO"` cannot be promoted by adding readiness flags. A missing
+or null incidental ceiling is a **monetary NO-GO**, not a zero-cost allowance.
+`audit_receipt` identifies the retained fixed-root private audit using exactly
+`name` (a JSON basename, not another directory) and its raw `sha256`; the helper
+verifies that immutable hash without exposing receipt contents.
+It must also bind raw hashes in `verification_receipts.rates` and
+`verification_receipts.incidentals` to the fixed owner-only files
+`continuation-cost-rates-verified.json` and
+`continuation-cost-incidentals-verified.json`. Each must have `verified: true`,
+the exact decision `target`/`history_sha256`/`source_revision`, and an explicit independently
+reviewed evidence `basis`; a fabricated positive amount is not evidence.
+
+The rate proof's `coverage` is `original_approved_guard_price_ceilings`;
+`unit_prices_usd` must retain the original approved service ceilings, and
+`component_upper_microdollars` must contain the three component-floor keys above,
+with verified bounds no lower than those floors and no higher than the decision.
+The incidental proof's `coverage` is `prior_and_one_hour_execution_incidentals`,
+and its integer `upper_microdollars` must equal the evidence's incidental ceiling.
+It covers retained prior consumption plus a **bounded one-hour continuation
+estimate**, not the infinite lifetime of persisted data. Set
+`execution_window_seconds: 3600`,
+`estimate_basis: "conservative_quantities_not_final_billing"`, and a nonempty
+`uncertainty` list disclosing quantity, price/metering and attribution limitations.
+Its `envelopes` must have exactly these categories and
+units: `stored_images`/`stored_blobs` in `byte_days`, `billable_logs`/`transfer` in
+`bytes`, `storage_operations` in `operations`, `orchestration_app_requests` in
+`requests`, `rollout_cpu` in `vcpu_seconds`, and `rollout_memory` in `gib_seconds`.
+Each category states nonnegative integer `prior_quantity` and `new_quantity`,
+`unit`, a positive decimal-string `unit_price_usd` per named unit, and an evidence
+`basis` supporting conservative finite quantity estimates for this exact reviewed code and retained
+history. The helper multiplies quantities by rates, rounds each category up to
+microdollars, and requires the sum to equal the claimed ceiling. Null quantities,
+omitted categories, or an arbitrary dollar contingency cannot establish readiness.
+Evidence-informed quantity margins are **forecasts**, not newly enforced provider
+limits, actual consumed usage, or a hard Azure billing cap. A monetary GO on this
+basis means the conservative forecast fits the unchanged budget; it is not
+execution approval. Preserve the scenario assumptions and uncertainty alongside
+the private receipt rather than relabeling them as finalized charges.
+Set `storage_month_days: 30` and explicitly convert monthly storage prices to
+the declared per-byte-day rate. An initial month's carrying estimate uses its
+corresponding byte-days; the one-hour execution estimate need not pretend storage
+ceases afterward. Observed whole-resource proxies and retained contingencies may
+support historical forecasts without claiming exact historical billing attribution.
+Proven nonbillable categories may have evidenced zero quantity; Consumption
+jobs themselves have no ingress-request charge, but orchestration API requests
+remain separately covered.
+
+Add `monthly_retention_disclosure` with `period_days: 30`,
+`automatic_deletion: false`, nonnegative integer `estimated_microdollars`, and
+an explicit estimate `basis`. This ongoing storage/retention estimate is disclosed
+**separately** from the one-hour execution cost and is not projected over an
+unbounded lifetime or silently charged against a new allowance. No automatic
+cleanup/deletion is created or required. Persisted images, source copies, ledger,
+results/reviews and receipts remain available after closure. Longer retention
+can continue accruing disclosed costs.
+If the conservative scenario already includes an initial month's carrying costs,
+retain `initial_month_included: true` and the source quantities in the private
+evidence; do not add that month twice. Continuing monthly storage estimates are
+disclosures, not authorization for deletion or new allowances.
+
+Finalized billing, a successful attribution query and a negotiated account-rate
+sheet are **not** requirements: the user permits the original approved guard-price
+basis plus complete conservative incidental bounds. An absent final bill alone
+is not infeasibility.
+The **five explicit components, including the incidental forecast**, must sum to at most
+**10,000,000 microdollars**;
+this is the original $10 **less consumption**, not another $10. Read-only
+preflight additionally checks consumed cost against the existing ledger and the
+model upper bound against remaining original input tokens plus at most four
+2048-token outputs at the original approved prices. Per-call rounding is accounted
+for; integral microdollar/token ceilings need no rounding uplift.
+No reservation is refunded. The original $10 less all retained components and
+the full remaining-token model bound is only **provisional** headroom for the
+supported one-hour incidental quantity×price estimate—not a new allowance.
+Preserve prior pricing/audit receipts privately, including superseded findings;
+a provisional residual alone does not establish that estimate. An evidenced
+monetary clearance and user approval remain necessary.
+
+After separately approved validation and decision preparation:
+
+```sh
+# Local binding/cost/context checks only; no cloud call.
+"$PY" scripts/pilot_continuation.py check --work "$WORK" --decision "$CONTINUATION_DECISION"
+# Read-only Azure identity/runtime and private store hash verification.
+"$PY" scripts/pilot_continuation.py preflight --work "$WORK" --decision "$CONTINUATION_DECISION"
+# Each following mutation requires explicit operator authorization.
+"$PY" scripts/pilot_continuation.py publish --work "$WORK" --decision "$CONTINUATION_DECISION" --approve publish
+"$PY" scripts/pilot_continuation.py deploy --work "$WORK" --decision "$CONTINUATION_DECISION" --approve deploy
+```
+
+Preflight reads the original model's **management-plane deployment metadata**,
+not an inference endpoint. It verifies the exact account/deployment resource,
+successful provisioning, GPT-5 `2025-08-07`/`GlobalStandard`, and an explicit
+`properties.rateLimits` token rule with `count >= 30000` and
+`renewalPeriod == 60`. A SKU capacity number, missing token metadata, a request
+rate instead of a token rate, or a changed model is not sufficient. The check
+runs again before configuration, enablement and the last start; immutable action
+receipts retain the metadata digest and observed TPM. It performs no AI probe,
+quota change, permission grant or credential retrieval. This verifies configured
+capacity, not exclusive availability: concurrent consumers may still exhaust
+shared quota. A later quota failure must not block default-off closure.
+
+Publication reuses `release.py`'s supported ACR API, validated signed destination,
+memory-only signed URL transport, CPU/timeout request, bounded submission/run
+observation and output-image/tag/digest verification. It never publishes the
+frontend. Deployment patches only the existing API and existing manual job
+container images. It accepts historical **terminal** job executions, never an
+active execution, and retains zero retries, one replica and a 600-second timeout.
+The existing worker must also retain the verified one-CPU/two-GiB shape.
+Identity, authentication, storage settings, ingress, unrelated configuration,
+frontend and original synthetic acceptance remain unchanged. Its new receipt
+explicitly references the old synthetic acceptance instead of claiming a new run.
+
+**Create the fresh activation only after deployment.** `$RECOVERY_PACKET` has
+exactly the server's `configuration/real-pilot-recovery.json` schema:
+`schema_version=1`, `approved=true`, original `approved_by`, original canonical
+`approval_sha256` and `batch_sha256`, the five `selection` fields above, and fresh
+aware `not_before`/`expires_at` at most 1200 seconds apart after the original
+window. This is a linked recovery record, **not a replacement approval**.
+Configuration is one conditional append only; the existing record cannot be
+overwritten. Configure/enable/start verify the packet and original ledger,
+status, cached-parse and approved-source hashes without reserving work or changing
+statuses. A read-only denial cannot invalidate or reset the ledger.
+The release console uses the backend's `validate_recovery(recovery, approval,
+batch, ledger, store)` read-only verifier after deployment. It compares the
+existing original approval and ledger and validates the active linked packet
+through a read-only store. It never constructs the normal guard or invokes the
+approval-drift path that writes invalidation to the ledger.
+
+```sh
+"$PY" scripts/pilot_continuation.py configure --work "$WORK" --decision "$CONTINUATION_DECISION" \
+  --recovery "$RECOVERY_PACKET" --approve configure
+"$PY" scripts/pilot_continuation.py enable --work "$WORK" --decision "$CONTINUATION_DECISION" --approve enable
+"$PY" scripts/pilot_continuation.py start --work "$WORK" --decision "$CONTINUATION_DECISION" --approve start
+```
+
+Enable changes only the three managed API pilot settings. Start requires at least
+600 seconds left in the same pinned window and the **persisted** recovery record.
+It rechecks the remaining time immediately before submission, after fresh worker
+metadata and durable attempt recording. If that last check fails, no start is
+submitted and the recorded attempt is not refunded or blindly repeated.
+Its sole worker override fixes `--real-pilot --concurrency 1 --max-batches 1
+--item-limit 2`, removes inherited external-service settings, and consumes the
+last original execution. The worker—not a separate status command—archives the
+interrupted states and performs the conditional recovery transitions under its
+batch lease after the existing reservation checks. Unselected items are deferred;
+no result/review is overwritten and the remaining original limits still apply.
+Recovery additionally caps each inference reservation at **30,000 combined input
+and output tokens**, with at most **four** new requests. The worker spaces starts
+of successfully reserved inference calls by at least **61 seconds**, uses the
+existing **60-second** model-client timeout, and disables client retries. A
+failed/unknown call keeps its reservation; pacing is not retry authority.
+These per-request/spacing controls do not replenish or replace the original
+200,000-input/32,768-output cumulative ceilings, 600-second worker bound or fresh
+activation window. The four-request rehearsal's 92,854 input tokens is a
+planning observation, not an enforced replacement cumulative cap; monetary
+preflight still conservatively covers the full remaining original input limit.
+The fresh recovery window must end within one hour of
+`publication_not_before`, and image deployment cannot start after that hour.
+These bounds keep the continuation inside the cost-estimation window; they do
+not delete retained data or prevent later default-off closure/rollback.
+
+After the one execution is terminal (or an approved explicit stop is confirmed),
+close even if its result was uncertain, start failed, or the window has expired.
+The operator's finalization/error path must invoke this separate command; `start`
+submits once and does not claim to monitor completion or automatically close.
+
+```sh
+"$PY" scripts/pilot_continuation.py close --work "$WORK" --decision "$CONTINUATION_DECISION" --approve close
+# Only if separately requested: restore the original backend/API and worker images.
+"$PY" scripts/pilot_continuation.py rollback --work "$WORK" --decision "$CONTINUATION_DECISION" --approve rollback
+```
+
+Closure restores only the prior managed API settings. It preserves authenticated
+read/export, machine outputs, reviews, recovery audit, singleton ledger and every
+receipt. It does not reactivate the original window. Rollback does not touch the
+frontend, delete data, refund counters, or start a worker; a partially completed
+image deployment can also be rolled back while processing remains disabled.
+The helper reconciles an asynchronous PATCH with bounded, read-only observations
+of the same resource for up to 180 seconds; it never repeats the PATCH.
+Unexpected configuration drift or unconfirmed mutation stops the operation.
+An active worker blocks image mutation and rollback, but does not block restoring
+the API's default-off flags.
+The old `pilot-disabled.json` is historical evidence only and never proves this
+new activation is closed. Only freshly confirmed default-off settings and
+`continuation-closed.json` establish continuation closure. Closing API flags does
+not restart, stop, or extend an existing worker: its original 600-second limit and
+the recovery window still apply. A failed/unknown start is never repeated to
+obtain a cleaner receipt.
+
 ## Local Batch Development
 
 Use existing installed dependencies while the lock gate remains open. Choose unused

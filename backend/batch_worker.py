@@ -8,6 +8,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from time import monotonic, sleep
 from urllib.parse import quote, urlsplit
 
 from azure.identity import ManagedIdentityCredential, get_bearer_token_provider
@@ -248,10 +249,28 @@ class RealBatchProcessor(BatchProcessor):
         self.guard = guard
         self.downloads = {}
         self.inference_provenance = []
+        self._last_recovery_inference = None
+
+    def cached(self, key, binding, location):
+        document, origin = super().cached(key, binding, location)
+        try:
+            self.guard.check_recovery_cache(key)
+        except (ValueError, Missing) as error:
+            raise ExecutionConfigurationError("Recovery parse cache binding changed") from error
+        return document, origin
 
     def reserve_real(self, *args, **kwargs):
         try:
-            return self.guard.reserve(*args, **kwargs)
+            paced = self.guard.recovery is not None and args[0] == "inference"
+            if paced and self._last_recovery_inference is not None:
+                # The bounded recovery uses the existing 30k-TPM deployment.
+                delay = 61 - (monotonic() - self._last_recovery_inference)
+                if delay > 0:
+                    sleep(delay)
+            reservation = self.guard.reserve(*args, **kwargs)
+            if paced:
+                self._last_recovery_inference = monotonic()
+            return reservation
         except RealPilotBudgetExceeded:
             raise
         except (ValueError, Missing) as error:
@@ -568,6 +587,10 @@ class RealBatchProcessor(BatchProcessor):
     def __call__(self, item, mode):
         if mode != "real_pilot":
             raise ValueError("Real processor cannot execute another mode")
+        try:
+            self.guard.check_recovery_item(item)
+        except ValueError as error:
+            raise ExecutionConfigurationError("Recovery excludes this product") from error
         manifest = Manifest.model_validate(item["manifest"])
         self.inference_provenance = []
         provenance = []
@@ -679,11 +702,15 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
             record, version = read_json(store, path)
             if record["state"] not in {"queued", "running"}:
                 return
+            guard = None
             if record["mode"] == "real_pilot":
                 if concurrency != 1 or not 1 <= item_limit <= 4:
                     raise ValueError("Real pilot requires one thread and at most four items")
                 guard = RealPilotGuard(store, record)
+                if guard.recovery is not None and item_limit != 2:
+                    raise ValueError("Recovery requires an exact two-item worker slice")
                 guard.before_execution(str(uuid.uuid4()))
+                guard.prepare_recovery(fence)
                 process = processor or RealBatchProcessor(store, record, guard)
             record["state"] = "running"
             version = write_json(store, path, record, version)
@@ -692,6 +719,11 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                 key = f"items/{batch_id}/{item['item_key']}.json"
                 try:
                     state, item_version = read_json(store, key)
+                    if (guard is not None and guard.recovery is not None
+                            and state["state"] == "recovery_ready"
+                            and item["item_key"] in guard.recovery["selected_item_keys"]
+                            and state.get("recovery_sha256") == guard.recovery_sha256):
+                        pending.append(item)
                     if state["state"] == "running":
                         try:
                             read_json(store, f"results/{batch_id}/{item['item_key']}.json")
@@ -701,13 +733,22 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                         fence()
                         write_json(store, key, state, item_version)
                 except Missing:
-                    pending.append(item)
+                    if guard is None or guard.recovery is None:
+                        pending.append(item)
+                    else:
+                        raise Conflict("Recovery status disappeared; no automatic resubmission")
 
             def execute(item):
                 key = f"items/{batch_id}/{item['item_key']}.json"
                 fence()
-                state = {"id": item["item_key"], "batch_id": batch_id, "state": "running", "started_at": now(), "requested_mode": record["mode"]}
-                item_version = write_json(store, key, state)
+                if guard is not None and guard.recovery is not None:
+                    state, item_version = read_json(store, key)
+                    if state.get("state") != "recovery_ready" or state.get("recovery_sha256") != guard.recovery_sha256:
+                        raise Conflict("Recovery item changed; no automatic retry")
+                else:
+                    state, item_version = {}, None
+                state.update(id=item["item_key"], batch_id=batch_id, state="running", started_at=now(), requested_mode=record["mode"])
+                item_version = write_json(store, key, state, item_version)
                 try:
                     result, outcome = process(item, record["mode"])
                     fence()
@@ -738,10 +779,12 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                 with ThreadPoolExecutor(max_workers=concurrency) as pool:
                     list(pool.map(execute, pending[:item_limit]))
             fence()
-            record["state"] = "queued" if len(pending) > item_limit else "completed"
             record["updated_at"] = now()
             states = [read_json(store, key)[0]["state"] for key in store.keys(f"items/{batch_id}/")]
-            record["progress"] = {"finished": sum(state not in {"running", "queued"} for state in states), "unresolved": states.count("unresolved"), "failed": states.count("failed") + states.count("interrupted")}
+            record["state"] = "deferred" if "deferred" in states else "queued" if len(pending) > item_limit else "completed"
+            record["progress"] = {"finished": sum(state not in {"running", "queued", "recovery_ready", "deferred"} for state in states), "unresolved": states.count("unresolved"), "failed": states.count("failed") + states.count("interrupted")}
+            if "deferred" in states:
+                record["progress"]["deferred"] = states.count("deferred")
             write_json(store, path, record, version)
         finally:
             stopped.set()
