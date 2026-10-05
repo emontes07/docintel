@@ -17,7 +17,9 @@ Decision v2 retains those bounds but uses the separately hash-pinned incremental
 $5 financial authority/audit, not historical forecasts or incidental maxima.
 The existing synchronous ACR poller is metered without another submission;
 worker observations read only final-execution actual model usage. Missing usage
-is unknown, not a reserved charge. An operating stop permits only safety closure.
+is unknown, not a reserved charge. Telemetry is warning-only: it cannot stop a
+worker, close processing early, or latch a cost stop. Request/token limits and
+worker timeout remain server-enforced; authorized windows still require closure.
 Before v2 ready, final-helper-validation.json must separately bind the committed
 helper/test bytes and successful CI to the unchanged application decision.
 """
@@ -33,6 +35,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 from time import monotonic, sleep
 import uuid
 
@@ -77,10 +80,6 @@ GATE_CHECKS = {
 require = release.require
 sha = prior.sha
 raw_sha = prior.raw_sha
-
-
-class CostStop(ValueError):
-    """The immutable incremental operating stop must not block safety closure."""
 
 
 def evidence_path(work, name):
@@ -215,18 +214,49 @@ def latest_cost(work, decision):
     return value, int(paths[-1].stem.rsplit("-", 1)[1])
 
 
-def require_incremental_open(work, decision):
-    if decision["schema_version"] != 2:
-        return
-    if (work / "final-cost-stop.json").exists():
-        receipt(work, "cost-stop", decision)
-        raise CostStop("Final incremental operating stop is permanent; no further activity or retry")
-    value, _ = latest_cost(work, decision)
-    require(value.get("measured_known_microdollars", 0) <= 5000000,
-            "Measured final compute/model cost exceeds $5; safety closure only")
+def monitoring_warning(work, decision, reason, error=None):
+    """Persist allowlisted diagnostics without exposing console output or controlling work."""
+    messages = {
+        "usage_unavailable": "Cost/usage probe unavailable; usage remains unknown.",
+        "cost_record_unavailable": "Cost telemetry could not be recorded; totals may be incomplete.",
+        "publication_telemetry_unavailable": "Publication cost telemetry unavailable.",
+        "execution_observation_unavailable": "Worker status probe unavailable; completion remains unknown.",
+        "incomplete_cost_observation": "Cost/usage telemetry incomplete; missing usage is not zero.",
+        "measured_direct_cost_exceeds_incremental_5_usd": "Observed direct cost exceeds the unchanged $5 allowance.",
+        "publication_hard_limit_exceeded": "Publication telemetry reports a server-limit discrepancy.",
+        "worker_or_model_hard_limit_exceeded": "Worker/model telemetry reports a server-limit discrepancy.",
+    }
+    code = reason if reason in messages else "cost_record_unavailable"
+    message = (messages[code] + " Warning only; continuing observation without worker stop or early closure. "
+               "Server request/token limits and worker timeout remain enforced.")
+    error_type = type(error).__name__ if error is not None else None
+    if error_type not in {None, "ValueError", "TypeError", "KeyError", "OSError", "TimeoutError", "RuntimeError"}:
+        error_type = "Exception"
+    persistence = ""
+    try:
+        release.save_once(work / f"final-monitoring-warning-{uuid.uuid4().hex}.json", {
+            **binding(decision, work), "observed_at": now().isoformat(), "severity": "warning",
+            "reason": code, "message": message, "error_type": error_type,
+            "observation_only": True, "worker_stop_requested": False,
+        })
+    except Exception:
+        persistence = " Durable warning unavailable; no worker control action taken."
+    try:
+        print(f"WARNING: {message}{persistence}", file=sys.stderr)
+    except Exception:
+        pass
 
 
-def record_cost(work, decision, updates, *, stop_reason=None):
+@contextmanager
+def monitoring(work, decision, reason):
+    """Observation/parsing/persistence failures must not escape into activation cleanup."""
+    try:
+        yield
+    except Exception as error:
+        monitoring_warning(work, decision, reason, error)
+
+
+def record_cost(work, decision, updates, *, warning_reason=None):
     """Replace cumulative component observations, never add reservations/forecasts."""
     previous, sequence = latest_cost(work, decision)
     for name, update in updates.items():
@@ -248,13 +278,12 @@ def record_cost(work, decision, updates, *, stop_reason=None):
         "historical_and_incidental_costs_included": False, "reservations_charged": False,
     }
     release.save_once(work / f"final-direct-cost-{sequence + 1:06d}.json", value)
-    reason = "measured_direct_cost_exceeds_incremental_5_usd" if known > 5000000 else stop_reason
-    if reason:
-        path = work / "final-cost-stop.json"
-        if not path.exists():
-            release.save_once(path, {**binding(decision, work), "reason": reason,
-                                     "measured_known_microdollars": known, "cost_receipt_sequence": sequence + 1})
-        raise CostStop("Final operating stop: " + reason)
+    if value["unknown_components"]:
+        monitoring_warning(work, decision, "incomplete_cost_observation")
+    if known > 5000000:
+        monitoring_warning(work, decision, "measured_direct_cost_exceeds_incremental_5_usd")
+    if warning_reason:
+        monitoring_warning(work, decision, warning_reason)
     return value
 
 
@@ -282,7 +311,7 @@ def build_cost(work, decision, kind, properties):
         "finish_time": properties.get("finishTime"),
     }
     violation = "publication_hard_limit_exceeded" if cpu != 2 or seconds is not None and seconds > 900 else None
-    record_cost(work, decision, {kind: update}, stop_reason=violation)
+    record_cost(work, decision, {kind: update}, warning_reason=violation)
     return update
 
 
@@ -298,27 +327,18 @@ def publication_meter(work, config, decision, kind):
 
     def azure(*args, **kwargs):
         result = original(*args, **kwargs)
-        queued_path = work / CHILD / f"final-{kind}-queued.json"
-        if args[:3] == ("rest", "--method", "GET") and "--url" in args and queued_path.exists():
-            queued = release.private_json(queued_path)
-            run_id = queued["runId"]
-            url = resource + "/runs/" + run_id + "?api-version=" + release.PUBLICATION_API_VERSION
-            if args[args.index("--url") + 1] == url:
-                require(queued["attempt_sha256"] == raw_sha(work / f"final-{kind}-attempt.json"),
-                        "ACR metering must bind only this reserved publication")
-                properties = result["properties"]
-                require(properties["runId"] == run_id, "ACR measured run identity changed")
-                try:
+        with monitoring(work, decision, "publication_telemetry_unavailable"):
+            queued_path = work / CHILD / f"final-{kind}-queued.json"
+            if args[:3] == ("rest", "--method", "GET") and "--url" in args and queued_path.exists():
+                queued = release.private_json(queued_path)
+                run_id = queued["runId"]
+                url = resource + "/runs/" + run_id + "?api-version=" + release.PUBLICATION_API_VERSION
+                if args[args.index("--url") + 1] == url:
+                    require(queued["attempt_sha256"] == raw_sha(work / f"final-{kind}-attempt.json"),
+                            "ACR metering must bind only this reserved publication")
+                    properties = result["properties"]
+                    require(properties["runId"] == run_id, "ACR measured run identity changed")
                     build_cost(work, decision, kind, properties)
-                except CostStop:
-                    path = work / f"final-{kind}-stop-attempt.json"
-                    if properties["status"] in {"Queued", "Started", "Running"} and not path.exists():
-                        release.save_once(path, {**binding(decision, work), "runId": run_id})
-                        live_window(work, decision, "cleanup")
-                        original("rest", "--method", "POST", "--url",
-                                 resource + "/runs/" + run_id + "/cancel?api-version="
-                                 + release.PUBLICATION_API_VERSION, timeout=30)
-                    raise
         return result
 
     release.azure = azure
@@ -435,7 +455,7 @@ def worker_cost(work, decision, properties, usage):
              "reservations": {key: {"operation": value["operation"], "actual_usage": value["actual_usage"]}
                               for key, value in reservations.items()}}
     reason = "worker_or_model_hard_limit_exceeded" if violation or seconds is not None and seconds > 600 else None
-    return record_cost(work, decision, {"worker": worker, "model": model}, stop_reason=reason)
+    return record_cost(work, decision, {"worker": worker, "model": model}, warning_reason=reason)
 
 
 def stop_worker(work, config, decision, execution, reason):
@@ -764,7 +784,6 @@ def live_window(work, decision, phase, minimum=0):
     if phase == "cleanup":
         # Disabling authorization/stopping the reserved worker remains fail-safe after expiry.
         return value
-    require_incremental_open(work, decision)
     end = instant(value["publication_expires_at" if phase == "publication" else "overall_expires_at"])
     if phase == "processing":
         end = min(end, instant(receipt(work, "deployed", decision)["processing_expires_at"]))
@@ -899,14 +918,15 @@ def publish_component(work, config, decision, kind, capacity):
                 expires=instant(value["publication_expires_at"]), validate_upload_window=True,
             )
     except Exception:
-        if decision["schema_version"] == 2 and kind not in latest_cost(work, decision)[0]["components"]:
-            record_cost(work, decision, {kind: {
-                "microdollars": None, "complete": False, "observation": "publication_outcome_unknown",
-            }})
+        if decision["schema_version"] == 2:
+            with monitoring(work, decision, "cost_record_unavailable"):
+                record_cost(work, decision, {kind: {
+                    "microdollars": None, "complete": False, "observation": "publication_outcome_unknown",
+                }})
         raise
     if decision["schema_version"] == 2:
-        measured = build_cost(work, decision, kind, result)
-        require(measured["complete"], "Publication usage remains unknown; no next publication or deployment")
+        with monitoring(work, decision, "publication_telemetry_unavailable"):
+            build_cost(work, decision, kind, result)
     release.save_once(work / f"final-{kind}-published.json", {
         **binding(decision, work), **result,
         "image": config["registry"] + f".azurecr.io/docintel/{kind}@" + result["digest"],
@@ -1200,13 +1220,13 @@ def start(work, config, decision):
 def observe(work, config, decision):
     """Observe only the already-reserved execution; never start or retry it."""
     approval, _ = validate(work, config, decision)
-    readiness(work, decision)
-    require_incremental_open(work, decision)
+    ready = readiness(work, decision)
     recovery = configured_recovery(work, decision, approval)
     current = published_config(work, config, decision)
     execution = receipt(work, "worker-result", decision)["execution_name"]
     attempted = receipt(work, "worker-attempt", decision)
     deadline = min(instant(recovery["expires_at"]),
+                   instant(ready["overall_expires_at"]),
                    instant(attempted["attempted_at"]) + timedelta(seconds=600))
     timeout = monotonic() + max(0, (deadline - now()).total_seconds())
     terminal = work / "final-worker-terminal.json"
@@ -1216,55 +1236,51 @@ def observe(work, config, decision):
                 "Final terminal receipt execution changed")
         require(existing.get("status") == "Succeeded", "Final worker terminated unsuccessfully; no retry")
         if decision["schema_version"] == 2:
-            require(not latest_cost(work, decision)[0].get("unknown_components", ["unmeasured"]),
-                    "Final usage remains unknown; reservations are not measured charges")
+            with monitoring(work, decision, "cost_record_unavailable"):
+                if latest_cost(work, decision)[0].get("unknown_components", ["unmeasured"]):
+                    monitoring_warning(work, decision, "incomplete_cost_observation")
         return
     while now() < deadline and monotonic() < timeout:
         remaining = min((deadline - now()).total_seconds(), timeout - monotonic())
         if remaining <= 0:
             break
+        properties = None
         with live_operations(work, decision, "processing"):
-            executions = release.azure(
-                "containerapp", "job", "execution", "list", "--subscription", current["subscription"],
-                "-g", current["group"], "-n", current["job"], timeout=min(30, remaining),
-            )
-        matches = [entry for entry in executions if entry["name"] == execution]
-        require(len(matches) == 1, "Started execution not uniquely visible; never resubmit")
-        properties = matches[0]["properties"]
-        status = properties["status"]
-        if decision["schema_version"] == 2:
-            try:
-                remaining = min((deadline - now()).total_seconds(), timeout - monotonic())
-                require(remaining > 0, "Worker observation window elapsed before usage measurement")
-                usage = read_model_usage(work, current, decision, approval, recovery,
-                                         timeout=min(30, remaining / 2))
-            except Exception:
-                try:
-                    record_cost(work, decision, {
-                        "worker": worker_compute(work, decision, properties),
-                        "model": {"microdollars": None, "complete": False, "observation": "usage_unavailable"},
-                    })
-                finally:
-                    if status not in release.TERMINAL:
-                        stop_worker(work, current, decision, execution, "usage_observation_unavailable")
-                raise
-            try:
-                measured = worker_cost(work, decision, properties, usage)
-            except ValueError:
-                if status not in release.TERMINAL:
-                    stop_worker(work, current, decision, execution, "incremental_cost_or_hard_limit_stop")
-                raise
-        if status in release.TERMINAL:
-            release.save_once(terminal, {
-                **binding(decision, work), "execution_name": execution, "attempt": 3,
-                "observed_at": now().isoformat(), "no_resubmission": True,
-                **{name: properties.get(name) for name in ("status", "startTime", "endTime")},
-            })
-            require(status == "Succeeded", "Final worker terminated unsuccessfully; no retry")
+            with monitoring(work, decision, "execution_observation_unavailable"):
+                executions = release.azure(
+                    "containerapp", "job", "execution", "list", "--subscription", current["subscription"],
+                    "-g", current["group"], "-n", current["job"], timeout=min(30, remaining),
+                )
+                matches = [entry for entry in executions if entry["name"] == execution]
+                require(len(matches) == 1, "Started execution not uniquely visible; never resubmit")
+                candidate = matches[0]["properties"]
+                require(isinstance(candidate["status"], str) and candidate["status"],
+                        "Worker status unavailable")
+                properties = candidate
+        if properties is not None:
+            status = properties["status"]
             if decision["schema_version"] == 2:
-                require(not measured["unknown_components"],
-                        "Final usage remains unknown; reservations are not measured charges")
-            return
+                try:
+                    remaining = min((deadline - now()).total_seconds(), timeout - monotonic())
+                    require(remaining > 0, "Worker observation window elapsed before usage measurement")
+                    usage = read_model_usage(work, current, decision, approval, recovery,
+                                             timeout=min(30, remaining / 2))
+                    worker_cost(work, decision, properties, usage)
+                except Exception as error:
+                    monitoring_warning(work, decision, "usage_unavailable", error)
+                    with monitoring(work, decision, "cost_record_unavailable"):
+                        record_cost(work, decision, {
+                            "worker": worker_compute(work, decision, properties),
+                            "model": {"microdollars": None, "complete": False, "observation": "usage_unavailable"},
+                        })
+            if status in release.TERMINAL:
+                release.save_once(terminal, {
+                    **binding(decision, work), "execution_name": execution, "attempt": 3,
+                    "observed_at": now().isoformat(), "no_resubmission": True,
+                    **{name: properties.get(name) for name in ("status", "startTime", "endTime")},
+                })
+                require(status == "Succeeded", "Final worker terminated unsuccessfully; no retry")
+                return
         sleep(min(15, max(0, (deadline - now()).total_seconds()), max(0, timeout - monotonic())))
     stop_worker(work, current, decision, execution, "bounded_worker_window_expired")
     raise ValueError("Final worker observation expired; same execution stop requested, never restart")
