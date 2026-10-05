@@ -3,6 +3,7 @@
 Opt in with DOCINTEL_TEST_PRIVATE_ROOT (an existing private release directory),
 DOCINTEL_TEST_PRIVATE_DOCUMENTS (approved local copies), and optionally
 DOCINTEL_TEST_PRIVATE_OUTPUT (a new filename prefix, never an allowance root).
+DOCINTEL_TEST_PRIVATE_REQUIRE_COMMITTED=true requires clean, tracked tested sources.
 The root contains retained snapshots, prompts, diagnostics, and the explicitly
 REPRODUCTION-only verification-reproduction-responses.json. No customer fixture
 belongs in Git or CI. A passing test can and must report a NO_GO capacity result.
@@ -38,10 +39,8 @@ from tests.test_interrupted_reconciliation import rehydrate_private_snapshot, re
 TESTED_SOURCES = (
     "backend/extract.py", "backend/evidence_verification.py", "backend/batch_worker.py",
     "backend/real_pilot.py", "backend/core/instructions.py", "backend/models/enrichment.py",
-    "backend/multisource.py", "backend/batch.py", "tests/test_private_verification.py",
+    "backend/multisource.py", "backend/batch.py",
     "backend/interrupted_reconciliation.py", "backend/batch_store.py",
-    "tests/test_interrupted_reconciliation.py",
-    "tests/test_final_rerun.py", "tests/test_real_pilot.py", "tests/test_real_batch_worker.py",
 )
 
 
@@ -495,6 +494,20 @@ def test_retained_shape_does_not_accept_changed_primitives_or_references():
 
 
 def test_exact_private_reconstruction_and_production_gate(private_inputs, monkeypatch):
+    workspace = Path(__file__).resolve().parents[1]
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=workspace, text=True).strip()
+    require_committed = os.environ.get("DOCINTEL_TEST_PRIVATE_REQUIRE_COMMITTED") == "true"
+    gate_path = str(Path(__file__).resolve().relative_to(workspace))
+    gate_sha256 = sha(Path(__file__).read_bytes())
+    if require_committed:
+        required = [*TESTED_SOURCES, gate_path, "tests/test_final_rerun.py", "tests/test_real_pilot.py",
+                    "tests/test_real_batch_worker.py", "tests/test_interrupted_reconciliation.py"]
+        subprocess.check_output(["git", "ls-files", "--error-unmatch", "--", *required], cwd=workspace)
+        changed = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all", "--", "backend", *required],
+            cwd=workspace, text=True,
+        )
+        assert not changed.strip(), "Commit the tested backend and gate before requiring committed-source acceptance"
     tested_source_sha256 = code_fingerprints()
     inputs = private_inputs
     reconciled, reconciliation = reconcile_private(inputs, monkeypatch)
@@ -633,6 +646,8 @@ def test_exact_private_reconstruction_and_production_gate(private_inputs, monkey
         service.export(batch["id"], "unrelated-owner")
     verifier_export, verifier_results = verifier_only_export(before, batch, requests, responses)
     assert code_fingerprints() == tested_source_sha256, "Source changed during the private gate"
+    assert sha(Path(__file__).read_bytes()) == gate_sha256, "Private gate changed during execution"
+    assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=workspace, text=True).strip() == revision
     prefix = os.environ.get("DOCINTEL_TEST_PRIVATE_OUTPUT")
     if prefix:
         assert re.fullmatch(r"[A-Za-z0-9_-]+", prefix)
@@ -643,11 +658,33 @@ def test_exact_private_reconstruction_and_production_gate(private_inputs, monkey
             private_write(inputs["root"], prefix + "-export.xlsx", exported),
             private_write(inputs["root"], prefix + "-verifier-only-export.xlsx", verifier_export),
         ]
-        workspace = Path(__file__).resolve().parents[1]
+        retained = [entry for entry in reproduction["requests"] if entry["retained_record"]]
+        retained_pdf = [entry for entry in retained if entry["source_tier"] == "internal_pdf"]
+        retained_vendor = [entry for entry in retained if entry["source_tier"] == "vendor_table"]
+        def count(entries, accepted):
+            return sum(comparison["new"]["accepted"] is accepted
+                       for entry in entries for comparison in entry["comparisons"])
+
+        original_execution_limit = approval["limits"]["executions"]
+        final_execution_exception = consumed["final_rerun"]["additional_execution_exception"]
+        final_used = consumed["attempted"]["inference"] - consumed["final_rerun"]["inference_before"]
         report = {
             "label": "REPRODUCTION", "decision": decision, "live_calls": 0, "product_findings": False,
             "claim_all_real_failures_fixed": "NO_GO",
             "counterfactual_normalization_controls_passed": len(counterfactual["cases"]),
+            "retained_structure_acceptance_scope": {
+                "retained_records": len(retained),
+                "candidate_count": count(retained, True) + count(retained, False),
+                "representative_accepted": count(retained, True),
+                "representative_rejected": count(retained, False),
+                "pdf_rejected": count(retained_pdf, False),
+                "vendor_accepted": count(retained_vendor, True),
+                "vendor_rejected": count(retained_vendor, False),
+                "supplemental_vendor_examples": sum(len(entry["comparisons"]) for entry in reproduction["requests"]
+                                                     if not entry["retained_record"]),
+                "actual_model_values_recovered": False,
+                "actual_live_failure_resolution_verified": False,
+            },
             "offline_simulation": {
                 "execution_start_bypassed": True, "reused_consumed_execution": guard._execution_id,
                 "clock_frozen_inside_existing_window": simulated_time.isoformat(),
@@ -657,13 +694,41 @@ def test_exact_private_reconstruction_and_production_gate(private_inputs, monkey
             },
             "source_hashes": inputs["hashes"], "prior_ledger_sha256": real_pilot._sha256(consumed),
             "isolated_stale_reconciliation": reconciliation,
-            "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=workspace, text=True).strip(),
+            "source_revision": revision,
+            "committed_source_required": require_committed,
+            "committed_source_verified": require_committed,
             "tested_source_sha256": tested_source_sha256,
+            "gate_test_sha256": gate_sha256,
             "source_binding": "Source SHA256 values bind the tested working tree; source_revision is its base HEAD, not release authorization.",
             "remaining": remaining, "complete_request_requirements": requested,
             "remaining_spend_microdollars": approval["limits"]["spend_microdollars"] - consumed["reserved"]["microdollars"],
             "minimum_additional_input_for_four_requests": max(requested["input_tokens"] - remaining["input_tokens"], 0),
             "remaining_current_final_rerun_slots": consumed["final_rerun"]["inference_before"] + 4 - consumed["attempted"]["inference"],
+            "execution_authority_distinct_from_global_request_budget": {
+                "original_execution_limit": original_execution_limit,
+                "single_final_execution_exception": final_execution_exception,
+                "consumed_executions": len(consumed["executions"]),
+                "unused_execution_starts": max(original_execution_limit + final_execution_exception
+                                               - len(consumed["executions"]), 0),
+                "global_inference_requests_remaining": remaining["inference"],
+                "per_final_inference_cap": 4,
+                "original_final_requests_consumed": final_used,
+                "unused_historical_final_request_slots": 4 - final_used,
+                "unused_slot_authorizes_restart": False,
+                "retained_execution_status": inputs["execution"]["execution"]["properties"]["status"],
+                "retained_processing_closed": inputs["execution"]["temporary_processing_closed"],
+                "isolated_simulation_final_requests_consumed": ledger["attempted"]["inference"]
+                                                             - consumed["final_rerun"]["inference_before"],
+            },
+            "informational_full_scope_prerequisites_not_an_authorization_request": {
+                "additional_execution_start_authorization_required": True,
+                "minimum_new_processing_window_seconds": 600,
+                "separately_authorized_new_final_request_scope": len(requests),
+                "additional_global_inference_requests": max(len(requests) - remaining["inference"], 0),
+                "additional_input_tokens": max(requested["input_tokens"] - remaining["input_tokens"], 0),
+                "additional_output_tokens": max(requested["output_tokens"] - remaining["output_tokens"], 0),
+                "approval_created_or_changed": False, "scope_pruned": False,
+            },
             "smaller_scope": [{
                 "item_key": key, "complete_requests": 2,
                 "input_tokens": sum(entry["input_tokens"] for entry in requests if entry["item_key"] == key),
