@@ -1224,10 +1224,8 @@ def observe(work, config, decision):
     recovery = configured_recovery(work, decision, approval)
     current = published_config(work, config, decision)
     execution = receipt(work, "worker-result", decision)["execution_name"]
-    attempted = receipt(work, "worker-attempt", decision)
-    deadline = min(instant(recovery["expires_at"]),
-                   instant(ready["overall_expires_at"]),
-                   instant(attempted["attempted_at"]) + timedelta(seconds=600))
+    receipt(work, "worker-attempt", decision)
+    deadline = min(instant(recovery["expires_at"]), instant(ready["overall_expires_at"]))
     timeout = monotonic() + max(0, (deadline - now()).total_seconds())
     terminal = work / "final-worker-terminal.json"
     if terminal.exists():
@@ -1282,7 +1280,7 @@ def observe(work, config, decision):
                 require(status == "Succeeded", "Final worker terminated unsuccessfully; no retry")
                 return
         sleep(min(15, max(0, (deadline - now()).total_seconds()), max(0, timeout - monotonic())))
-    stop_worker(work, current, decision, execution, "bounded_worker_window_expired")
+    stop_worker(work, current, decision, execution, "authorization_window_expired")
     raise ValueError("Final worker observation expired; same execution stop requested, never restart")
 
 

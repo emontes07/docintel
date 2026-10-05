@@ -750,7 +750,7 @@ def test_worker_status_probe_recovers_without_early_closure(final_state, monkeyp
 
 
 @pytest.mark.parametrize("observation", ["unavailable", "overbudget"])
-def test_incremental_monitoring_never_extends_authorized_worker_window(incremental_state, monkeypatch, observation):
+def test_incremental_monitoring_never_extends_authorization_window(incremental_state, monkeypatch, observation):
     state = incremental_state
     deployed(state)
     original = release.azure
@@ -760,13 +760,12 @@ def test_incremental_monitoring_never_extends_authorized_worker_window(increment
         if args[:4] == ("containerapp", "job", "execution", "list"):
             assert not (state.work / "final-closed.json").exists()
             started = final.instant(final.receipt(state.work, "worker-attempt", state.decision)["attempted_at"])
-            state.clock = started + timedelta(seconds=10 if not polls else 600)
+            state.clock = started + timedelta(seconds=10) if not polls else final.instant(state.recovery["expires_at"])
             polls.append(args)
             execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
             return [{"name": execution, "properties": {"status": "Running", "startTime": started.isoformat()}}]
         if args[:3] == ("containerapp", "job", "stop"):
-            attempted = final.receipt(state.work, "worker-attempt", state.decision)
-            assert state.clock >= final.instant(attempted["attempted_at"]) + timedelta(seconds=600)
+            assert state.clock >= final.instant(state.recovery["expires_at"])
             state.calls.append(args)
             return {}
         return original(*args, **kwargs)
@@ -788,9 +787,44 @@ def test_incremental_monitoring_never_extends_authorized_worker_window(increment
     assert len(stops) == 1
     assert stops[0][stops[0].index("--job-execution-name") + 1] == final.receipt(
         state.work, "worker-result", state.decision)["execution_name"]
-    assert final.receipt(state.work, "worker-stop-attempt", state.decision)["reason"] == "bounded_worker_window_expired"
+    assert final.receipt(state.work, "worker-stop-attempt", state.decision)["reason"] == "authorization_window_expired"
     assert final.receipt(state.work, "closed", state.decision)
     assert not (state.work / "final-cost-stop.json").exists()
+
+
+def test_observer_has_no_client_side_worker_timeout(incremental_state, monkeypatch):
+    state = incremental_state
+    deployed(state)
+    original = release.azure
+    polls = []
+
+    def azure(*args, **kwargs):
+        if args[:4] == ("containerapp", "job", "execution", "list"):
+            started = final.instant(final.receipt(state.work, "worker-attempt", state.decision)["attempted_at"])
+            state.clock = started + timedelta(seconds=601 + len(polls))
+            assert state.clock < final.instant(state.recovery["expires_at"])
+            polls.append(args)
+            execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
+            return [{"name": execution, "properties": {
+                "status": "Running" if len(polls) == 1 else "Failed", "startTime": started.isoformat(),
+            }}]
+        if args[:3] == ("containerapp", "job", "stop"):
+            pytest.fail("Only the server may enforce the worker's 600-second timeout")
+        return original(*args, **kwargs)
+
+    def unavailable(*args, **kwargs):
+        raise ValueError("Remote console did not confirm the expected marker")
+
+    monkeypatch.setattr(release, "azure", azure)
+    monkeypatch.setattr(final, "read_model_usage", unavailable)
+    monkeypatch.setattr(final, "sleep", lambda _: None)
+    with pytest.raises(ValueError, match="terminated unsuccessfully"):
+        final.activate(state.work, state.config, state.decision, state.recovery)
+    assert len(polls) == 2
+    assert final.receipt(state.work, "worker-terminal", state.decision)["status"] == "Failed"
+    assert final.receipt(state.work, "closed", state.decision)
+    assert state.job["properties"]["configuration"]["replicaTimeout"] == 600
+    assert not (state.work / "final-worker-stop-attempt.json").exists()
 
 
 def test_readiness_clock_starts_after_all_offline_preparation(final_state, monkeypatch):
@@ -1375,10 +1409,10 @@ def test_activation_always_closes_in_finally(final_state, monkeypatch, failure):
             raise ValueError("synthetic start outcome unknown")
         if args[:4] == ("containerapp", "job", "execution", "list"):
             if failure == "observe_window_expired":
-                state.clock += timedelta(seconds=600)
+                state.clock = final.instant(state.recovery["expires_at"])
                 raise ValueError("synthetic observation failure")
             if failure == "timeout":
-                state.clock += timedelta(seconds=600)
+                state.clock = final.instant(state.recovery["expires_at"])
             execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
             status = "Running" if failure == "timeout" else "Failed" if failure == "worker_failed" else "Succeeded"
             return [{"name": execution, "properties": {"status": status, "startTime": "synthetic", "endTime": "synthetic"}}]
@@ -1417,5 +1451,6 @@ def test_activation_always_closes_in_finally(final_state, monkeypatch, failure):
     if stops:
         assert stops[0][stops[0].index("--job-execution-name") + 1] == final.receipt(
             state.work, "worker-result", state.decision)["execution_name"]
-    with pytest.raises(ValueError, match="closed"):
+    denial = "processing window" if failure in {"timeout", "observe_window_expired"} else "closed"
+    with pytest.raises(ValueError, match=denial):
         final.activate(state.work, state.config, state.decision, state.recovery)

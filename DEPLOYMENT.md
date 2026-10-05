@@ -832,7 +832,9 @@ failures, malformed/unavailable telemetry, observed server-limit discrepancies,
 and compute-plus-model estimates above the unchanged $5 allowance produce clear
 warnings, never a worker-stop command, early processing closure, or a cost-stop
 latch. Observation continues for the same execution until actual completion or
-the independently authorized window/600-second worker deadline. Unknown usage
+the independently authorized activation/operating window. The observer does not
+impose a client-side 600-second timeout: it can await a delayed terminal status
+past that point while the job enforces its own timeout. Unknown usage
 does not turn successful worker completion into a failure.
 
 Warnings are sanitized (no raw exception, console output or credentials) and
