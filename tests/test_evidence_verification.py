@@ -138,6 +138,18 @@ def test_vendor_quote_can_span_cells_but_value_cannot_come_from_wrapper():
         assert caught.value.issues[0].field_path == "candidates[0].value"
 
 
+@pytest.mark.parametrize("source,value,rule", [
+    ("0.750", "0.75", "numeric_format"),
+    ("\u22125", "-5", "unicode_numeric_symbols"),
+])
+def test_format_equivalence_is_never_mislabeled_as_verbatim(source, value, rule):
+    evidence = [row(source)]
+    candidates, manifest = response(value, value, evidence)
+    check = validate_response(candidates, manifest, evidence)[0]
+    assert rule in check.value.normalization
+    assert rule in check.quote.normalization
+
+
 @pytest.mark.parametrize("source,quote,value", [
     ("5/8 in", "5 8 in", "5/8 in"),
     ("0.5 in", "5 in", "5 in"),

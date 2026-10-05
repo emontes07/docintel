@@ -37,6 +37,8 @@ def normalized(text: str, *, vendor: bool = False) -> tuple[list[str], list[str]
     if folded != value:
         rules.append("casefold")
     value = folded.replace("\u2044", "/").replace("\u2212", "-")
+    if value != folded:
+        rules.append("unicode_numeric_symbols")
     spaced = re.sub(r"(?<=\d)\s*/\s*(?=\d)", "/", value)
     spaced = re.sub(r"(?<!\w)([+-])\s+(?=\d)", r"\1", spaced)
     if spaced != value:
@@ -203,7 +205,9 @@ def match_text(text: str, spans: list[list[Fragment]]) -> EvidenceMatch | None:
             for part in owners[start:end]:
                 if part not in matched:
                     matched.append(part)
-            literal = len(matched) == 1 and text in matched[0].text
+            literal = len(matched) == 1 and re.search(
+                rf"(?<!\w){re.escape(text)}(?!\w)", matched[0].text,
+            ) is not None
             applied = [] if literal else sorted(set(target_rules + [
                 rule for group in rules[start:end] for rule in group
             ]))
