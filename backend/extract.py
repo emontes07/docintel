@@ -16,6 +16,9 @@ from backend.models.enrichment import (
     InferenceFailure, LiveBundle, OfflineBundle, OfflineSource, RetrievalOutcome, ReviewDecision,
 )
 from backend.real_pilot import RealPilotBudgetExceeded
+from backend.response_validation import (
+    ResponseValidationError, invalid, parsed_content, response_diagnostic, schema_issues,
+)
 
 
 class StructuredCompletion(Protocol):
@@ -29,6 +32,12 @@ class ExecutionConfigurationError(ValueError):
 
 
 def sanitized_failure(error: Exception, stage: str) -> InferenceFailure:
+    if isinstance(error, ResponseValidationError):
+        return InferenceFailure(
+            stage=error.diagnostic.stage if error.diagnostic else "evidence_validation",
+            exception_class="ResponseValidationError", parameter=error.issues[0].field_path,
+            explanation=error.issues[0].message,
+        )
     if isinstance(error, RealPilotBudgetExceeded):
         return InferenceFailure(
             stage="client_initialization", exception_class="RealPilotBudgetExceeded",
@@ -147,22 +156,28 @@ def validate_response(
 ) -> None:
     definitions = {attribute.attribute_id: attribute for attribute in manifest.attributes}
     citations = {item.evidence_id: item for item in evidence}
-    for candidate in response.candidates:
+    for index, candidate in enumerate(response.candidates):
+        path = f"candidates[{index}]"
         if candidate.attribute_id not in definitions or candidate.attribute_id in manifest.existing_values:
-            raise ValueError("Candidate must target a known missing attribute")
-        definitions[candidate.attribute_id].validate_value(candidate.value, candidate.unit)
-        for evidence_id in candidate.evidence_ids:
+            raise invalid(path + ".attribute_id", "Candidate must target a known missing attribute")
+        definition = definitions[candidate.attribute_id]
+        try:
+            definition.validate_value(candidate.value, candidate.unit)
+        except ValueError as error:
+            field = ".unit" if not definition.unit_resolved or candidate.unit != definition.unit else ".value"
+            raise invalid(path + field, str(error)) from error
+        for offset, evidence_id in enumerate(candidate.evidence_ids):
             if evidence_id not in citations or citations[evidence_id].content_kind != "source_excerpt":
-                raise ValueError("Candidate must cite an available source excerpt")
+                raise invalid(f"{path}.evidence_ids[{offset}]", "Candidate must cite an available source excerpt")
             scope = citations[evidence_id].attribute_ids
             if scope is not None and candidate.attribute_id not in scope:
-                raise ValueError("Candidate exceeds the approved product/attribute applicability")
+                raise invalid(f"{path}.evidence_ids[{offset}]", "Candidate exceeds the approved product/attribute applicability")
         if candidate.supporting_quote is not None and (
             not candidate.supporting_quote.strip() or not any(
                 candidate.supporting_quote in citations[key].text for key in candidate.evidence_ids
             )
         ):
-            raise ValueError("Supporting quotation must occur verbatim in cited evidence")
+            raise invalid(path + ".supporting_quote", "Supporting quotation must occur verbatim in cited evidence")
         literal = str(candidate.value)
         if isinstance(candidate.value, float) and candidate.value.is_integer():
             literal = str(int(candidate.value))
@@ -172,29 +187,29 @@ def validate_response(
             citations[evidence_id].text for evidence_id in candidate.evidence_ids
         ]
         if not any(re.search(pattern, text, re.IGNORECASE) for text in supporting_text):
-            raise ValueError("Candidates require literal value support in source excerpts")
+            raise invalid(path + ".value", "Candidates require literal value support in source excerpts")
         if candidate.unit and not any(
             re.search(rf"(?<!\w){re.escape(candidate.unit)}(?!\w)", text, re.IGNORECASE)
             for text in supporting_text
         ):
-            raise ValueError("Candidates require explicit unit support in source excerpts")
+            raise invalid(path + ".unit", "Candidates require explicit unit support in source excerpts")
         if candidate.supporting_quote and re.search(r"\b(maximum|max)\b", candidate.attribute_id, re.IGNORECASE):
             if re.search(r"\bworking\b", candidate.supporting_quote, re.IGNORECASE) and not re.search(
                 r"\b(maximum|max)\b", candidate.supporting_quote, re.IGNORECASE
             ):
-                raise ValueError("Working rating does not establish a maximum rating")
+                raise invalid(path + ".supporting_quote", "Working rating does not establish a maximum rating")
         if candidate.supporting_quote and candidate.attribute_id.casefold() in {"material", "primary material", "body material"}:
             if re.search(r"\b(o-ring|seat|stem|seal|ball|pin|washer)s?\b", candidate.supporting_quote, re.IGNORECASE) and not re.search(
                 r"\b(body|primary material)\b", candidate.supporting_quote, re.IGNORECASE
             ):
-                raise ValueError("A component material does not establish the product/body material")
+                raise invalid(path + ".supporting_quote", "A component material does not establish the product/body material")
         if candidate.supporting_quote and type(candidate.value) is bool:
             answer = "(?:true|yes)" if candidate.value else "(?:false|no)"
             if not re.search(
                 rf"{re.escape(candidate.attribute_id)}\s*[:=]\s*{answer}(?!\w)",
                 candidate.supporting_quote, re.IGNORECASE,
             ):
-                raise ValueError("Boolean proposals require an explicit labeled answer, not negation or missing evidence")
+                raise invalid(path + ".supporting_quote", "Boolean proposals require an explicit labeled answer, not negation or missing evidence")
 
 
 class ReplayCompletion:
@@ -274,17 +289,19 @@ def run_enrichment(
     response = ExtractionResponse(candidates=[])
     extraction_error = None
     failure = None
+    diagnostics = []
     invalid_attributes = set()
     model_call_status = "not_attempted"
-    missing_attributes = any(attribute.attribute_id not in manifest.existing_values for attribute in manifest.attributes)
-    skip_reason = "no_missing_attributes" if not missing_attributes else "no_eligible_evidence" if not evidence else None
+    missing_attributes = any(attribute.attribute_id not in manifest.existing_values and attribute.unit_resolved for attribute in manifest.attributes)
+    clarification_needed = any(not attribute.unit_resolved for attribute in manifest.attributes)
+    skip_reason = ("definition_clarification_needed" if clarification_needed else "no_missing_attributes") if not missing_attributes else "no_eligible_evidence" if not evidence else None
     if live and skip_reason:
         model_call_status = "skipped"
     if skip_reason is None:
         prompt = json.dumps({
             "product": manifest.product.model_dump(),
             "attributes": [attribute.model_dump(exclude={"examples"}) for attribute in manifest.attributes
-                           if attribute.attribute_id not in manifest.existing_values],
+                           if attribute.attribute_id not in manifest.existing_values and attribute.unit_resolved],
             "evidence": [item.model_dump(mode="json") for item in evidence],
         })
         if live and completion is None:
@@ -294,6 +311,7 @@ def run_enrichment(
             if not endpoint or not endpoint.strip() or not settings.LLM_DEPLOYMENT or not settings.LLM_DEPLOYMENT.strip():
                 raise ExecutionConfigurationError("Live inference requires LLM_ENDPOINT (or AI_FOUNDRY_ENDPOINT) and LLM_DEPLOYMENT")
         stage = "client_initialization"
+        generator = None
         try:
             generator = (completion if completion is not None else LLMClient()) if live else ReplayCompletion(bundle.generated_response)
             options = {}
@@ -314,19 +332,38 @@ def run_enrichment(
             stage = "evidence_validation"
             if qualified:
                 accepted = []
-                for candidate in response.candidates:
+                issues = []
+                for index, candidate in enumerate(response.candidates):
                     try:
                         if not candidate.supporting_quote or not candidate.qualification or not candidate.qualification.strip():
-                            raise ValueError("Real proposals require quotations and applicability qualifications")
+                            field = "supporting_quote" if not candidate.supporting_quote else "qualification"
+                            raise invalid(f"candidates[0].{field}", "Real proposals require quotations and applicability qualifications")
                         validate_response(ExtractionResponse(candidates=[candidate]), manifest, evidence)
                         accepted.append(candidate)
-                    except ValueError as error:
+                    except ResponseValidationError as error:
                         invalid_attributes.add(candidate.attribute_id)
                         extraction_error = "invalid_response"
                         failure = sanitized_failure(error, stage)
+                        issues.extend(issue.model_copy(update={
+                            "field_path": issue.field_path.replace("candidates[0]", f"candidates[{index}]", 1),
+                        }) for issue in error.issues)
+                if issues:
+                    handler = getattr(type(generator), "validation_failure", None)
+                    diagnostics.append(handler(generator, issues) if handler else response_diagnostic(
+                        payload=response.model_dump(mode="json"),
+                        references={entry.evidence_id: entry.evidence_id for entry in evidence}, issues=issues,
+                        raw_response_sha256=getattr(generator, "last_response_sha256", None),
+                    ))
+                    error = ResponseValidationError(issues)
+                    error.diagnostic = diagnostics[-1]
+                    failure = sanitized_failure(error, stage)
                 response = ExtractionResponse(candidates=accepted)
             else:
                 validate_response(response, manifest, evidence)
+            if extraction_error is None:
+                cache_validated = getattr(type(generator), "validated_response", None)
+                if cache_validated is not None:
+                    cache_validated(generator, response)
         except RealPilotBudgetExceeded as error:
             model_call_status = "not_attempted"
             extraction_error = "model_failed"
@@ -336,6 +373,20 @@ def run_enrichment(
         except Exception as error:
             extraction_error = "invalid_response" if stage != "client_initialization" and isinstance(error, (ValidationError, ValueError, LLMSchemaValidationError)) else "model_failed"
             failure = sanitized_failure(error, stage)
+            if isinstance(error, ResponseValidationError):
+                diagnostics.append(error.diagnostic or response_diagnostic(
+                    payload=response.model_dump(mode="json"),
+                    references={entry.evidence_id: entry.evidence_id for entry in evidence},
+                    issues=error.issues, raw_response_sha256=getattr(generator, "last_response_sha256", None),
+                ))
+            elif isinstance(error, (LLMSchemaValidationError, ValidationError)):
+                content = error.raw_content if isinstance(error, LLMSchemaValidationError) else None
+                diagnostics.append(response_diagnostic(
+                    payload=parsed_content(content), references={entry.evidence_id: entry.evidence_id for entry in evidence},
+                    issues=schema_issues(error.errors if isinstance(error, LLMSchemaValidationError) else error),
+                    stage="structured_response_parsing",
+                    raw_response_sha256=getattr(generator, "last_response_sha256", None),
+                ))
             response = ExtractionResponse(candidates=[])
 
     results = []
@@ -345,6 +396,8 @@ def run_enrichment(
         values = {(type(candidate.value).__name__, candidate.value, candidate.unit) for candidate in candidates}
         if attribute.attribute_id in manifest.existing_values:
             status = "existing"
+        elif not attribute.unit_resolved:
+            status = "definition_clarification_needed"
         elif extraction_error and not invalid_attributes:
             status = "extraction_failed"
         elif candidates:
@@ -353,14 +406,20 @@ def run_enrichment(
             status = "extraction_failed"
         else:
             status = "retrieval_failed" if retrieval_failed else "missing_evidence"
-        results.append(AttributeResult(attribute_id=attribute.attribute_id, status=status, candidates=candidates))
+        results.append(AttributeResult(
+            attribute_id=attribute.attribute_id, status=status, candidates=candidates,
+            definition_clarification=(
+                f"Confirm the expected unit for {attribute.attribute_id}; no unit or dimensionless value is inferred."
+                if status == "definition_clarification_needed" else None
+            ),
+        ))
     return EnrichmentResult(
         execution_mode=execution_mode,
         candidate_source="llm" if live else "supplied_response",
         model_call_status=model_call_status, skip_reason=skip_reason,
         manifest=manifest, observed_at=observed_at, retrieval=retrieval,
         evidence=evidence, attributes=results, extraction_error=extraction_error,
-        failure=failure,
+        failure=failure, validation_diagnostics=diagnostics,
     )
 
 

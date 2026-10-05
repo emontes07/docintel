@@ -69,6 +69,22 @@ class Completion:
         return ExtractionResponse(candidates=candidates)
 
 
+def test_missing_definition_unit_is_customer_clarification_not_extraction(manifest):
+    manifest.attributes.append(AttributeDefinition(
+        attribute_id="Pressure Rating", description="Pressure", value_type="number", unit_resolved=False,
+    ))
+    completion = Completion()
+    result = run_cascade(
+        manifest, lambda tier, pending: [source(manifest, tier, "Body Material: brass")], completion,
+    )
+    pressure = next(attribute for attribute in result.attributes if attribute.attribute_id == "Pressure Rating")
+    assert pressure.status == "definition_clarification_needed"
+    assert "Confirm the expected unit for Pressure Rating" in pressure.definition_clarification
+    assert not pressure.candidates
+    assert all(attribute["attribute_id"] != "Pressure Rating"
+               for call in completion.calls for attribute in call["attributes"])
+
+
 def test_cascade_only_requests_remaining_attributes_and_keeps_all_sources(manifest):
     completion = Completion()
     requests = []

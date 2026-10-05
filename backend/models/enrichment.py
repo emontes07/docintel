@@ -2,7 +2,7 @@
 
 from typing import Literal, Self
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from backend.core.docintel import ParsedDocument
 
@@ -170,7 +170,8 @@ class ReviewAnnotation(Contract):
 
 class AttributeResult(Contract):
     attribute_id: str
-    status: Literal["existing", "proposed", "conflict", "missing_evidence", "retrieval_failed", "extraction_failed"]
+    status: Literal["existing", "proposed", "conflict", "missing_evidence", "retrieval_failed", "extraction_failed", "definition_clarification_needed"]
+    definition_clarification: str | None = None
     candidates: list[Candidate] = Field(default_factory=list)
     review: ReviewDecision | None = None
     review_annotations: list[ReviewAnnotation] = Field(default_factory=list)
@@ -191,11 +192,38 @@ class InferenceFailure(Contract):
     explanation: str
 
 
+class ValidationIssue(Contract):
+    field_path: str
+    message: str
+
+
+class DiagnosticReference(Contract):
+    field_path: str
+    value: str | None = None
+    sha256: str
+    redacted: bool
+
+
+class ResponseValidationDiagnostic(Contract):
+    schema_version: Literal[1] = 1
+    stage: Literal["structured_response_parsing", "evidence_validation"]
+    issues: list[ValidationIssue]
+    used_references: list[DiagnosticReference]
+    valid_references: list[str]
+    parsed_response: dict[str, JsonValue]
+    raw_response_sha256: str | None = None
+    raw_response_hash_basis: Literal["provider_content", "unavailable"]
+    source_tier: SourceTier | None = None
+    reservation_id: str | None = None
+    prompt_format: str | None = None
+    truncated: bool = False
+
+
 class EnrichmentResult(Contract):
     execution_mode: Literal["offline_replay", "live_inference"]
     candidate_source: Literal["supplied_response", "llm"]
     model_call_status: Literal["not_attempted", "skipped", "succeeded", "failed"]
-    skip_reason: Literal["no_eligible_evidence", "no_missing_attributes"] | None = None
+    skip_reason: Literal["no_eligible_evidence", "no_missing_attributes", "definition_clarification_needed"] | None = None
     manifest: Manifest
     observed_at: AwareDatetime
     retrieval: list[RetrievalOutcome]
@@ -203,3 +231,4 @@ class EnrichmentResult(Contract):
     attributes: list[AttributeResult]
     extraction_error: Literal["invalid_response", "model_failed"] | None = None
     failure: InferenceFailure | None = None
+    validation_diagnostics: list[ResponseValidationDiagnostic] = Field(default_factory=list)

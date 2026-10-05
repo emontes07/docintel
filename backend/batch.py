@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from backend.batch_store import Conflict, Missing, read_json, write_json
 from backend.core.vendor_tables import VendorTableConfig
 from backend.extract import apply_reviews
-from backend.models.enrichment import AttributeDefinition, EnrichmentResult, Manifest, ProductKey, ReviewDecision
+from backend.models.enrichment import AttributeDefinition, EnrichmentResult, Manifest, ProductKey, ResponseValidationDiagnostic, ReviewDecision
 from backend.workbooks import WorkbookError, read_workbook, write_workbook
 
 
@@ -218,7 +218,7 @@ def validate_batch(manifest_bytes, attribute_bytes, attribute_reference, registr
                     definition = parsed_definitions[key]
                     selected.append(definition)
                     if not definition.unit_resolved:
-                        warnings.append(f"Unresolved unit: {name}; no dimensionless or physical unit is inferred")
+                        warnings.append(f"Definition clarification needed: {name}; confirm the expected unit. No dimensionless or physical unit is inferred")
             for column, tiers in source_columns.items():
                 for reference in selections(original.get(column, "")):
                     source = source_lookup.get(reference)
@@ -352,6 +352,15 @@ class BatchService:
             detail.update(machine_result=result, machine_sha256=digest(machine.model_dump_json(exclude_unset=True).encode()), reviewed_result=apply_reviews(machine, [ReviewDecision.model_validate(review) for review in reviews]).model_dump(mode="json"), reviewer_identity="verified_entra" if not actor.startswith("development:") else "development_unverified")
         except Missing:
             detail.update(machine_result=None, reviewed_result=None)
+        diagnostics = {
+            digest(json.dumps(value, sort_keys=True).encode()): value
+            for value in (detail.get("machine_result") or {}).get("validation_diagnostics", [])
+        }
+        for key in self.store.keys(f"response-diagnostics/{batch_id}/{item_key}/"):
+            value, _ = read_json(self.store, key)
+            value = ResponseValidationDiagnostic.model_validate(value).model_dump(mode="json")
+            diagnostics[digest(json.dumps(value, sort_keys=True).encode())] = value
+        detail["validation_diagnostics"] = list(diagnostics.values())
         return detail
 
     def review(self, batch_id, item_key, actor, value):
@@ -375,14 +384,37 @@ class BatchService:
         inputs = [columns, *[[item["original"].get(column, "") for column in columns] for item in record["items"]]]
         results = [["Row", "Item ID", "Vendor", "MPN", "Attribute", "Status", "Candidate index", "Proposed value", "Unit", "Evidence IDs", "Qualifications", "Review status", "Reviewed value", "Reviewed unit", "Reviewer", "Reviewed at", "Reason", "Error", "Source tiers", "Supporting quote", "Model confidence (not measured accuracy)"]]
         evidence_rows = [["Row", "Evidence ID", "Source ID", "Locator", "Version", "Excerpt", "Observed at", "Source tier", "Applicability", "Approved attributes", "Discovery method"]]
-        errors = [["Row", "State", "Error", "Warnings"]]
+        errors = [["Row", "State", "Error", "Warnings", "Definition clarifications", "Validation diagnostics"]]
+        diagnostics_sheet = [["Row", "Diagnostic", "Part", "Parts", "Sanitized diagnostic JSON"]]
         provenance = [["Row", "Execution method", "Machine SHA256", "Source provenance", "Consumption reservations and usage", "Attribute coverage", "Inference provenance"]]
         for item in record["items"]:
             try:
                 detail = self.detail(batch_id, item["item_key"], actor)
             except Missing:
                 detail = {"state": record["state"], "error": "; ".join(item["errors"]), "reviewed_result": None}
-            errors.append([item["row"], detail["state"], detail.get("error", ""), "; ".join(item["warnings"])])
+            clarifications = [
+                attribute["definition_clarification"]
+                for attribute in (detail.get("reviewed_result") or {}).get("attributes", [])
+                if attribute.get("definition_clarification")
+            ]
+            diagnostic_summaries = []
+            for index, diagnostic in enumerate(detail.get("validation_diagnostics", [])):
+                diagnostic_summaries.extend(
+                    f"{issue['field_path']}: {issue['message']}" for issue in diagnostic["issues"]
+                )
+                serialized = json.dumps(diagnostic, ensure_ascii=True)
+                chunks = [serialized[offset:offset + 30000] for offset in range(0, len(serialized), 30000)]
+                diagnostics_sheet.extend(
+                    [item["row"], index + 1, part + 1, len(chunks), chunk]
+                    for part, chunk in enumerate(chunks)
+                )
+            diagnostic_summary = "\n".join(diagnostic_summaries)
+            if len(diagnostic_summary) > 30000:
+                diagnostic_summary = diagnostic_summary[:30000] + "\nSee Diagnostics sheet for complete sanitized diagnostics."
+            errors.append([
+                item["row"], detail["state"], detail.get("error", ""), "; ".join(item["warnings"]),
+                "\n".join(clarifications), diagnostic_summary,
+            ])
             provenance.append([item["row"], record.get("mode", "not_submitted"), detail.get("machine_sha256", ""), json.dumps(detail.get("provenance", [])), json.dumps(detail.get("consumption")), json.dumps(detail.get("coverage")), json.dumps(detail.get("inference_provenance"))])
             machine = detail.get("reviewed_result")
             if not machine:
@@ -411,6 +443,8 @@ class BatchService:
                 reviews_sheet.append([item["row"], review["attribute_id"], review["decision"], review["candidate_index"], review["corrected_value"], review["corrected_unit"], review["reviewer"], "development_unverified" if actor.startswith("development:") else "verified_entra", review["reviewed_at"], review["reason"]])
         metadata = [["Key", "Value"], ["Batch ID", batch_id], ["Export started at", exported_at], ["Batch state", record["state"]], ["Input hashes", json.dumps(record["input_hashes"])], ["Attribute reference", record["attribute_reference"]], ["Consistency", "Per-item snapshot; reviews or processing may advance during export"], ["Qualification", "Machine proposals are not approved master data; inspect every exception and review"]]
         sheets = {"Batch": metadata, "Inputs": inputs, "Definitions": [definition_columns, *[[row.get(column, "") for column in definition_columns] for row in record["original_definitions"]]], "Results": results, "Evidence": evidence_rows, "Provenance": provenance, "Errors": errors, "Reviews": reviews_sheet}
+        if len(diagnostics_sheet) > 1:
+            sheets["Diagnostics"] = diagnostics_sheet
         return export_workbook(sheets)
 
 

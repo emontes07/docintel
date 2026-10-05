@@ -22,7 +22,12 @@ def run_cascade(
     attributes = {
         definition.attribute_id: AttributeResult(
             attribute_id=definition.attribute_id,
-            status="existing" if definition.attribute_id in manifest.existing_values else "missing_evidence",
+            status=("existing" if definition.attribute_id in manifest.existing_values
+                    else "missing_evidence" if definition.unit_resolved else "definition_clarification_needed"),
+            definition_clarification=(
+                f"Confirm the expected unit for {definition.attribute_id}; no unit or dimensionless value is inferred."
+                if not definition.unit_resolved else None
+            ),
         )
         for definition in manifest.attributes
     }
@@ -30,6 +35,7 @@ def run_cascade(
     retrieval = []
     calls = []
     failure = None
+    diagnostics = []
     extraction_error = None
     for tier in TIERS:
         eligible = {definition.attribute_id for definition in manifest.attributes if definition.unit_resolved}
@@ -55,6 +61,7 @@ def run_cascade(
         evidence.extend(result.evidence)
         retrieval.extend(outcome for outcome in result.retrieval if outcome.source_tier == tier)
         calls.append(result.model_call_status)
+        diagnostics.extend(result.validation_diagnostics)
         if result.extraction_error:
             extraction_error, failure = result.extraction_error, result.failure
         for current in result.attributes:
@@ -75,5 +82,5 @@ def run_cascade(
         ) else "no_eligible_evidence") if status == "skipped" else None,
         manifest=manifest, observed_at=datetime.now(timezone.utc),
         retrieval=retrieval, evidence=evidence, attributes=list(attributes.values()),
-        extraction_error=extraction_error, failure=failure,
+        extraction_error=extraction_error, failure=failure, validation_diagnostics=diagnostics,
     )

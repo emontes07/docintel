@@ -717,6 +717,51 @@ its own selectable row and citation reference, even when its text is duplicated.
 Original evidence IDs and locations remain encoded by exact prefixes/suffixes;
 request-local citation references are expanded back to the selected original IDs
 before quote/applicability validation, caching or export.
+The `real-evidence-groups-v2` contract requests a JSON `evidence_ids` list of
+first-column row references such as `["E1", "E2"]`. Surrounding whitespace,
+lowercase `e`, ordering and duplicates are harmless. Exact original evidence IDs
+are also accepted when they do not collide with row-reference labels, which
+always take precedence. Group indexes, source IDs, location suffixes, joined
+references in one string, unknown references and empty citation lists are not
+accepted. Values still require verbatim supporting quotations, explicit units
+where specified, and approved product/attribute applicability.
+
+Response-validation failures retain bounded sanitized diagnostics under the
+owner-bound `response-diagnostics/<batch>/<item>/<reservation>.json` path before
+the machine result is written. Failure to persist that audit stops execution.
+These records do not replace results, reviews, reservations or prior attempts.
+The private product detail merges these records with machine-result diagnostics,
+including when execution was interrupted before producing a machine result.
+Diagnostics retain safe error messages and field paths, the allowed references,
+the supplied reference tokens (unknown text is redacted and hashed), a redacted
+parsed structure, and the SHA-256 of exact provider message content captured
+before schema validation. Values, quotes, qualifications, unknown keys and
+secret-like reference strings are not copied into diagnostics. Absent response
+content is explicitly marked unavailable; hashes of reserialized guesses are
+never presented as raw-response hashes. Bounds and truncation are explicit.
+Model usage remains counted even if structured-response parsing fails.
+Only responses that pass citation, quotation, value, unit and applicability
+validation enter the reusable inference cache. A successful cache entry retains
+sanitized reference/structure context for diagnosing a later validation failure;
+rejected raw response text is never cached.
+
+The owner's page renders diagnostics as text only. The Excel `Errors` sheet
+includes field-level summaries and definition clarifications; a `Diagnostics`
+sheet is included when needed. Its numbered JSON parts are at most 30,000
+characters each, so complete sanitized diagnostics survive Excel cell limits.
+For a definition with unresolved unit guidance, the attribute is
+`definition_clarification_needed`, not an extraction failure. It is excluded from
+model requests until the customer confirms its unit; the application never
+guesses a physical unit or assumes dimensionless.
+
+The opt-in private response gate uses `DOCINTEL_TEST_SUBSET_PROMPTS` and
+`DOCINTEL_TEST_CONSUMPTION_SNAPSHOT` with
+`tests/test_real_batch_worker.py::test_actual_private_two_product_response_contract`.
+It runs production prompt construction, citation validation and owner-bound
+export against actual private payloads with explicitly constructed responses.
+Its capacity projection uses the consumed-reservation snapshot but does not
+simulate worker authorization or replenish executions. A skipped private test
+is not a readiness pass; private payloads and receipts must never enter CI.
 Stored evidence and approved inputs are not rewritten or truncated. The effective
 compact system/user/schema bytes plus the existing safety allowance still determine
 the conservative reservation; measured token usage never refunds that reservation.
