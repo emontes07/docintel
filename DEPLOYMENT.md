@@ -815,6 +815,23 @@ then frontend, and each build still needs its full 900 seconds before submission
 No Azure operation is permitted during preparation. No incomplete deployment may
 open processing, and unused exceptions do not renew elapsed windows.
 
+A separate explicit financial amendment may instead authorize a $5 incremental
+operating allowance for this final rerun. It does not replenish the original
+request/token ledger, alter the two build or one worker limits, or count historical
+forecast margins as consumed spending. Retain the original financial evidence;
+bind the new authority and verified rates to readiness. Historical identified
+spend is a reference, not a finalized bill. Storage, log and transfer estimates
+use observed quantities with attribution uncertainty and are disclosure-only
+under this amendment, not blocking cumulative forecast maxima.
+
+For that amended basis, meter only this rerun's observed build/worker durations
+and recorded model usage at the verified rates. Missing usage remains unknown,
+not zero. Check between operations and during worker observation; a measured
+compute-plus-model estimate above $5 stops further operations and closes temporary
+processing. This is an operating allowance with polling delay, not a hard Azure
+billing cap. A release-helper-only correction can retain the exact previously
+validated application source and build context.
+
 The existing PDF request still selects `pages="1-5"` with a 120-second polling
 bound. Offline SDK tests verify those arguments, not server handling when a PDF
 has fewer pages. No undocumented out-of-range acceptance is assumed and no

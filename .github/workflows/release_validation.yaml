@@ -29,7 +29,7 @@ jobs:
           python - <<'PY'
           import os, subprocess
           paths = subprocess.check_output(['git', 'diff', '--name-only', os.environ['BASE'], os.environ['HEAD']], text=True).splitlines()
-          allowed = {'scripts/release.py', 'scripts/pilot_continuation.py', 'tests/test_release.py', 'tests/test_release_continuation.py', 'DEPLOYMENT.md', '.github/workflows/release_validation.yaml'}
+          allowed = {'scripts/release.py', 'scripts/pilot_continuation.py', 'scripts/final_continuation.py', 'tests/test_release.py', 'tests/test_release_continuation.py', 'tests/test_final_continuation.py', 'DEPLOYMENT.md', '.github/workflows/release_validation.yaml'}
           helper_only = bool(paths) and set(paths) <= allowed
           frontend_only = bool(paths) and set(paths) <= (allowed | {'frontend/Dockerfile', 'frontend/replace-env.mjs', 'scripts/frontend_smoke.py'})
           backend_only = bool(paths) and set(paths) <= (allowed | {'backend/batch_store.py', 'backend/batch_worker.py', 'backend/real_pilot.py', 'tests/test_real_batch_worker.py', 'tests/test_real_pilot.py', 'tests/test_batch.py', 'tests/test_batch_api.py', 'scripts/backend_smoke.py', '.github/workflows/frontend_docker_build.yaml'})
@@ -66,7 +66,7 @@ jobs:
       - name: Install committed dependencies
         run: uv sync --locked --python 3.13
       - name: Release helper regression
-        run: .venv/bin/python -m pytest tests/test_release.py tests/test_release_continuation.py -q -p no:cacheprovider
+        run: .venv/bin/python -m pytest tests/test_release.py tests/test_release_continuation.py tests/test_final_continuation.py -q -p no:cacheprovider
   release:
     needs: changes
     if: needs.changes.outputs.helper_only != 'true'
