@@ -420,24 +420,34 @@ def require_pilot_build_receipts(config, work):
                 break
             component_work = private_path(preserved["work"])
             require(fingerprint(private_json(component_work / "images.json")) == preserved["receipt_sha256"], "Preserved pilot publication receipt changed")
-        clean = private_json(component_work / "clean-checks.json")
-        smoke = private_json(component_work / f"{kind}-smoke.json")
-        inventory = private_json(component_work / "context.json")
-        modes = private_json(component_work / "context-modes.json")
-        context = component_work / "context"
-        require(inventory == {str(path.relative_to(context)): hashlib.sha256(path.read_bytes()).hexdigest() for path in context.rglob("*") if path.is_file()}, "Pilot smoke context content drift")
-        require(modes == {str(path.relative_to(context)): path.stat().st_mode & 0o777 for path in context.rglob("*")}, "Pilot smoke context permission drift")
-        require(all(source["files"].get(name) == digest for name, digest in inventory.items()), "Pilot tested context differs from published source")
-        require(clean["revision"] == smoke["revision"] == source["revision"], "Pilot clean/runtime receipt revision mismatch")
-        expected_clean = "clean_locked_install_offline_tests" if kind == "backend" else "clean_npm_ci_checks_build"
-        require(clean.get(kind) == expected_clean, "Pilot requires actual clean component installation/build checks")
-        require(clean["lock_sha256"] == source["files"].get("uv.lock"), "Pilot clean checks do not bind the published lock")
-        require(smoke.get("passed") is True and smoke.get("network") == "none", "Pilot offline startup smoke did not pass")
-        require(smoke["context_sha256"] == fingerprint(inventory) and smoke["modes_sha256"] == fingerprint(modes), "Pilot startup smoke did not test this exact build context")
-        if kind == "backend":
-            require(smoke.get("startup") == "health_200_anonymous_batch_401" and smoke.get("uid") == 10001, "Pilot backend startup/auth/nonroot smoke is missing")
-        else:
-            require(smoke.get("running") is True and smoke.get("permission_failure") is False and smoke.get("probe_exit_code") == 0, "Pilot frontend nonroot asset/startup smoke is missing")
+        require_component_source_receipts(component_work, kind)
+
+
+def require_component_source_receipts(work, kind):
+    """The same exact-source evidence is required before and after publication."""
+    require(kind in {"backend", "frontend"}, "Unsupported source component")
+    source = verify_source(work)
+    clean = private_json(work / "clean-checks.json")
+    smoke = private_json(work / f"{kind}-smoke.json")
+    inventory = private_json(work / "context.json")
+    modes = private_json(work / "context-modes.json")
+    context = work / "context"
+    entries = list(context.rglob("*"))
+    require(all(not path.is_symlink() and (path.is_file() or path.is_dir()) for path in entries),
+            "Build context links/special files are forbidden")
+    require(inventory == {str(path.relative_to(context)): hashlib.sha256(path.read_bytes()).hexdigest() for path in entries if path.is_file()}, "Pilot smoke context content drift")
+    require(modes == {str(path.relative_to(context)): path.stat().st_mode & 0o777 for path in entries}, "Pilot smoke context permission drift")
+    require(all(source["files"].get(name) == digest for name, digest in inventory.items()), "Pilot tested context differs from published source")
+    require(clean["revision"] == smoke["revision"] == source["revision"], "Pilot clean/runtime receipt revision mismatch")
+    expected_clean = "clean_locked_install_offline_tests" if kind == "backend" else "clean_npm_ci_checks_build"
+    require(clean.get(kind) == expected_clean, "Pilot requires actual clean component installation/build checks")
+    require(clean["lock_sha256"] == source["files"].get("uv.lock"), "Pilot clean checks do not bind the published lock")
+    require(smoke.get("passed") is True and smoke.get("network") == "none", "Pilot offline startup smoke did not pass")
+    require(smoke["context_sha256"] == fingerprint(inventory) and smoke["modes_sha256"] == fingerprint(modes), "Pilot startup smoke did not test this exact build context")
+    if kind == "backend":
+        require(smoke.get("startup") == "health_200_anonymous_batch_401" and smoke.get("uid") == 10001, "Pilot backend startup/auth/nonroot smoke is missing")
+    else:
+        require(smoke.get("running") is True and smoke.get("permission_failure") is False and smoke.get("probe_exit_code") == 0, "Pilot frontend nonroot asset/startup smoke is missing")
 
 
 def require_pilot_acceptance(config, work):

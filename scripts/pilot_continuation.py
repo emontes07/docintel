@@ -122,7 +122,8 @@ def root(path=None):
 def history(work):
     paths = {work / name for name in REQUIRED_HISTORY}
     for pattern in HISTORY_PATTERNS:
-        paths.update(path for path in work.glob(pattern) if not path.name.startswith("continuation-"))
+        paths.update(path for path in work.glob(pattern)
+                     if not path.name.startswith(("continuation-", "final-")))
     require(not (work / "pilot-execution-attempt-2.json").exists(),
             "The original last worker allowance has already been attempted")
     for path in paths:
@@ -227,11 +228,14 @@ def validate_source(work, decision):
     return child
 
 
-def incidental_ceiling(proof):
-    require(proof.get("execution_window_seconds") == 3600
+def incidental_ceiling(proof, *, execution_window_seconds=3600):
+    window_names = {3600: "one-hour", 4500: "75-minute", 5400: "90-minute"}
+    require(execution_window_seconds in window_names, "Unsupported bounded forecast window")
+    window_name = window_names[execution_window_seconds]
+    require(proof.get("execution_window_seconds") == execution_window_seconds
             and type(proof["execution_window_seconds"]) is int
             and proof.get("estimate_basis") == "conservative_quantities_not_final_billing",
-            "Incidental estimate must cover the bounded one-hour execution, not indefinite future storage")
+            f"Incidental estimate must cover the bounded {window_name} execution, not indefinite future storage")
     require(proof.get("storage_month_days") == 30 and type(proof["storage_month_days"]) is int,
             "Storage forecasts must disclose the 30-day price conversion without implying deletion")
     uncertainty = proof.get("uncertainty")
@@ -248,7 +252,7 @@ def incidental_ceiling(proof):
             "Disclose a 30-day retained-data estimate separately; no deletion or infinite-lifetime proof")
     envelopes = proof.get("envelopes")
     require(isinstance(envelopes, dict) and set(envelopes) == set(INCIDENTAL_UNITS),
-            "Prior and bounded one-hour incidental quantity-price coverage is required")
+            f"Prior and bounded {window_name} incidental quantity-price coverage is required")
     total = 0
     with localcontext() as context:
         context.prec = 60
@@ -661,14 +665,16 @@ def ready(config, kind):
     return resource
 
 
-def patch(work, config, label, resource, containers, *, job=False):
+def patch(work, config, label, resource, containers, *, job=False, kind="backend", prefix="continuation"):
+    require(kind in {"backend", "frontend"} and prefix in {"continuation", "final"},
+            "Unsupported bounded mutation scope")
     if job:
         current, running = release.active_executions(config)
         require(not running, "Worker became active before mutation")
     else:
-        current = release.app(config, config["backend"])
+        current = release.app(config, config[kind])
     require(current == resource, "Resource changed before mutation; inspect, never overwrite drift")
-    path = work / ("continuation-" + label + "-patch.json")
+    path = work / (prefix + "-" + label + "-patch.json")
     payload = {"properties": {"template": {"containers": release.writable_containers(containers)}}}
     release.save_once(path, payload)
     arguments = ["rest", "--method", "PATCH", "--url", "https://management.azure.com" + resource["id"]
@@ -684,7 +690,7 @@ def patch(work, config, label, resource, containers, *, job=False):
             actual, running = release.active_executions(config, timeout=30)
             require(not running, "Worker became active during mutation; stop and inspect")
         else:
-            actual = release.app(config, config["backend"], timeout=30)
+            actual = release.app(config, config[kind], timeout=30)
         observed = shape(actual)
         if observed == expected:
             break
