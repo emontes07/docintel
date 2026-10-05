@@ -324,7 +324,7 @@ class BatchService:
             try:
                 detail, _ = read_json(self.store, f"items/{batch_id}/{item['item_key']}.json")
                 try:
-                    reviews, _ = read_json(self.store, f"reviews/{batch_id}/{item['item_key']}.json")
+                    reviews, _ = read_json(self.store, self.result_record_key(batch_id, item["item_key"], detail).replace("results/", "reviews/", 1))
                 except Missing:
                     reviews = []
                 pending = bool(set(detail.get("reviewable_attributes", [])) - {review["attribute_id"] for review in reviews})
@@ -335,6 +335,16 @@ class BatchService:
             output = [item for item in output if (view == "failed" and (item["errors"] or item["state"] in {"failed", "interrupted"})) or (view == "unresolved" and item["state"] == "unresolved") or (view == "pending" and item["pending_review"])]
         return {"items": output if view == "all" else output[offset:offset + limit], "total": len(record["items"]) if view == "all" else len(output)}
 
+    @staticmethod
+    def result_record_key(batch_id, item_key, state):
+        original = f"results/{batch_id}/{item_key}.json"
+        key = state.get("result_key", original)
+        if key != original and not re.fullmatch(
+            re.escape(f"results/{batch_id}/{item_key}/attempts/") + r"[a-f0-9]{64}\.json", key,
+        ):
+            raise ValueError("Invalid item-bound result pointer")
+        return key
+
     def detail(self, batch_id, item_key, actor):
         record = self.get(batch_id, actor)
         if item_key not in {item["item_key"] for item in record["items"]}:
@@ -343,9 +353,10 @@ class BatchService:
         item = next(item for item in record["items"] if item["item_key"] == item_key)
         detail.update(original=item["original"], row=item["row"], requested_mode=record.get("mode", "not_submitted"))
         try:
-            result, _ = read_json(self.store, f"results/{batch_id}/{item_key}.json")
+            result_key = self.result_record_key(batch_id, item_key, detail)
+            result, _ = read_json(self.store, result_key)
             try:
-                reviews, _ = read_json(self.store, f"reviews/{batch_id}/{item_key}.json")
+                reviews, _ = read_json(self.store, result_key.replace("results/", "reviews/", 1))
             except Missing:
                 reviews = []
             machine = EnrichmentResult.model_validate(result)
@@ -361,6 +372,29 @@ class BatchService:
             value = ResponseValidationDiagnostic.model_validate(value).model_dump(mode="json")
             diagnostics[digest(json.dumps(value, sort_keys=True).encode())] = value
         detail["validation_diagnostics"] = list(diagnostics.values())
+        if detail.get("result_key"):
+            states = []
+            state = {key: value for key, value in detail.items()
+                     if key not in {"machine_result", "reviewed_result", "validation_diagnostics"}}
+            while state:
+                states.append({key: value for key, value in state.items() if key != "previous_attempt"})
+                state = state.get("previous_attempt")
+            history = []
+            for index, state in enumerate(reversed(states)):
+                result_key = self.result_record_key(batch_id, item_key, state)
+                machine = None
+                machine_hash = None
+                if state.get("state") not in {"interrupted", "recovery_ready", "running"}:
+                    try:
+                        raw, _ = self.store.read_bytes(result_key)
+                        machine, machine_hash = json.loads(raw), digest(raw)
+                    except Missing:
+                        pass
+                history.append({
+                    "attempt": index + 1, "state": state, "result_key": result_key,
+                    "machine_result": machine, "machine_sha256": machine_hash,
+                })
+            detail["attempt_history"] = history
         return detail
 
     def review(self, batch_id, item_key, actor, value):
@@ -368,7 +402,7 @@ class BatchService:
         if not detail["machine_result"]:
             raise ValueError("No machine result is available for review")
         review = ReviewDecision.model_validate({**value, "reviewer": actor, "reviewed_at": now()})
-        key = f"reviews/{batch_id}/{item_key}.json"
+        key = self.result_record_key(batch_id, item_key, detail).replace("results/", "reviews/", 1)
         try:
             reviews, version = read_json(self.store, key)
         except Missing:
@@ -386,12 +420,29 @@ class BatchService:
         evidence_rows = [["Row", "Evidence ID", "Source ID", "Locator", "Version", "Excerpt", "Observed at", "Source tier", "Applicability", "Approved attributes", "Discovery method"]]
         errors = [["Row", "State", "Error", "Warnings", "Definition clarifications", "Validation diagnostics"]]
         diagnostics_sheet = [["Row", "Diagnostic", "Part", "Parts", "Sanitized diagnostic JSON"]]
+        attempts_sheet = [["Row", "Attempt", "State", "Result key", "Machine SHA256", "Error", "Started at", "Finished at", "Proposals", "Extraction error"]]
+        attempt_records = [["Row", "Attempt", "Part", "Parts", "Attempt record JSON"]]
         provenance = [["Row", "Execution method", "Machine SHA256", "Source provenance", "Consumption reservations and usage", "Attribute coverage", "Inference provenance"]]
         for item in record["items"]:
             try:
                 detail = self.detail(batch_id, item["item_key"], actor)
             except Missing:
                 detail = {"state": record["state"], "error": "; ".join(item["errors"]), "reviewed_result": None}
+            for attempt in detail.get("attempt_history", []):
+                state, machine = attempt["state"], attempt["machine_result"] or {}
+                attempts_sheet.append([
+                    item["row"], attempt["attempt"], state["state"], attempt["result_key"],
+                    attempt["machine_sha256"], state.get("error"), state.get("started_at"),
+                    state.get("finished_at"),
+                    sum(len(attribute["candidates"]) for attribute in machine.get("attributes", [])),
+                    machine.get("extraction_error"),
+                ])
+                serialized = json.dumps(attempt, ensure_ascii=True)
+                chunks = [serialized[offset:offset + 30000] for offset in range(0, len(serialized), 30000)]
+                attempt_records.extend(
+                    [item["row"], attempt["attempt"], part + 1, len(chunks), chunk]
+                    for part, chunk in enumerate(chunks)
+                )
             clarifications = [
                 attribute["definition_clarification"]
                 for attribute in (detail.get("reviewed_result") or {}).get("attributes", [])
@@ -436,7 +487,9 @@ class BatchService:
         reviews_sheet = [["Row", "Attribute", "Decision", "Selected candidate index", "Corrected value", "Corrected unit", "Reviewer", "Identity status", "Reviewed at", "Reason"]]
         for item in record["items"]:
             try:
-                reviews, _ = read_json(self.store, f"reviews/{batch_id}/{item['item_key']}.json")
+                state, _ = read_json(self.store, f"items/{batch_id}/{item['item_key']}.json")
+                key = self.result_record_key(batch_id, item["item_key"], state).replace("results/", "reviews/", 1)
+                reviews, _ = read_json(self.store, key)
             except Missing:
                 continue
             for review in reviews:
@@ -445,6 +498,9 @@ class BatchService:
         sheets = {"Batch": metadata, "Inputs": inputs, "Definitions": [definition_columns, *[[row.get(column, "") for column in definition_columns] for row in record["original_definitions"]]], "Results": results, "Evidence": evidence_rows, "Provenance": provenance, "Errors": errors, "Reviews": reviews_sheet}
         if len(diagnostics_sheet) > 1:
             sheets["Diagnostics"] = diagnostics_sheet
+        if len(attempts_sheet) > 1:
+            sheets["Attempts"] = attempts_sheet
+            sheets["Attempt Records"] = attempt_records
         return export_workbook(sheets)
 
 

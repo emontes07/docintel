@@ -794,7 +794,7 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                         pending.append(item)
                     if state["state"] == "running":
                         try:
-                            read_json(store, f"results/{batch_id}/{item['item_key']}.json")
+                            read_json(store, state.get("result_key", f"results/{batch_id}/{item['item_key']}.json"))
                             state.update(state="unresolved", error="Recovered persisted result after interrupted status update; inspect before review")
                         except Missing:
                             state.update(state="interrupted", error="Prior worker stopped after reservation; remote completion unknown. No automatic resubmission")
@@ -820,7 +820,8 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                 try:
                     result, outcome = process(item, record["mode"])
                     fence()
-                    write_json(store, f"results/{batch_id}/{item['item_key']}.json", result.model_dump(mode="json"))
+                    result_key = guard.result_key(item["item_key"]) if guard else f"results/{batch_id}/{item['item_key']}.json"
+                    write_json(store, result_key, result.model_dump(mode="json"))
                     state.update(outcome)
                     state["reviewable_attributes"] = [attribute.attribute_id for attribute in result.attributes if attribute.status != "existing"]
                 except ExecutionConfigurationError:
