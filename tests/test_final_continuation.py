@@ -1,6 +1,7 @@
 """Synthetic-only final rerun helper tests; network access is forbidden."""
 
 import copy
+import base64
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -162,6 +163,84 @@ def final_state(continued, monkeypatch):
     return state
 
 
+@pytest.fixture
+def incremental_state(final_state, monkeypatch):
+    state = final_state
+    state.legacy_financial_bytes = (state.work / "final-cost-evidence.json").read_bytes()
+    gate_file = "final-private-gate-afd06d6.json"
+    release.save(state.work / gate_file, release.private_json(state.work / "final-recovery-gate.json"))
+    authority = {
+        "approved": True, "application_revision": state.decision["source_revision"],
+        "private_gate_receipt": gate_file, "private_gate_sha256": final.raw_sha(state.work / gate_file),
+        "baseline_sha256": final.raw_sha(state.work / "final-baseline.json"),
+        "original_ledger_sha256": state.recovery["ledger_sha256"],
+    }
+    authority_path = state.work / "final-financial-authority-v2.json"
+    release.save(authority_path, authority)
+    monkeypatch.setattr(final, "FINANCIAL_AUTHORITY_SHA256", final.raw_sha(authority_path))
+    no_go = state.work / "final-phase-a-cost-90min.json"
+    release.save(no_go, {"decision": "NO_GO", "historical_forecast_is_not_consumption": True})
+    rates = {
+        "acr_usd_per_vcpu_second": "0.0001", "worker_cpu_usd_per_vcpu_second": "0.000024",
+        "worker_memory_usd_per_gib_second": "0.000003",
+        "model_input_guard_usd_per_token": state.approval["unit_prices_usd"]["input_token"],
+        "model_output_guard_usd_per_token": state.approval["unit_prices_usd"]["output_token"],
+    }
+    report = {
+        "schema_version": 2, "passed": True, "money_ready": True, "no_live_operations": True,
+        "accepted_source_context": {"source_revision": state.decision["source_revision"]},
+        "evidence_integrity": {"all_checks_passed": True, "source_receipt_raw_sha256": {
+            name: final.raw_sha(state.work / name) for name in (
+                "real-pilot-approval.json", "continuation-cost-rates-verified.json",
+            )
+        }},
+        "financial_authority": {
+            "new_separate_incremental_operating_allowance_microdollars": 5000000,
+            "historical_usage_deducted_from_new_allowance": False,
+            "incidental_estimates_are_disclosure_only": True, "incidental_maxima_are_not_a_gate": True,
+            "prior_cost_report_preserved": {"name": no_go.name, "sha256": final.raw_sha(no_go)},
+        },
+        "stop_rule": {"threshold_microdollars": 5000000, "comparison": "strictly_greater_than"},
+        "verified_retained_price_basis": rates,
+        "direct_compute_model_cost": {"maximum_direct_compute_model_microdollars": 378000 + 107146 + 8192},
+        "observed_incidentals_disclosure": {"not_a_gate": True, "estimate_usd": "1000000"},
+    }
+    report_path = state.work / "final-financial-authority-cost-v2.json"
+    release.save(report_path, report)
+    monkeypatch.setattr(final, "FINANCIAL_EVIDENCE_SHA256", final.raw_sha(report_path))
+    state.decision.update(
+        schema_version=2, policy=copy.deepcopy(final.INCREMENTAL_POLICY), gate_file=gate_file,
+        gate_sha256=authority["private_gate_sha256"], financial_authority_sha256=final.raw_sha(authority_path),
+        cost={"mode": "incremental_operating", "limit_microdollars": 5000000,
+              "evidence_file": report_path.name, "evidence_sha256": final.raw_sha(report_path)},
+    )
+    release.save(state.work / "final-helper-validation.json", {
+        "schema_version": 1, "decision_sha256": final.sha(state.decision),
+        "application_revision": state.decision["source_revision"], "helper_revision": "b" * 40,
+        "helper_sha256": final.raw_sha(Path(final.__file__)), "tests_sha256": final.raw_sha(Path(__file__)),
+        "checks": {"Validate Backend": "success", "Validate Frontend": "success", "Validate Release": "success"},
+    })
+    monkeypatch.setattr(final, "require_helper_commit", lambda value: None)
+    original_execute = release.execute_publication
+
+    def execute(*args, **kwargs):
+        first = state.clock
+        result = original_execute(*args, **kwargs)
+        state.clock += timedelta(seconds=10)
+        return {**result, "status": "Succeeded", "startTime": first.isoformat(),
+                "finishTime": state.clock.isoformat(), "agentConfiguration": {"cpu": 2}}
+
+    monkeypatch.setattr(release, "execute_publication", execute)
+    state.model_usage = {
+        "execution_id": "e" * 64, "invalidated": None,
+        "reservations": {str(index): {
+            "operation": "inference", "actual_usage": {"input_tokens": 1000, "output_tokens": 100, "analysis_pages": 0},
+        } for index in range(4)},
+    }
+    monkeypatch.setattr(final, "read_model_usage", lambda *args, **kwargs: copy.deepcopy(state.model_usage))
+    return state
+
+
 def make_ready(state):
     value = final.ready(state.work, state.config, state.decision)
     state.recovery.update(readiness_at=value["readiness_at"],
@@ -198,6 +277,289 @@ def test_offline_check_has_no_clock_or_readiness_dependency(final_state, monkeyp
     monkeypatch.setattr(final, "now", forbidden)
     final.validate(final_state.work, final_state.config, final_state.decision)
     assert not (final_state.work / "final-readiness.json").exists()
+
+
+def test_incremental_authority_is_offline_and_preserves_legacy_costs(incremental_state, monkeypatch):
+    state = incremental_state
+    monkeypatch.setattr(final, "now", lambda: pytest.fail("Offline financial validation must not start a clock"))
+    final.validate(state.work, state.config, state.decision)
+    assert not state.calls and not state.console_calls and not state.model_metadata_calls
+    assert (state.work / "final-cost-evidence.json").read_bytes() == state.legacy_financial_bytes
+    assert release.private_json(state.work / "final-phase-a-cost-90min.json")["decision"] == "NO_GO"
+    assert not (state.work / "final-readiness.json").exists()
+
+
+@pytest.mark.parametrize("defect", ["authority", "report", "limit", "mode", "path", "symlink", "permissions", "retained"])
+def test_incremental_authority_denies_bad_evidence_before_clock(incremental_state, monkeypatch, defect):
+    state = incremental_state
+    if defect in {"authority", "report"}:
+        name = "final-financial-authority-v2.json" if defect == "authority" else "final-financial-authority-cost-v2.json"
+        path = state.work / name
+        value = release.private_json(path)
+        value["changed"] = True
+        release.save(path, value)
+    elif defect == "limit":
+        state.decision["cost"]["limit_microdollars"] = 5000001
+    elif defect == "mode":
+        state.decision["cost"]["mode"] = "forgive_all_history"
+    elif defect == "path":
+        state.decision["gate_file"] = "../" + state.decision["gate_file"]
+    elif defect == "symlink":
+        path = state.work / state.decision["gate_file"]
+        path.unlink()
+        path.symlink_to(state.work / "final-recovery-gate.json")
+    elif defect == "permissions":
+        (state.work / "final-financial-authority-cost-v2.json").chmod(0o644)
+    else:
+        release.save(state.work / "final-phase-a-cost-90min.json", {"rewritten": True})
+    monkeypatch.setattr(final, "now", lambda: pytest.fail("Invalid financial evidence must not read clock"))
+    with pytest.raises(ValueError):
+        make_ready(state)
+    assert not (state.work / "final-readiness.json").exists()
+    assert not state.calls and not state.console_calls and not state.model_metadata_calls
+
+
+def test_incremental_readiness_binds_authority_and_helper(incremental_state):
+    state = incremental_state
+    ready = make_ready(state)
+    assert ready["financial_authority_sha256"] == state.decision["financial_authority_sha256"]
+    assert ready["helper_sha256"] == final.raw_sha(Path(final.__file__))
+    assert ready["helper_revision"] == "b" * 40 != ready["source_revision"]
+    assert ready["helper_validation_sha256"] == final.raw_sha(state.work / "final-helper-validation.json")
+    assert ready["cost_sha256"] == state.decision["cost"]["evidence_sha256"]
+    assert final.instant(ready["overall_expires_at"]) - final.instant(ready["readiness_at"]) == timedelta(seconds=5400)
+
+
+@pytest.mark.parametrize("defect", ["missing", "source", "ci", "decision", "helper_bytes", "test_bytes"])
+def test_incremental_ready_requires_separate_helper_ci_before_clock(incremental_state, monkeypatch, defect):
+    state = incremental_state
+    path = state.work / "final-helper-validation.json"
+    if defect == "missing":
+        path.unlink()
+    else:
+        value = release.private_json(path)
+        if defect == "source":
+            value["application_revision"] = value["helper_revision"]
+        elif defect == "ci":
+            value["checks"]["Validate Release"] = "failure"
+        elif defect == "decision":
+            value["decision_sha256"] = "0" * 64
+        else:
+            value["helper_sha256" if defect == "helper_bytes" else "tests_sha256"] = "0" * 64
+        release.save(path, value)
+    monkeypatch.setattr(final, "now", lambda: pytest.fail("Helper CI must precede readiness clock"))
+    final.validate(state.work, state.config, state.decision)
+    with pytest.raises(ValueError):
+        make_ready(state)
+    assert not (state.work / "final-readiness.json").exists()
+    assert not state.calls and not state.console_calls
+
+
+@pytest.mark.parametrize("defect", [None, "head", "uncommitted"])
+def test_helper_commit_receipt_verifies_git_without_relabeling_app(final_state, monkeypatch, defect):
+    value = {
+        "helper_revision": "b" * 40, "helper_sha256": final.raw_sha(Path(final.__file__)),
+        "tests_sha256": final.raw_sha(Path(__file__)),
+    }
+
+    def command(args, **kwargs):
+        if args[1] == "rev-parse":
+            return (("c" if defect == "head" else "b") * 40).encode()
+        assert args[:2] == ["git", "show"]
+        name = args[2].split(":", 1)[1]
+        return b"uncommitted" if defect == "uncommitted" else (Path(final.__file__).resolve().parents[1] / name).read_bytes()
+
+    monkeypatch.setattr(release, "command", command)
+    if defect:
+        with pytest.raises(ValueError, match="checkout|Uncommitted"):
+            final.require_helper_commit(value)
+    else:
+        final.require_helper_commit(value)
+
+
+def test_incremental_authority_cannot_change_after_readiness(incremental_state):
+    state = incremental_state
+    make_ready(state)
+    path = state.work / "final-financial-authority-v2.json"
+    value = release.private_json(path)
+    value["approved"] = False
+    release.save(path, value)
+    with pytest.raises(ValueError, match="authority"):
+        final.publish(state.work, state.config, state.decision)
+    assert not state.published and not state.model_metadata_calls and not state.console_calls
+    assert not (state.work / "final-backend-attempt.json").exists()
+
+
+def test_incremental_meter_counts_only_completed_final_builds(incremental_state):
+    state = incremental_state
+    make_ready(state)
+    final.publish(state.work, state.config, state.decision)
+    value, _ = final.latest_cost(state.work, state.decision)
+    assert value["measured_known_microdollars"] == 4000
+    assert set(value["components"]) == {"backend", "frontend"}
+    assert not value["unknown_components"] and value["reservations_charged"] is False
+    assert value["historical_and_incidental_costs_included"] is False
+    assert (state.work / "final-cost-evidence.json").read_bytes() == state.legacy_financial_bytes
+
+
+def test_incremental_missing_build_runtime_is_unknown_not_forecast(incremental_state, monkeypatch):
+    state = incremental_state
+    make_ready(state)
+    original = release.execute_publication
+
+    def execute(*args, **kwargs):
+        value = original(*args, **kwargs)
+        value.pop("finishTime")
+        return value
+
+    monkeypatch.setattr(release, "execute_publication", execute)
+    with pytest.raises(ValueError, match="usage remains unknown"):
+        final.publish(state.work, state.config, state.decision)
+    value, _ = final.latest_cost(state.work, state.decision)
+    assert value["components"]["backend"]["microdollars"] is None
+    assert value["unknown_components"] == ["backend"]
+    assert not (state.work / "final-frontend-attempt.json").exists()
+
+
+@pytest.mark.parametrize("measured,stop", [(5000000, False), (5000001, True)])
+def test_incremental_threshold_is_strict_and_stop_survives_next_action(incremental_state, measured, stop):
+    state = incremental_state
+    make_ready(state)
+    if stop:
+        with pytest.raises(final.CostStop):
+            final.record_cost(state.work, state.decision, {"model": {"microdollars": measured, "complete": True}})
+        with pytest.raises(final.CostStop):
+            final.publish(state.work, state.config, state.decision)
+        assert not state.model_metadata_calls and not state.published
+    else:
+        final.record_cost(state.work, state.decision, {"model": {"microdollars": measured, "complete": True}})
+        final.require_incremental_open(state.work, state.decision)
+
+
+def test_incremental_acr_poller_cancels_exact_existing_run(incremental_state, monkeypatch):
+    state = incremental_state
+    make_ready(state)
+    run_id = "only-reserved-run"
+    calls = []
+    properties = {"runId": run_id, "status": "Running", "agentConfiguration": {"cpu": 2},
+                  "startTime": (state.clock - timedelta(seconds=26000)).isoformat()}
+
+    def azure(*args, **kwargs):
+        calls.append(args)
+        return {"properties": properties}
+
+    def execute(config, work, kind, revision, attempt, **kwargs):
+        release.save_once(work / f"final-{kind}-queued.json", {
+            "runId": run_id, "attempt_sha256": final.raw_sha(attempt),
+        })
+        url = (f"https://management.azure.com/subscriptions/{config['subscription']}/resourceGroups/"
+               f"{config['group']}/providers/Microsoft.ContainerRegistry/registries/"
+               f"{config['registry']}/runs/{run_id}?api-version={release.PUBLICATION_API_VERSION}")
+        return release.azure("rest", "--method", "GET", "--url", url)
+
+    monkeypatch.setattr(release, "execute_publication", execute)
+    monkeypatch.setattr(release, "azure", azure)
+    with pytest.raises(final.CostStop, match="measured_direct_cost"):
+        final.publish_component(state.work, state.config, state.decision, "backend", {})
+    assert len(calls) == 2 and calls[1][:3] == ("rest", "--method", "POST")
+    assert f"/runs/{run_id}/cancel?" in calls[1][4]
+    assert final.receipt(state.work, "backend-stop-attempt", state.decision)["runId"] == run_id
+    assert not (state.work / "final-frontend-attempt.json").exists()
+
+
+@pytest.mark.parametrize("unknown,overrun", [(False, False), (True, False), (False, True)])
+def test_incremental_worker_meter_closes_and_stops_only_existing_worker(incremental_state, monkeypatch, unknown, overrun):
+    state = incremental_state
+    deployed(state)
+    original = release.azure
+    if unknown:
+        state.model_usage["reservations"]["0"]["actual_usage"] = None
+    if overrun:
+        state.model_usage["reservations"]["0"]["actual_usage"]["input_tokens"] = 6000000
+
+    def azure(*args, **kwargs):
+        if args[:4] == ("containerapp", "job", "execution", "list"):
+            attempted = final.receipt(state.work, "worker-attempt", state.decision)
+            started = final.instant(attempted["attempted_at"])
+            state.clock = started + timedelta(seconds=10)
+            execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
+            return [{"name": execution, "properties": {
+                "status": "Running" if overrun else "Succeeded",
+                "startTime": started.isoformat(), "endTime": None if overrun else state.clock.isoformat(),
+            }}]
+        if args[:3] == ("containerapp", "job", "stop"):
+            state.calls.append(args)
+            return {}
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(release, "azure", azure)
+    if unknown or overrun:
+        with pytest.raises(ValueError, match="unknown|operating stop"):
+            final.activate(state.work, state.config, state.decision, state.recovery)
+    else:
+        final.activate(state.work, state.config, state.decision, state.recovery)
+    value, _ = final.latest_cost(state.work, state.decision)
+    assert value["components"]["model"]["microdollars"] == (6003400 if overrun else 3300 if unknown else 4400)
+    assert value["components"]["worker"]["microdollars"] == 300
+    assert value["measured_known_microdollars"] == (6007700 if overrun else 7600 if unknown else 8700)
+    assert value["components"]["model"]["unknown_reservations"] == (["0"] if unknown else [])
+    assert final.receipt(state.work, "closed", state.decision)
+    release.require_real_pilot_off(state.resources["backend"])
+    stops = [call for call in state.calls if call[:3] == ("containerapp", "job", "stop")]
+    assert len(stops) == int(overrun)
+    if overrun:
+        execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
+        assert stops[0][stops[0].index("--job-execution-name") + 1] == execution
+        with pytest.raises(final.CostStop):
+            final.start(state.work, state.config, state.decision)
+
+
+def test_incremental_all_missing_usage_is_null_not_reserved_spend(incremental_state):
+    state = incremental_state
+    make_ready(state)
+    for reservation in state.model_usage["reservations"].values():
+        reservation.update(actual_usage=None, reserved_microdollars=999999999)
+    value = final.worker_cost(state.work, state.decision, {
+        "status": "Succeeded", "startTime": state.clock.isoformat(),
+        "endTime": (state.clock + timedelta(seconds=10)).isoformat(),
+    }, state.model_usage)
+    assert value["components"]["model"]["microdollars"] is None
+    assert value["components"]["model"]["unknown_reservations"] == ["0", "1", "2", "3"]
+    assert value["measured_known_microdollars"] == 300
+    assert value["unknown_components"] == ["model"]
+    assert not (state.work / "final-cost-stop.json").exists()
+
+
+def test_incremental_usage_query_failure_stops_worker_and_preserves_unknown(incremental_state, monkeypatch):
+    state = incremental_state
+    deployed(state)
+    original = release.azure
+
+    def azure(*args, **kwargs):
+        if args[:4] == ("containerapp", "job", "execution", "list"):
+            attempted = final.receipt(state.work, "worker-attempt", state.decision)
+            first = final.instant(attempted["attempted_at"])
+            state.clock = first + timedelta(seconds=10)
+            execution = final.receipt(state.work, "worker-result", state.decision)["execution_name"]
+            return [{"name": execution, "properties": {"status": "Running", "startTime": first.isoformat()}}]
+        if args[:3] == ("containerapp", "job", "stop"):
+            state.calls.append(args)
+            return {}
+        return original(*args, **kwargs)
+
+    def unavailable(*args, **kwargs):
+        raise ValueError("synthetic usage observation unavailable")
+
+    monkeypatch.setattr(release, "azure", azure)
+    monkeypatch.setattr(final, "read_model_usage", unavailable)
+    with pytest.raises(ValueError, match="observation unavailable"):
+        final.activate(state.work, state.config, state.decision, state.recovery)
+    value, _ = final.latest_cost(state.work, state.decision)
+    assert value["components"]["worker"]["microdollars"] == 300
+    assert value["components"]["model"]["microdollars"] is None
+    assert value["components"]["model"]["observation"] == "usage_unavailable"
+    assert len([call for call in state.calls if call[:3] == ("containerapp", "job", "stop")]) == 1
+    assert final.receipt(state.work, "closed", state.decision)
 
 
 def test_readiness_clock_starts_after_all_offline_preparation(final_state, monkeypatch):
@@ -669,6 +1031,42 @@ def test_remote_validator_executes_real_backend_without_history_writes(final_cas
         exec(compile(code, "<final existing-write denial>", "exec"), {})
     assert store.read_bytes(final.RECOVERY_KEY)[0] == before
     assert read_json(store, BUDGET_KEY)[0] == ledger
+
+
+def test_incremental_usage_snapshot_reads_only_new_actual_reservations(final_case, monkeypatch, capsys):
+    from backend import batch_store, real_pilot
+    from tests.test_final_rerun import all_records
+
+    store, batch, approval, amendment = final_case
+    monkeypatch.setattr(batch_store, "configured_store", lambda: store)
+    code, marker = final.usage_remote_code(approval, amendment)
+
+    def capture():
+        before = all_records(store)
+        exec(compile(code, "<final measured-usage snapshot>", "exec"), {})
+        lines = capsys.readouterr().out.splitlines()
+        assert marker in lines
+        data = next(line.removeprefix("DOCINTEL_FINAL_USAGE:") for line in lines
+                    if line.startswith("DOCINTEL_FINAL_USAGE:"))
+        assert all_records(store) == before
+        return json.loads(base64.b64decode(data, validate=True))
+
+    assert capture()["reservations"] == {}
+    guard = real_pilot.RealPilotGuard(store, batch)
+    execution = guard.before_execution("synthetic-new-final-worker")
+    operation = guard.operation_key(batch["items"][0], tier="inference",
+                                    source_version="synthetic-final", prompt_version="current")
+    reserved = guard.reserve("inference", operation, item_key=batch["items"][0]["item_key"],
+                             max_input_tokens=10, max_output_tokens=20)
+    result = capture()
+    assert result["execution_id"] == execution
+    assert result["reservations"] == {
+        reserved["reservation_id"]: {"operation": "inference", "actual_usage": None},
+    }
+    guard.record_usage(reserved["reservation_id"], input_tokens=7, output_tokens=4)
+    assert capture()["reservations"][reserved["reservation_id"]]["actual_usage"] == {
+        "input_tokens": 7, "output_tokens": 4, "analysis_pages": 0,
+    }
 
 
 def test_prepublication_snapshot_probe_rejects_consumed_final_scope(final_case, monkeypatch):

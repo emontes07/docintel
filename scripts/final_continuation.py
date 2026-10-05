@@ -12,6 +12,14 @@ deploy, activate --recovery PRIVATE_JSON. Activate performs configure, enable,
 start and observe, and always attempts close in finally. Individual configure,
 enable, start, observe and close actions remain available. Every mutation
 requires --approve ACTION. A failed/unknown attempt is consumed, never retried.
+
+Decision v2 retains those bounds but uses the separately hash-pinned incremental
+$5 financial authority/audit, not historical forecasts or incidental maxima.
+The existing synchronous ACR poller is metered without another submission;
+worker observations read only final-execution actual model usage. Missing usage
+is unknown, not a reserved charge. An operating stop permits only safety closure.
+Before v2 ready, final-helper-validation.json must separately bind the committed
+helper/test bytes and successful CI to the unchanged application decision.
 """
 
 import argparse
@@ -20,6 +28,8 @@ import copy
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, localcontext
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -47,6 +57,10 @@ POLICY = {
     "remaining_inference_requests": 12, "remaining_input_tokens": 107146,
     "remaining_output_tokens": 24576, "total_microdollars": 10000000,
 }
+INCREMENTAL_POLICY = {key: value for key, value in POLICY.items() if key != "total_microdollars"}
+INCREMENTAL_POLICY["incremental_operating_microdollars"] = 5000000
+FINANCIAL_AUTHORITY_SHA256 = "be0add67b35954218a4ba6158acba7abed98ac9305c7d345353fa9e0b99931ed"
+FINANCIAL_EVIDENCE_SHA256 = "6c58fa981ae091a17cd6ce15504b1f9dd462ebffd9f5337e54adadbfe6a3acb7"
 VALIDATION_FILES = (*prior.VALIDATION_FILES, "frontend-smoke.json", "ci.json")
 DECISION_FIELDS = {
     "schema_version", "approved", "approved_by", "target", "approval_sha256",
@@ -54,6 +68,7 @@ DECISION_FIELDS = {
     "validation_sha256", "scope_sha256", "gate_sha256", "cost", "policy",
     "window_policy",
 }
+DECISION_V2_FIELDS = DECISION_FIELDS | {"gate_file", "financial_authority_sha256"}
 GATE_CHECKS = {
     "production_run_batch", "real_guard_reservations", "full_four_prompt_match",
     "expected_token_reservations", "zero_new_analysis", "append_only_history",
@@ -62,6 +77,378 @@ GATE_CHECKS = {
 require = release.require
 sha = prior.sha
 raw_sha = prior.raw_sha
+
+
+class CostStop(ValueError):
+    """The immutable incremental operating stop must not block safety closure."""
+
+
+def evidence_path(work, name):
+    require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.json", name),
+            "Evidence must be a single root-confined JSON basename")
+    path = work / name
+    require(not path.is_symlink() and path.resolve().parent == work.resolve(),
+            "Financial/gate evidence must remain in the original root")
+    require(path.is_file() and path.stat().st_mode & 0o077 == 0, "Evidence must remain an owner-only file")
+    return path
+
+
+def gate_path(work, decision):
+    return evidence_path(work, decision["gate_file"] if decision["schema_version"] == 2
+                         else "final-recovery-gate.json")
+
+
+def cost_path(work, decision):
+    return evidence_path(work, decision["cost"]["evidence_file"] if decision["schema_version"] == 2
+                         else "final-cost-evidence.json")
+
+
+def microdollars(value):
+    return int((value * 1000000).to_integral_value(rounding=ROUND_CEILING))
+
+
+def incremental_rates(work, decision):
+    report = release.private_json(cost_path(work, decision))
+    source = report["verified_retained_price_basis"]
+    names = {
+        "build": "acr_usd_per_vcpu_second", "worker_cpu": "worker_cpu_usd_per_vcpu_second",
+        "worker_memory": "worker_memory_usd_per_gib_second",
+        "input": "model_input_guard_usd_per_token", "output": "model_output_guard_usd_per_token",
+    }
+    rates = {name: Decimal(source[key]) for name, key in names.items()}
+    require(all(rate.is_finite() and rate > 0 for rate in rates.values()),
+            "Verified positive direct-compute/model rates required")
+    return rates
+
+
+def validate_incremental_cost(work, decision, approval):
+    cost = decision["cost"]
+    require(set(cost) == {"mode", "limit_microdollars", "evidence_file", "evidence_sha256"}
+            and cost["mode"] == "incremental_operating"
+            and type(cost["limit_microdollars"]) is int and cost["limit_microdollars"] == 5000000
+            and cost["evidence_file"] == "final-financial-authority-cost-v2.json",
+            "Only the separately approved incremental $5 authority is supported")
+    authority_path = evidence_path(work, "final-financial-authority-v2.json")
+    authority = release.private_json(authority_path)
+    require(raw_sha(authority_path) == decision["financial_authority_sha256"] == FINANCIAL_AUTHORITY_SHA256
+            and authority.get("approved") is True
+            and authority["application_revision"] == decision["source_revision"]
+            and authority["private_gate_receipt"] == decision["gate_file"]
+            and authority["private_gate_sha256"] == decision["gate_sha256"]
+            and authority["baseline_sha256"] == raw_sha(work / "final-baseline.json")
+            and authority["original_ledger_sha256"]
+            == release.private_json(gate_path(work, decision))["amendment_scope"]["ledger_sha256"],
+            "The new financial authority must bind the accepted source, gate and unchanged baseline")
+    path = cost_path(work, decision)
+    report = release.private_json(path)
+    require(raw_sha(path) == cost["evidence_sha256"] == FINANCIAL_EVIDENCE_SHA256
+            and report.get("schema_version") == 2 and report.get("passed") is True
+            and report.get("money_ready") is True and report.get("no_live_operations") is True
+            and report["accepted_source_context"]["source_revision"] == decision["source_revision"]
+            and report["evidence_integrity"]["all_checks_passed"] is True,
+            "The immutable independent incremental financial audit must pass")
+    for name, expected in report["evidence_integrity"]["source_receipt_raw_sha256"].items():
+        retained = evidence_path(work, name)
+        require(raw_sha(retained) == expected, "Retained financial source evidence changed")
+    financial = report["financial_authority"]
+    require(financial["new_separate_incremental_operating_allowance_microdollars"] == 5000000
+            and financial["historical_usage_deducted_from_new_allowance"] is False
+            and financial["incidental_estimates_are_disclosure_only"] is True
+            and financial["incidental_maxima_are_not_a_gate"] is True
+            and report["stop_rule"]["threshold_microdollars"] == 5000000
+            and report["stop_rule"]["comparison"] == "strictly_greater_than",
+            "Historical forecasts and incidental estimates are not incremental charges")
+    prior_report = financial["prior_cost_report_preserved"]
+    require(raw_sha(evidence_path(work, prior_report["name"])) == prior_report["sha256"],
+            "The historical NO_GO report must remain unchanged")
+    rates = incremental_rates(work, decision)
+    require(rates["input"] == Decimal(approval["unit_prices_usd"]["input_token"])
+            and rates["output"] == Decimal(approval["unit_prices_usd"]["output_token"]),
+            "Original model guard prices cannot be discounted")
+    with localcontext() as context:
+        context.prec = 60
+        maximum = (
+            2 * microdollars(2 * 900 * rates["build"])
+            + microdollars(600 * (rates["worker_cpu"] + 2 * rates["worker_memory"]))
+            + microdollars(POLICY["remaining_input_tokens"] * rates["input"])
+            + microdollars(4 * 2048 * rates["output"])
+        )
+    require(maximum == report["direct_compute_model_cost"]["maximum_direct_compute_model_microdollars"]
+            and maximum <= 5000000,
+            "Verified bounded direct compute/model envelope must fit the separate allowance")
+
+
+def helper_validation(work, decision):
+    path = evidence_path(work, "final-helper-validation.json")
+    value = release.private_json(path)
+    require(set(value) == {
+        "schema_version", "decision_sha256", "application_revision", "helper_revision",
+        "helper_sha256", "tests_sha256", "checks",
+    } and type(value["schema_version"]) is int and value["schema_version"] == 1
+            and value["decision_sha256"] == sha(decision)
+            and value["application_revision"] == decision["source_revision"]
+            and re.fullmatch(r"[a-f0-9]{40}", value["helper_revision"])
+            and value["helper_sha256"] == raw_sha(Path(__file__))
+            and value["tests_sha256"] == raw_sha(Path(__file__).resolve().parents[1] / "tests/test_final_continuation.py")
+            and value["checks"] == {
+                "Validate Backend": "success", "Validate Frontend": "success", "Validate Release": "success",
+            }, "Exact helper-only commit/CI receipt must bind this decision without replacing the application source")
+    return value
+
+
+def require_helper_commit(value):
+    root = Path(__file__).resolve().parents[1]
+    head = release.command(["git", "rev-parse", "HEAD"], cwd=root).decode().strip()
+    require(head == value["helper_revision"], "Readiness must use the committed and CI-tested helper checkout")
+    for name, field in (("scripts/final_continuation.py", "helper_sha256"),
+                        ("tests/test_final_continuation.py", "tests_sha256")):
+        committed = release.command(["git", "show", head + ":" + name], cwd=root)
+        require(hashlib.sha256(committed).hexdigest() == value[field],
+                "Uncommitted helper/test changes cannot start readiness")
+
+
+def latest_cost(work, decision):
+    paths = sorted(work.glob("final-direct-cost-[0-9][0-9][0-9][0-9][0-9][0-9].json"))
+    if not paths:
+        return {"components": {}}, 0
+    value = receipt(work, paths[-1].stem.removeprefix("final-"), decision)
+    return value, int(paths[-1].stem.rsplit("-", 1)[1])
+
+
+def require_incremental_open(work, decision):
+    if decision["schema_version"] != 2:
+        return
+    if (work / "final-cost-stop.json").exists():
+        receipt(work, "cost-stop", decision)
+        raise CostStop("Final incremental operating stop is permanent; no further activity or retry")
+    value, _ = latest_cost(work, decision)
+    require(value.get("measured_known_microdollars", 0) <= 5000000,
+            "Measured final compute/model cost exceeds $5; safety closure only")
+
+
+def record_cost(work, decision, updates, *, stop_reason=None):
+    """Replace cumulative component observations, never add reservations/forecasts."""
+    previous, sequence = latest_cost(work, decision)
+    for name, update in updates.items():
+        known = previous["components"].get(name, {}).get("microdollars")
+        if update["microdollars"] is None and known is not None:
+            update = {**update, "microdollars": known, "complete": False, "last_known_only": True}
+            updates = {**updates, name: update}
+    components = {**previous["components"], **updates}
+    require(set(components) <= {"backend", "frontend", "worker", "model"}, "Unexpected incremental component")
+    require(all(value["microdollars"] is None
+                or type(value["microdollars"]) is int and value["microdollars"] >= 0
+                for value in components.values()), "Measured quantities cannot be negative or invented")
+    known = sum(value["microdollars"] for value in components.values() if value["microdollars"] is not None)
+    value = {
+        **binding(decision, work), "observed_at": now().isoformat(), "components": components,
+        "measured_known_microdollars": known,
+        "unknown_components": [name for name, component in components.items() if not component["complete"]],
+        "basis": "observed_quantities_at_verified_rates_not_provider_billing",
+        "historical_and_incidental_costs_included": False, "reservations_charged": False,
+    }
+    release.save_once(work / f"final-direct-cost-{sequence + 1:06d}.json", value)
+    reason = "measured_direct_cost_exceeds_incremental_5_usd" if known > 5000000 else stop_reason
+    if reason:
+        path = work / "final-cost-stop.json"
+        if not path.exists():
+            release.save_once(path, {**binding(decision, work), "reason": reason,
+                                     "measured_known_microdollars": known, "cost_receipt_sequence": sequence + 1})
+        raise CostStop("Final operating stop: " + reason)
+    return value
+
+
+def runtime_seconds(properties, end_key, *, terminal):
+    start, end = properties.get("startTime"), properties.get(end_key)
+    if not start or terminal and not end:
+        return None
+    first, last = instant(start), instant(end) if end else now()
+    require(first <= last, "Observed runtime cannot be negative")
+    elapsed = last - first
+    return Decimal(elapsed.days * 86400 + elapsed.seconds) + Decimal(elapsed.microseconds) / 1000000
+
+
+def build_cost(work, decision, kind, properties):
+    terminal = properties.get("status") not in {"Queued", "Started", "Running"}
+    seconds = runtime_seconds(properties, "finishTime", terminal=terminal)
+    cpu = properties.get("agentConfiguration", {}).get("cpu")
+    valid_cpu = type(cpu) is int and cpu > 0
+    amount = microdollars(seconds * cpu * incremental_rates(work, decision)["build"]) \
+        if seconds is not None and valid_cpu else None
+    update = {
+        "run_id": properties["runId"], "seconds": str(seconds) if seconds is not None else None,
+        "vcpu": cpu, "microdollars": amount, "complete": terminal and amount is not None,
+        "status": properties.get("status"), "start_time": properties.get("startTime"),
+        "finish_time": properties.get("finishTime"),
+    }
+    violation = "publication_hard_limit_exceeded" if cpu != 2 or seconds is not None and seconds > 900 else None
+    record_cost(work, decision, {kind: update}, stop_reason=violation)
+    return update
+
+
+@contextmanager
+def publication_meter(work, config, decision, kind):
+    """Observe the existing synchronous ACR poller; never schedule another run."""
+    if decision["schema_version"] != 2:
+        yield
+        return
+    original = release.azure
+    resource = (f"https://management.azure.com/subscriptions/{config['subscription']}/resourceGroups/"
+                f"{config['group']}/providers/Microsoft.ContainerRegistry/registries/{config['registry']}")
+
+    def azure(*args, **kwargs):
+        result = original(*args, **kwargs)
+        queued_path = work / CHILD / f"final-{kind}-queued.json"
+        if args[:3] == ("rest", "--method", "GET") and "--url" in args and queued_path.exists():
+            queued = release.private_json(queued_path)
+            run_id = queued["runId"]
+            url = resource + "/runs/" + run_id + "?api-version=" + release.PUBLICATION_API_VERSION
+            if args[args.index("--url") + 1] == url:
+                require(queued["attempt_sha256"] == raw_sha(work / f"final-{kind}-attempt.json"),
+                        "ACR metering must bind only this reserved publication")
+                properties = result["properties"]
+                require(properties["runId"] == run_id, "ACR measured run identity changed")
+                try:
+                    build_cost(work, decision, kind, properties)
+                except CostStop:
+                    path = work / f"final-{kind}-stop-attempt.json"
+                    if properties["status"] in {"Queued", "Started", "Running"} and not path.exists():
+                        release.save_once(path, {**binding(decision, work), "runId": run_id})
+                        live_window(work, decision, "cleanup")
+                        original("rest", "--method", "POST", "--url",
+                                 resource + "/runs/" + run_id + "/cancel?api-version="
+                                 + release.PUBLICATION_API_VERSION, timeout=30)
+                    raise
+        return result
+
+    release.azure = azure
+    try:
+        yield
+    finally:
+        release.azure = original
+
+
+def usage_remote_code(approval, recovery):
+    """Only final-execution usage metadata leaves the unchanged application."""
+    packet = {"approval_sha256": sha(approval), "recovery": recovery}
+    encoded = release.bounded_metadata(packet)
+    marker = "DOCINTEL_FINAL_USAGE_OK:" + sha(packet)
+    code = f'''import base64, json, zlib
+from backend.batch_store import configured_store, read_json
+from backend.real_pilot import BUDGET_KEY, _sha256
+packet = json.loads(zlib.decompress(base64.b64decode({encoded!r}, validate=True)))
+assert _sha256(packet) == {sha(packet)!r}
+store = configured_store()
+approval, _ = read_json(store, "configuration/real-pilot-approval.json")
+assert _sha256(approval) == packet["approval_sha256"]
+candidate, _ = read_json(store, {RECOVERY_KEY!r})
+assert candidate == packet["recovery"]
+ledger, _ = read_json(store, BUDGET_KEY)
+assert ledger["approval_sha256"] == packet["approval_sha256"]
+final = ledger.get("final_rerun")
+prior = candidate["prior_execution_ids"]
+if final is None:
+    assert _sha256(ledger) == candidate["ledger_sha256"]
+    selected = {{}}
+    execution = None
+else:
+    execution = final["execution_id"]
+    assert final["sha256"] == _sha256(candidate) and final["baseline_sha256"] == candidate["ledger_sha256"]
+    assert execution not in prior and set(ledger["executions"]) == set(prior) | {{execution}}
+    selected = {{key: value for key, value in ledger["reservations"].items()
+                if value["execution_id"] not in prior}}
+    assert all(value["execution_id"] == execution for value in selected.values())
+result = {{"recovery_sha256": _sha256(candidate), "execution_id": execution,
+          "invalidated": ledger.get("invalidated"),
+          "reservations": {{key: {{"operation": value["operation"], "actual_usage": value["actual_usage"]}}
+                           for key, value in selected.items()}}}}
+print("DOCINTEL_FINAL_USAGE:" + base64.b64encode(json.dumps(result, sort_keys=True).encode()).decode())
+print({marker!r})
+'''
+    require(len(base64.b64encode(code.encode())) + 80 <= 16384, "Final usage metadata exceeds console bound")
+    return code, marker
+
+
+def read_model_usage(work, config, decision, approval, recovery, *, timeout):
+    with live_operations(work, decision, "processing"):
+        backend = release.app(config, config["backend"], timeout=timeout)
+        release.require_pilot_identity(backend, approval["identities"]["api_principal_id"])
+        code, marker = usage_remote_code(approval, recovery)
+        output = release.console_code([
+            "az", "containerapp", "exec", "--subscription", config["subscription"],
+            "-g", config["group"], "-n", config["backend"],
+            "--revision", backend["properties"]["latestReadyRevisionName"],
+            "--command", "/usr/bin/env PYTHON_BASIC_REPL=1 /app/.venv/bin/python -q", "--only-show-errors",
+        ], code, marker, timeout=timeout)
+    lines = output.decode().splitlines()
+    reports = [line.removeprefix("DOCINTEL_FINAL_USAGE:") for line in lines
+               if line.startswith("DOCINTEL_FINAL_USAGE:")]
+    require(marker in lines and len(reports) == 1, "Final usage observation did not uniquely confirm")
+    value = json.loads(base64.b64decode(reports[0], validate=True))
+    require(set(value) == {"recovery_sha256", "execution_id", "invalidated", "reservations"}
+            and value["recovery_sha256"] == sha(recovery), "Final usage belongs to a different recovery")
+    return value
+
+
+def worker_compute(work, decision, properties):
+    terminal = properties["status"] in release.TERMINAL
+    rates = incremental_rates(work, decision)
+    seconds = runtime_seconds(properties, "endTime", terminal=terminal)
+    return {"seconds": str(seconds) if seconds is not None else None,
+            "microdollars": microdollars(seconds * (rates["worker_cpu"] + 2 * rates["worker_memory"]))
+            if seconds is not None else None, "complete": terminal and seconds is not None,
+            "vcpu": 1, "gib": 2, "status": properties["status"],
+            "start_time": properties.get("startTime"), "end_time": properties.get("endTime")}
+
+
+def worker_cost(work, decision, properties, usage):
+    terminal = properties["status"] in release.TERMINAL
+    rates = incremental_rates(work, decision)
+    worker = worker_compute(work, decision, properties)
+    seconds = Decimal(worker["seconds"]) if worker["seconds"] is not None else None
+    tokens = {"input_tokens": 0, "output_tokens": 0, "analysis_pages": 0}
+    unknown = []
+    reservations = usage["reservations"]
+    require(isinstance(reservations, dict) and all(isinstance(value, dict) for value in reservations.values())
+            and (not reservations or isinstance(usage["execution_id"], str)
+                 and re.fullmatch(r"[a-f0-9]{64}", usage["execution_id"])),
+            "Only final-execution actual reservation metadata can be metered")
+    violation = bool(usage["invalidated"]) or len(reservations) > 4
+    for key, reservation in reservations.items():
+        violation |= reservation["operation"] != "inference"
+        actual = reservation["actual_usage"]
+        if actual is None:
+            unknown.append(key)
+            continue
+        require(set(actual) == set(tokens) and all(type(value) is int and value >= 0 for value in actual.values()),
+                "Reported model usage must be nonnegative actual units")
+        violation |= actual["output_tokens"] > 2048 or actual["analysis_pages"] != 0
+        for name in tokens:
+            tokens[name] += actual[name]
+    violation |= tokens["input_tokens"] > POLICY["remaining_input_tokens"] or tokens["output_tokens"] > 8192
+    amount = (microdollars(tokens["input_tokens"] * rates["input"])
+              + microdollars(tokens["output_tokens"] * rates["output"]))
+    model = {"actual_usage": tokens, "unknown_reservations": unknown, "execution_id": usage["execution_id"],
+             "requests": len(reservations),
+             "microdollars": None if unknown and len(unknown) == len(reservations) else amount,
+             "complete": terminal and not unknown, "usage_sha256": sha(usage),
+             "reservations": {key: {"operation": value["operation"], "actual_usage": value["actual_usage"]}
+                              for key, value in reservations.items()}}
+    reason = "worker_or_model_hard_limit_exceeded" if violation or seconds is not None and seconds > 600 else None
+    return record_cost(work, decision, {"worker": worker, "model": model}, stop_reason=reason)
+
+
+def stop_worker(work, config, decision, execution, reason):
+    path = work / "final-worker-stop-attempt.json"
+    if path.exists():
+        require(receipt(work, "worker-stop-attempt", decision)["execution_name"] == execution,
+                "A stop may target only the original final execution")
+        return
+    release.save_once(path, {**binding(decision, work), "execution_name": execution, "reason": reason})
+    with live_operations(work, decision, "cleanup"):
+        release.azure("containerapp", "job", "stop", "--subscription", config["subscription"],
+                      "-g", config["group"], "-n", config["job"],
+                      "--job-execution-name", execution, timeout=30)
 
 
 def now():
@@ -136,6 +523,9 @@ def prepare(work, config, revision):
 
 
 def validate_cost(work, decision, approval, old):
+    if decision["schema_version"] == 2:
+        validate_incremental_cost(work, decision, approval)
+        return
     cost = decision["cost"]
     components = {
         "consumed_component_upper_microdollars", "backend_build_upper_microdollars",
@@ -213,11 +603,14 @@ def validate(work, config, decision):
     """Entirely local. In particular, a failed gate cannot trigger model metadata."""
     approval, old, previous_config = original(work, config)
     baseline = release.private_json(work / "final-baseline.json")
-    require(set(decision) == DECISION_FIELDS and type(decision["schema_version"]) is int
-            and decision["schema_version"] == 1 and decision["approved"] is True
+    version = decision.get("schema_version")
+    require(type(version) is int and version in (1, 2)
+            and set(decision) == (DECISION_V2_FIELDS if version == 2 else DECISION_FIELDS)
+            and decision["approved"] is True
             and decision["approved_by"] == approval["approved_by"],
             "Exact separately approved final decision required")
-    require(decision["policy"] == POLICY and all(type(x) is int for x in decision["policy"].values()),
+    require(decision["policy"] == (INCREMENTAL_POLICY if version == 2 else POLICY)
+            and all(type(x) is int for x in decision["policy"].values()),
             "Only the final two builds and one two-item worker are approved")
     require(decision["window_policy"] == WINDOW_POLICY
             and all(type(value) is int for value in decision["window_policy"].values()),
@@ -250,9 +643,9 @@ def validate(work, config, decision):
             and ci.get("checks") == {
                 "Validate Backend": "success", "Validate Frontend": "success", "Validate Release": "success",
             }, "All three CI workflows must pass on the exact merged main revision")
-    gate_path = work / "final-recovery-gate.json"
-    gate = release.private_json(gate_path)
-    require(not gate_path.is_symlink() and raw_sha(gate_path) == decision["gate_sha256"]
+    path = gate_path(work, decision)
+    gate = release.private_json(path)
+    require(raw_sha(path) == decision["gate_sha256"]
             and gate.get("schema_version") == 1 and gate.get("passed") is True
             and gate.get("no_live_operations") is True
             and gate.get("window_policy") == WINDOW_POLICY
@@ -296,6 +689,10 @@ def ready(work, config, decision):
         approval, _ = validate(work, config, decision)
         require(not list(work.glob("final-*-attempt.json")), "Final live authority already consumed")
         capacity = remaining_capacity(approval)
+        helper = None
+        if decision["schema_version"] == 2:
+            helper = helper_validation(work, decision)
+            require_helper_commit(helper)
         anchor = now()
         value = {
             "schema_version": 1, **binding(decision),
@@ -306,6 +703,10 @@ def ready(work, config, decision):
             "publication_expires_at": (anchor + timedelta(seconds=2700)).isoformat(),
             "overall_expires_at": (anchor + timedelta(seconds=5400)).isoformat(),
         }
+        if helper is not None:
+            value.update(financial_authority_sha256=decision["financial_authority_sha256"],
+                         helper_sha256=helper["helper_sha256"], helper_revision=helper["helper_revision"],
+                         helper_validation_sha256=raw_sha(work / "final-helper-validation.json"))
         release.save_once(path, value)
         release.save_once(pin, {**binding(decision), "readiness_sha256": raw_sha(path)})
         return value
@@ -322,13 +723,21 @@ def readiness(work, decision):
         "remaining_capacity": {name: POLICY["remaining_" + name]
                                for name in ("inference_requests", "input_tokens", "output_tokens")},
     }
+    if decision["schema_version"] == 2:
+        helper = helper_validation(work, decision)
+        expected.update(financial_authority_sha256=decision["financial_authority_sha256"],
+                        helper_sha256=helper["helper_sha256"], helper_revision=helper["helper_revision"],
+                        helper_validation_sha256=raw_sha(work / "final-helper-validation.json"))
+        require(raw_sha(evidence_path(work, "final-financial-authority-v2.json"))
+                == decision["financial_authority_sha256"] == FINANCIAL_AUTHORITY_SHA256,
+                "Incremental financial authority changed")
     require(not path.is_symlink() and not (work / "final-readiness-pin.json").is_symlink()
             and pin == {**binding(decision), "readiness_sha256": raw_sha(path)}
             and set(value) == set(expected) | {"readiness_at", "publication_expires_at", "overall_expires_at"}
             and all(value.get(key) == expected_value for key, expected_value in expected.items()),
             "Exact immutable final readiness and source/decision/gate/cost bindings required")
-    require(raw_sha(work / "final-recovery-gate.json") == value["gate_sha256"]
-            and raw_sha(work / "final-cost-evidence.json") == value["cost_sha256"]
+    require(raw_sha(gate_path(work, decision)) == value["gate_sha256"]
+            and raw_sha(cost_path(work, decision)) == value["cost_sha256"]
             and sha({name: raw_sha(work / CHILD / name) for name in VALIDATION_FILES})
             == value["validation_sha256"], "Readiness evidence changed")
     anchor = instant(value["readiness_at"])
@@ -355,6 +764,7 @@ def live_window(work, decision, phase, minimum=0):
     if phase == "cleanup":
         # Disabling authorization/stopping the reserved worker remains fail-safe after expiry.
         return value
+    require_incremental_open(work, decision)
     end = instant(value["publication_expires_at" if phase == "publication" else "overall_expires_at"])
     if phase == "processing":
         end = min(end, instant(receipt(work, "deployed", decision)["processing_expires_at"]))
@@ -369,7 +779,7 @@ def live_operations(work, decision, phase, minimum=0):
     live_window(work, decision, phase, minimum)
     pinned = raw_sha(work / "final-readiness.json")
     originals = {name: getattr(release, name) for name in (
-        "azure", "run_pilot_console", "upload_publication_context",
+        "azure", "run_pilot_console", "console_code", "upload_publication_context",
     )}
 
     def checked(name, operation):
@@ -402,7 +812,7 @@ def preflight(work, config, decision):
         release.require_real_pilot_off(prior.ready(previous_config, "backend"))
         prior.ready(previous_config, "frontend")
         prior.require_worker(previous_config, approval)
-        gate = release.private_json(work / "final-recovery-gate.json")
+        gate = release.private_json(gate_path(work, decision))
         code, marker = preflight_remote_code(approval, gate["amendment_scope"])
         backend = release.app(previous_config, previous_config["backend"])
         release.require_pilot_identity(backend, approval["identities"]["api_principal_id"])
@@ -482,11 +892,21 @@ def publish_component(work, config, decision, kind, capacity):
         "model_capacity": capacity, "helper_sha256": raw_sha(Path(__file__)),
     })
     publication_window(work, decision)
-    with live_operations(work, decision, "publication"):
-        result = release.execute_publication(
-            config, work / CHILD, kind, decision["source_revision"], path,
-            expires=instant(value["publication_expires_at"]), validate_upload_window=True,
-        )
+    try:
+        with publication_meter(work, config, decision, kind), live_operations(work, decision, "publication"):
+            result = release.execute_publication(
+                config, work / CHILD, kind, decision["source_revision"], path,
+                expires=instant(value["publication_expires_at"]), validate_upload_window=True,
+            )
+    except Exception:
+        if decision["schema_version"] == 2 and kind not in latest_cost(work, decision)[0]["components"]:
+            record_cost(work, decision, {kind: {
+                "microdollars": None, "complete": False, "observation": "publication_outcome_unknown",
+            }})
+        raise
+    if decision["schema_version"] == 2:
+        measured = build_cost(work, decision, kind, result)
+        require(measured["complete"], "Publication usage remains unknown; no next publication or deployment")
     release.save_once(work / f"final-{kind}-published.json", {
         **binding(decision, work), **result,
         "image": config["registry"] + f".azurecr.io/docintel/{kind}@" + result["digest"],
@@ -781,6 +1201,7 @@ def observe(work, config, decision):
     """Observe only the already-reserved execution; never start or retry it."""
     approval, _ = validate(work, config, decision)
     readiness(work, decision)
+    require_incremental_open(work, decision)
     recovery = configured_recovery(work, decision, approval)
     current = published_config(work, config, decision)
     execution = receipt(work, "worker-result", decision)["execution_name"]
@@ -794,6 +1215,9 @@ def observe(work, config, decision):
         require(existing["execution_name"] == execution,
                 "Final terminal receipt execution changed")
         require(existing.get("status") == "Succeeded", "Final worker terminated unsuccessfully; no retry")
+        if decision["schema_version"] == 2:
+            require(not latest_cost(work, decision)[0].get("unknown_components", ["unmeasured"]),
+                    "Final usage remains unknown; reservations are not measured charges")
         return
     while now() < deadline and monotonic() < timeout:
         remaining = min((deadline - now()).total_seconds(), timeout - monotonic())
@@ -808,6 +1232,28 @@ def observe(work, config, decision):
         require(len(matches) == 1, "Started execution not uniquely visible; never resubmit")
         properties = matches[0]["properties"]
         status = properties["status"]
+        if decision["schema_version"] == 2:
+            try:
+                remaining = min((deadline - now()).total_seconds(), timeout - monotonic())
+                require(remaining > 0, "Worker observation window elapsed before usage measurement")
+                usage = read_model_usage(work, current, decision, approval, recovery,
+                                         timeout=min(30, remaining / 2))
+            except Exception:
+                try:
+                    record_cost(work, decision, {
+                        "worker": worker_compute(work, decision, properties),
+                        "model": {"microdollars": None, "complete": False, "observation": "usage_unavailable"},
+                    })
+                finally:
+                    if status not in release.TERMINAL:
+                        stop_worker(work, current, decision, execution, "usage_observation_unavailable")
+                raise
+            try:
+                measured = worker_cost(work, decision, properties, usage)
+            except ValueError:
+                if status not in release.TERMINAL:
+                    stop_worker(work, current, decision, execution, "incremental_cost_or_hard_limit_stop")
+                raise
         if status in release.TERMINAL:
             release.save_once(terminal, {
                 **binding(decision, work), "execution_name": execution, "attempt": 3,
@@ -815,15 +1261,12 @@ def observe(work, config, decision):
                 **{name: properties.get(name) for name in ("status", "startTime", "endTime")},
             })
             require(status == "Succeeded", "Final worker terminated unsuccessfully; no retry")
+            if decision["schema_version"] == 2:
+                require(not measured["unknown_components"],
+                        "Final usage remains unknown; reservations are not measured charges")
             return
         sleep(min(15, max(0, (deadline - now()).total_seconds()), max(0, timeout - monotonic())))
-    release.save_once(work / "final-worker-stop-attempt.json", {
-        **binding(decision, work), "execution_name": execution, "reason": "bounded_worker_window_expired",
-    })
-    with live_operations(work, decision, "cleanup"):
-        release.azure("containerapp", "job", "stop", "--subscription", current["subscription"],
-                      "-g", current["group"], "-n", current["job"],
-                      "--job-execution-name", execution, timeout=30)
+    stop_worker(work, current, decision, execution, "bounded_worker_window_expired")
     raise ValueError("Final worker observation expired; same execution stop requested, never restart")
 
 
