@@ -224,6 +224,23 @@ def test_local_check_uses_original_root_and_hashes_not_new_allowances(continued)
     assert {name: (state.work / name).read_bytes() for name in state.old} == state.old
 
 
+@pytest.mark.parametrize("valid", [True, False])
+def test_original_closure_retains_reconciled_patch_provenance(continued, valid):
+    state = continued
+    path = state.work / "pilot-disabled.json"
+    closure = release.private_json(path)
+    closure.update(reconciled_existing_patch=valid,
+                   verified_revision=state.config["backend"] + "--0000009")
+    release.save(path, closure)
+    before = path.read_bytes()
+    if valid:
+        assert continuation.original(state.work, state.config) == state.approval
+    else:
+        with pytest.raises(ValueError, match="reconciled closure"):
+            continuation.original(state.work, state.config)
+    assert path.read_bytes() == before
+
+
 def test_standard_publication_cannot_treat_context_child_as_fresh_allowance(continued):
     from argparse import Namespace
 
