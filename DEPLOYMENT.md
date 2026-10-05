@@ -1040,7 +1040,9 @@ Unexpected configuration drift or unconfirmed mutation stops the operation.
 An active worker blocks image mutation and rollback, but does not block restoring
 the API's default-off flags.
 The old `pilot-disabled.json` is historical evidence only and never proves this
-new activation is closed. Only freshly confirmed default-off settings and
+new activation is closed. Its verified asynchronous-reconciliation metadata is
+preserved and hash-bound, not stripped to fit a simpler receipt shape.
+Only freshly confirmed default-off settings and
 `continuation-closed.json` establish continuation closure. Closing API flags does
 not restart, stop, or extend an existing worker: its original 600-second limit and
 the recovery window still apply. A failed/unknown start is never repeated to

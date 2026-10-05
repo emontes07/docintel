@@ -158,8 +158,15 @@ def original(work, config):
             and first["attempt"] == result["attempt"] == 1 and result.get("execution_name"),
             "Exactly one confirmed original worker attempt is required")
     disabled = release.private_json(work / "pilot-disabled.json")
-    require(disabled == {"target": binding["target"], "approval_sha256": binding["approval_sha256"]},
+    closed_binding = {"target": binding["target"], "approval_sha256": binding["approval_sha256"]}
+    require(all(disabled.get(key) == value for key, value in closed_binding.items())
+            and set(disabled) in (set(closed_binding), set(closed_binding) | {"reconciled_existing_patch", "verified_revision"}),
             "Original activation must be closed, not reset")
+    if "reconciled_existing_patch" in disabled:
+        require(disabled["reconciled_existing_patch"] is True
+                and isinstance(disabled["verified_revision"], str)
+                and disabled["verified_revision"].startswith(config["backend"] + "--"),
+                "Original reconciled closure must identify its verified backend revision")
     return approval
 
 
