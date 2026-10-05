@@ -5,6 +5,7 @@ returns validated Pydantic instances rather than raw JSON.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -123,6 +124,7 @@ class LLMClient:
         self.deployment = deployment or settings.LLM_DEPLOYMENT
         self.timeout = timeout
         self.last_usage: dict[str, int] | None = None
+        self.last_response_sha256: str | None = None
 
         if token_provider is None:
             token_provider = get_bearer_token_provider(
@@ -163,6 +165,7 @@ class LLMClient:
         last_content: Optional[str] = None
         last_error: Any = None
         self.last_usage = None
+        self.last_response_sha256 = None
 
         for attempt in range(max_retries):
             if attempt:
@@ -183,6 +186,9 @@ class LLMClient:
                     "output_tokens": response.usage.completion_tokens,
                 }
             last_content = response.choices[0].message.content
+            self.last_response_sha256 = (
+                hashlib.sha256(last_content.encode()).hexdigest() if last_content is not None else None
+            )
             result = _parse(schema, last_content)
             if isinstance(result, BaseModel):
                 return result

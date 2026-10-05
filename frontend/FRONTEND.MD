@@ -123,3 +123,38 @@ The frontend requires the following environment variables:
   - Page components for route-specific content
   - Loading and error states
 - **Shell Components**: Shared chrome lives in `app-sidebar.tsx`, `page-header.tsx`, and `animated-layout.tsx`
+
+## 7. Owner Product Diagnostics
+
+The owner product page at `/batches/[batchId]/[itemKey]` displays recorded
+`validation_diagnostics` from the existing authenticated batch-detail response.
+The top-level array is authoritative (including an empty array); older records
+can fall back to diagnostics in `machine_result` or `reviewed_result`. Missing
+diagnostics are not presented as validation success.
+
+The section shows issue paths, supplied and valid references, reference hashes
+and redaction labels, the sanitized/redacted parsed JSON structure, raw response
+hash availability and basis, source/request metadata, and truncation warnings.
+All values are rendered as text, never HTML or reference links. The backend is
+responsible for owner authorization and sanitizing the diagnostic payload;
+supplied reference values marked redacted are also withheld by the UI.
+
+An attribute with `definition_clarification_needed` is labeled as a customer
+input clarification, not an extraction failure. Its optional
+`definition_clarification` text explains the request. Existing correction and
+rejection controls remain available; approval requires an actual candidate.
+The existing batch error and source-provenance explanations remain visible.
+
+Focused offline validation (from `frontend/`):
+
+```sh
+npm run test:owner-product-diagnostics
+```
+
+These tests use the local Node/TypeScript harness and React server rendering,
+with in-memory owner-detail fixtures and review callbacks. They do not start
+workers, request live services, invoke models, or run hosted acceptance tests.
+The validation-only frontend workflow also includes this suite through its
+existing `node --test tests/*.test.mjs` step. A workflow running from the
+repository root can invoke `npm --prefix frontend run test:owner-product-diagnostics`
+after installing the committed frontend dependencies.

@@ -120,7 +120,7 @@ def test_intake_missing_sources_are_valid_and_units_remain_qualified_unresolved(
     definition = item["manifest"]["attributes"][0]
     assert definition["value_type"] == "number" and definition["unit"] is None
     assert definition["unit_resolved"] is False
-    assert any("Unresolved unit" in warning for warning in item["warnings"])
+    assert any("Definition clarification needed" in warning for warning in item["warnings"])
     assert any("No approved evidence" in warning for warning in item["warnings"])
 
 

@@ -13,29 +13,37 @@ from urllib.parse import quote, urlsplit
 
 from azure.identity import ManagedIdentityCredential, get_bearer_token_provider
 from azure.core.exceptions import AzureError
+from pydantic import ValidationError
 
 from backend.batch import digest, now
 from backend.batch_store import Conflict, Missing, configured_store, read_json, write_json
 from backend.core.docintel import DocumentIntelligenceError, DocumentIntelligenceService, ParsedDocument
-from backend.core.llm import LLMClient, COGNITIVE_SERVICES_SCOPE
+from backend.core.llm import LLMClient, LLMSchemaValidationError, COGNITIVE_SERVICES_SCOPE
 from backend.core.websearch import WebSearchError
 from backend.extract import ExecutionConfigurationError, run_enrichment
 from backend.models.enrichment import Evidence, ExtractionResponse, LiveBundle, Manifest, OfflineBundle, OfflineSource, ProductKey, ReviewAnnotation
 from backend.pilot import PARSER_VERSION, QUALIFICATIONS
 from backend.multisource import run_cascade
 from backend.real_pilot import RealPilotBudgetExceeded, RealPilotGuard
+from backend.response_validation import (
+    ResponseValidationError, map_citations, parsed_content, response_diagnostic, schema_issues,
+)
 
 
-COMPACT_PROMPT_FORMAT = "real-evidence-groups-v1"
+COMPACT_PROMPT_FORMAT = "real-evidence-groups-v2"
 COMPACT_PROMPT_INSTRUCTIONS = """
-Evidence is a table with evidence_columns as its headers. Each row inherits all
-metadata, attribute_ids and qualification from evidence_groups[row.group].
-row.text_index selects its verbatim excerpt in evidence_texts. Its evidence_id is
-a request-local citation reference: cite that exact reference, selecting only the
-rows supporting the candidate. row.location preserves the original citation: a
-string is appended to both the group's evidence_id_prefix and source_locator_prefix;
-a two-string array gives the respective suffixes. The application restores the
-selected original IDs before validation. No row or original location is discarded.
+Evidence rows use evidence_columns as headers. Cite the FIRST element of each
+supporting row in candidate.evidence_ids: a JSON list such as ["E1", "E2"].
+Group indexes, text indexes, source IDs and location suffixes are NOT citations.
+Never combine several references into one string. Every candidate needs at least
+one known row reference. Order and duplicates do not change citation meaning.
+Surrounding whitespace and lowercase e are accepted; use canonical E1 spelling.
+Exact original IDs are aliases unless they collide with a row-reference label.
+Each row inherits metadata, attribute_ids and qualification from its group.
+text_index selects the verbatim evidence_texts excerpt. location is appended to
+the group's evidence_id_prefix and source_locator_prefix; a two-string location
+gives their respective suffixes. The application restores the exact original IDs.
+Select only supporting rows; do not infer citations from a group or invent IDs.
 """
 
 
@@ -502,6 +510,43 @@ class RealBatchProcessor(BatchProcessor):
         processor = self
 
         class Completion:
+            def validation_failure(self, issues, stage="evidence_validation"):
+                diagnostic = self.diagnostic_context(issues, stage)
+                diagnostic.reservation_id = self.reservation_id
+                diagnostic.source_tier = self.source_tier
+                diagnostic.prompt_format = COMPACT_PROMPT_FORMAT
+                path = f"response-diagnostics/{processor.record['id']}/{item['item_key']}/{self.reservation_id}.json"
+                try:
+                    write_json(processor.store, path, diagnostic.model_dump(mode="json"))
+                except (Conflict, AzureError, OSError) as error:
+                    raise ExecutionConfigurationError("Validation diagnostic persistence failed; execution stopped") from error
+                return diagnostic
+
+            def diagnostic_context(self, issues, stage="evidence_validation"):
+                from backend.models.enrichment import ResponseValidationDiagnostic
+
+                if self.cached_diagnostic_context is not None:
+                    diagnostic = ResponseValidationDiagnostic.model_validate(self.cached_diagnostic_context)
+                    diagnostic.issues = issues[:32]
+                    diagnostic.stage = stage
+                    diagnostic.truncated |= len(issues) > 32
+                    return diagnostic
+                return response_diagnostic(
+                    payload=self.response_payload, references=self.references,
+                    issues=issues, stage=stage, raw_response_sha256=self.last_response_sha256,
+                )
+
+            def validated_response(self, response):
+                if self.from_cache:
+                    return
+                write_json(processor.store, self.cache_key, {
+                    "response": response.model_dump(mode="json"), "usage": self.response_usage,
+                    "reservation_id": self.reservation_id, "request_parameters": self.request_parameters,
+                    "prompt_format": COMPACT_PROMPT_FORMAT,
+                    "raw_response_sha256": self.last_response_sha256,
+                    "sanitized_response_context": self.diagnostic_context([]).model_dump(mode="json"),
+                })
+
             def complete_structured(self, system, user, schema):
                 from backend.core.config import settings
                 from backend.core.llm import LLM_API_VERSION
@@ -509,6 +554,13 @@ class RealBatchProcessor(BatchProcessor):
                 if os.environ.get("AOAI_API_VERSION") != LLM_API_VERSION:
                     raise ValueError("Approved model API version differs from the installed client")
                 user, references = compact_inference_prompt(user)
+                self.references = references
+                self.response_payload = None
+                self.last_response_sha256 = None
+                self.from_cache = False
+                self.cached_diagnostic_context = None
+                groups = json.loads(user)["evidence_groups"]
+                self.source_tier = groups[0]["source_tier"] if groups else None
                 system += COMPACT_PROMPT_INSTRUCTIONS
                 request_parameters = {"max_completion_tokens": 2048}
                 if settings.LLM_DEPLOYMENT == "gpt-5":
@@ -521,6 +573,8 @@ class RealBatchProcessor(BatchProcessor):
                 version = digest(version_input.encode())
                 key = processor.key(item, "inference", version)
                 cache_key = "real-inferences/" + key + ".json"
+                self.cache_key = cache_key
+                self.request_parameters = request_parameters
                 try:
                     stored, _ = read_json(processor.store, cache_key)
                     processor.inference_provenance.append({
@@ -528,6 +582,11 @@ class RealBatchProcessor(BatchProcessor):
                         "request_parameters": request_parameters,
                         "prompt_format": COMPACT_PROMPT_FORMAT,
                     })
+                    self.reservation_id = stored["reservation_id"]
+                    self.last_response_sha256 = stored.get("raw_response_sha256")
+                    self.response_payload = stored["response"]
+                    self.from_cache = True
+                    self.cached_diagnostic_context = stored.get("sanitized_response_context")
                     return schema.model_validate(stored["response"])
                 except Missing:
                     pass
@@ -552,32 +611,41 @@ class RealBatchProcessor(BatchProcessor):
                     ),
                 )
                 client.sync_client = client.sync_client.with_options(max_retries=0)
+                self.reservation_id = reservation["reservation_id"]
                 try:
-                    response = client.complete_structured(system, user, schema, max_retries=1, **request_parameters)
-                    if client.last_usage is not None:
-                        try:
-                            processor.guard.record_usage(reservation["reservation_id"], **client.last_usage)
-                        except (ValueError, Missing) as error:
-                            raise ExecutionConfigurationError("Real-pilot measured usage exceeded or invalidated its reservation") from error
-                    processor.inference_provenance.append({
-                        "method": "model", "reservation_id": reservation["reservation_id"],
-                        "usage": client.last_usage, "new_model_call": True,
-                        "request_parameters": request_parameters,
-                        "prompt_format": COMPACT_PROMPT_FORMAT,
-                    })
-                    response = schema.model_validate(response.model_dump())
-                    for candidate in response.candidates:
-                        if any(reference not in references for reference in candidate.evidence_ids):
-                            raise ValueError("Model cited an unknown compact evidence reference")
-                        candidate.evidence_ids = list(dict.fromkeys(
-                            references[reference] for reference in candidate.evidence_ids
-                        ))
-                    write_json(processor.store, cache_key, {
-                        "response": response.model_dump(mode="json"),
-                        "usage": client.last_usage, "reservation_id": reservation["reservation_id"],
-                        "request_parameters": request_parameters,
-                        "prompt_format": COMPACT_PROMPT_FORMAT,
-                    })
+                    try:
+                        response = client.complete_structured(system, user, schema, max_retries=1, **request_parameters)
+                        self.response_payload = response.model_dump(mode="json")
+                        response = map_citations(schema.model_validate(self.response_payload), references)
+                    except (LLMSchemaValidationError, ValidationError, ResponseValidationError) as error:
+                        raw_hash = getattr(client, "last_response_sha256", None)
+                        self.last_response_sha256 = raw_hash if isinstance(raw_hash, str) else None
+                        if isinstance(error, LLMSchemaValidationError):
+                            self.response_payload = parsed_content(error.raw_content)
+                            issues = schema_issues(error.errors)
+                        else:
+                            issues = error.issues if isinstance(error, ResponseValidationError) else schema_issues(error)
+                        failure = ResponseValidationError(issues)
+                        failure.diagnostic = self.validation_failure(
+                            issues, "evidence_validation" if isinstance(error, ResponseValidationError)
+                            else "structured_response_parsing",
+                        )
+                        raise failure from error
+                    finally:
+                        self.response_usage = client.last_usage
+                        if client.last_usage is not None:
+                            try:
+                                processor.guard.record_usage(reservation["reservation_id"], **client.last_usage)
+                            except (ValueError, Missing) as error:
+                                raise ExecutionConfigurationError("Real-pilot measured usage exceeded or invalidated its reservation") from error
+                        processor.inference_provenance.append({
+                            "method": "model", "reservation_id": reservation["reservation_id"],
+                            "usage": client.last_usage, "new_model_call": True,
+                            "request_parameters": request_parameters,
+                            "prompt_format": COMPACT_PROMPT_FORMAT,
+                        })
+                    raw_hash = getattr(client, "last_response_sha256", None)
+                    self.last_response_sha256 = raw_hash if isinstance(raw_hash, str) else None
                     return response
                 finally:
                     client.sync_client.close()
@@ -650,7 +718,7 @@ class RealBatchProcessor(BatchProcessor):
             attribute.status not in {"existing", "proposed"} for attribute in result.attributes
         ) or any(entry.get("error") or entry.get("page_errors") for entry in provenance)
         coverage = {state: [attribute.attribute_id for attribute in result.attributes if attribute.status == state]
-                    for state in ("existing", "proposed", "conflict", "missing_evidence", "retrieval_failed", "extraction_failed")}
+                    for state in ("existing", "proposed", "conflict", "missing_evidence", "retrieval_failed", "extraction_failed", "definition_clarification_needed")}
         cited = {evidence.evidence_id: evidence for evidence in result.evidence}
         for name, predicate in [
             ("internally_supported", lambda evidence: evidence.source_tier in {"internal_pdf", "vendor_table"}),

@@ -512,7 +512,9 @@ def test_gpt5_request_parameters_are_bound_to_cache_identity(configured, monkeyp
     old_key = "real-inferences/" + processor.key(item, "inference", old_version) + ".json"
     write_json(store, old_key, {"response": {"candidates": []}})
     completion = processor.completion(item)
-    completion.complete_structured(system, user, ExtractionResponse)
+    response = completion.complete_structured(system, user, ExtractionResponse)
+    assert not [path for path in store.keys("real-inferences/") if path != old_key]
+    completion.validated_response(response)
     completion.complete_structured(system, user, ExtractionResponse)
     assert len(calls) == 1
     assert processor.inference_provenance[-1]["method"] == "compatible_response_cache"
@@ -1152,3 +1154,353 @@ def test_actual_private_two_product_recovery_prompt_bounds():
         assert bound + 2048 <= 30000
         total += bound
     assert total <= 200000 and 4 * 2048 <= 32768
+
+
+@pytest.mark.parametrize("failure_kind", ["citation", "schema", "quotation"])
+def test_validation_failures_are_durable_redacted_owner_bound_and_exported(configured, monkeypatch, failure_kind):
+    from pydantic import ValidationError
+    from backend.core.llm import LLMSchemaValidationError
+    from backend.workbooks import read_workbook
+
+    store, record, _ = configured
+    install_services(monkeypatch)
+    internal_only(configured, monkeypatch)
+    raw_responses = []
+    secret = "PRIVATE-DOCUMENT-TEXT-OR-CREDENTIAL"
+
+    class RejectedClient:
+        def __init__(self, **kwargs):
+            self.sync_client = self
+            self.last_usage = None
+            self.last_response_sha256 = None
+
+        def with_options(self, **kwargs):
+            assert kwargs == {"max_retries": 0}
+            return self
+
+        def close(self):
+            pass
+
+        def complete_structured(self, system, user, schema, **kwargs):
+            payload = json.loads(user)
+            candidate = Candidate(
+                attribute_id="Body Material", value="brass",
+                evidence_ids=[payload["evidence"][0][0]],
+                supporting_quote=secret, qualification="TEST RESPONSE ONLY",
+            ).model_dump(mode="json")
+            if failure_kind == "citation":
+                candidate["evidence_ids"] = ["E999", secret]
+            elif failure_kind == "schema":
+                candidate["evidence_ids"] = secret
+            raw = json.dumps({"candidates": [candidate]})
+            raw_responses.append(raw)
+            self.last_response_sha256 = hashlib.sha256(raw.encode()).hexdigest()
+            self.last_usage = {"input_tokens": 12, "output_tokens": 8}
+            try:
+                return schema.model_validate_json(raw)
+            except ValidationError as error:
+                raise LLMSchemaValidationError(schema, raw, error) from error
+
+    monkeypatch.setattr("backend.batch_worker.LLMClient", RejectedClient)
+    run_batch(store, record["id"], concurrency=1, item_limit=1)
+    service = BatchService(store)
+    detail = service.detail(record["id"], "row-2", record["owner"])
+    assert len(raw_responses) == 1 and len(detail["validation_diagnostics"]) == 1
+    diagnostic = detail["validation_diagnostics"][0]
+    assert diagnostic["raw_response_sha256"] == hashlib.sha256(raw_responses[0].encode()).hexdigest()
+    assert secret not in json.dumps(diagnostic)
+    assert diagnostic["raw_response_hash_basis"] == "provider_content"
+    assert diagnostic["valid_references"] == ["E1"]
+    assert diagnostic["source_tier"] == "internal_pdf"
+    assert diagnostic["reservation_id"]
+    assert diagnostic["prompt_format"] == COMPACT_PROMPT_FORMAT
+    assert diagnostic["issues"][0]["field_path"].startswith("candidates[0].")
+    assert detail["machine_result"]["failure"]["exception_class"] == "ResponseValidationError"
+    assert detail["machine_result"]["failure"]["stage"] != "service_request"
+    assert len(store.keys(f"response-diagnostics/{record['id']}/row-2/")) == 1
+    assert detail["consumption"]["actual_usage"]["input_tokens"] == 12
+    assert detail["consumption"]["actual_usage"]["output_tokens"] == 8
+    ledger, _ = read_json(store, "budgets/real-pilot.json")
+    assert all(entry["status"] == "usage_reported_not_billing"
+               for entry in ledger["reservations"].values() if entry["operation"] == "inference")
+    machine_before = store.read_bytes(f"results/{record['id']}/row-2.json")[0]
+    workbook = read_workbook(service.export(record["id"], record["owner"]))
+    assert diagnostic["issues"][0]["field_path"] in workbook["Errors"][0]["Validation diagnostics"]
+    exported = "".join(row["Sanitized diagnostic JSON"] for row in workbook["Diagnostics"])
+    assert json.loads(exported) == diagnostic
+    assert secret not in exported
+    assert not store.keys("real-inferences/")
+    assert store.read_bytes(f"results/{record['id']}/row-2.json")[0] == machine_before
+    with pytest.raises(Missing):
+        service.detail(record["id"], "row-2", "another-owner")
+    with pytest.raises(Missing):
+        service.export(record["id"], "another-owner")
+
+
+def test_diagnostic_survives_interruption_before_machine_result_and_large_export(configured, monkeypatch):
+    from backend.models.enrichment import ValidationIssue
+    from backend.response_validation import response_diagnostic
+    from backend.workbooks import read_workbook
+
+    store, record, _ = configured
+    item_path = f"items/{record['id']}/row-2.json"
+    write_json(store, item_path, {"state": "interrupted"})
+    diagnostic = response_diagnostic(
+        payload={"candidates": []},
+        references={f"E{index}": f"source:version:{index}" for index in range(1, 4097)},
+        issues=[ValidationIssue(field_path="candidates[0].evidence_ids[0]", message="Unknown citation.")],
+        raw_response_sha256="f" * 64,
+    )
+    write_json(store, f"response-diagnostics/{record['id']}/row-2/reservation.json", diagnostic.model_dump(mode="json"))
+    service = BatchService(store)
+    detail = service.detail(record["id"], "row-2", record["owner"])
+    assert detail["machine_result"] is None and len(detail["validation_diagnostics"]) == 1
+    exported = read_workbook(service.export(record["id"], record["owner"]))
+    assert len(exported["Diagnostics"]) > 1
+    assert all(len(row["Sanitized diagnostic JSON"]) <= 30000 for row in exported["Diagnostics"])
+    assert json.loads("".join(row["Sanitized diagnostic JSON"] for row in exported["Diagnostics"])) == diagnostic.model_dump(mode="json")
+
+
+def test_actual_private_two_product_response_contract(tmp_path, monkeypatch):
+    """Real full payloads; fabricated responses; capacity projection is not authorization."""
+    import base64
+    import re
+    from pydantic import ValidationError
+    from backend.core.llm import LLMSchemaValidationError
+    from backend.core.config import settings
+    from backend.extract import run_enrichment
+    from backend.models.enrichment import Evidence, LiveBundle, OfflineSource
+    from backend.workbooks import read_workbook
+
+    prompt_path = os.environ.get("DOCINTEL_TEST_SUBSET_PROMPTS")
+    snapshot_path = os.environ.get("DOCINTEL_TEST_CONSUMPTION_SNAPSHOT")
+    if not prompt_path or not snapshot_path:
+        pytest.skip("Requires exact private two-product prompts and final read-only consumption snapshot")
+    snapshot_bytes = Path(snapshot_path).read_bytes()
+    snapshot = json.loads(snapshot_bytes)
+    records = snapshot["records"]
+
+    def read(key):
+        raw = base64.b64decode(records[key]["base64"])
+        assert hashlib.sha256(raw).hexdigest() == records[key]["sha256"]
+        return json.loads(raw)
+
+    approval = read("configuration/real-pilot-approval.json")
+    consumed = read("budgets/real-pilot.json")
+    batch = read(f"batches/{approval['batch_id']}.json")
+    captures = json.loads(Path(prompt_path).read_text())
+    assert len(captures) == 4 and len({row["item_key"] for row in captures}) == 2
+    assert consumed["attempted"]["inference"] == 4
+    assert consumed["reserved"]["input_tokens"] == 92854
+    assert consumed["reserved"]["output_tokens"] == 8192
+    assert len(consumed["executions"]) == approval["limits"]["executions"] == 2
+    remaining = {
+        "requests": approval["limits"]["inference"] - consumed["attempted"]["inference"],
+        "input": approval["limits"]["input_tokens"] - consumed["reserved"]["input_tokens"],
+        "output": approval["limits"]["output_tokens"] - consumed["reserved"]["output_tokens"],
+    }
+    monkeypatch.setenv("AOAI_API_VERSION", LLM_API_VERSION)
+    monkeypatch.setattr(settings, "LLM_DEPLOYMENT", "gpt-5")
+    monkeypatch.setattr("backend.batch_worker.ManagedIdentityCredential", lambda **kwargs: None)
+    monkeypatch.setattr("backend.batch_worker.get_bearer_token_provider", lambda *args: None)
+    outcomes = []
+    planning = []
+    for mode in ("canonical", "whitespace_case", "original", "multiple", "unknown", "schema", "quotation"):
+        case_home = tmp_path / mode
+        case_home.mkdir()
+        store = SQLiteStore.__new__(SQLiteStore)
+        store.path = case_home / "batches.sqlite3"
+        with store.connect() as connection:
+            connection.execute("CREATE TABLE records (key TEXT PRIMARY KEY, value BLOB NOT NULL, version TEXT NOT NULL)")
+        projected = copy.deepcopy(consumed)
+
+        def reserve(operation, key, **limits):
+            assert operation == "inference"
+            assert limits["max_input_tokens"] + limits["max_output_tokens"] <= 30000
+            projected["attempted"]["inference"] += 1
+            projected["reserved"]["input_tokens"] += limits["max_input_tokens"]
+            projected["reserved"]["output_tokens"] += limits["max_output_tokens"]
+            assert projected["attempted"]["inference"] <= approval["limits"]["inference"]
+            assert projected["reserved"]["input_tokens"] <= approval["limits"]["input_tokens"]
+            assert projected["reserved"]["output_tokens"] <= approval["limits"]["output_tokens"]
+            if mode == "canonical":
+                planning.append({
+                    "item_key": limits["item_key"],
+                    "input": limits["max_input_tokens"], "output": limits["max_output_tokens"],
+                })
+            return {"reservation_id": key}
+
+        guard = SimpleNamespace(
+            recovery=None, reserve=reserve, record_usage=lambda *args, **kwargs: None,
+            operation_key=lambda item, **kwargs: hashlib.sha256(json.dumps([item["item_key"], kwargs], sort_keys=True).encode()).hexdigest(),
+        )
+        processor = RealBatchProcessor(store, batch, guard)
+        for capture_index, capture in enumerate(captures):
+            original = capture["user"]
+            compact, references = compact_inference_prompt(json.dumps(original))
+            attribute = next(entry for entry in original["attributes"]
+                             if entry["value_type"] == "string" and entry["unit"] is None
+                             and not entry["allowed_values"] and not re.search(r"material|max", entry["attribute_id"], re.I))
+            evidence = next(entry for entry in original["evidence"]
+                            if (entry["attribute_ids"] is None or attribute["attribute_id"] in entry["attribute_ids"])
+                            and re.search(r"\b[A-Za-z]{4,}\b", entry["text"]))
+            reference = next(key for key, value in references.items() if value == evidence["evidence_id"])
+            expected_ids = [evidence["evidence_id"]]
+            second_evidence = next((
+                entry for entry in original["evidence"]
+                if entry["evidence_id"] != evidence["evidence_id"]
+                and entry["text"] == evidence["text"]
+                and (entry["attribute_ids"] is None or attribute["attribute_id"] in entry["attribute_ids"])
+            ), evidence)
+            if mode == "multiple":
+                expected_ids = list(dict.fromkeys([second_evidence["evidence_id"], evidence["evidence_id"]]))
+
+            class RepresentativeClient:
+                def __init__(self, **kwargs):
+                    self.sync_client = self
+                    self.last_usage = None
+                    self.last_response_sha256 = None
+
+                def with_options(self, **kwargs):
+                    assert kwargs == {"max_retries": 0}
+                    return self
+
+                def close(self):
+                    pass
+
+                def complete_structured(self, system, user, schema, **kwargs):
+                    assert user == compact and system == capture["system"] + COMPACT_PROMPT_INSTRUCTIONS
+                    ids = [reference]
+                    if mode == "whitespace_case":
+                        ids = [" \t" + reference.lower() + "\n"]
+                    elif mode == "original":
+                        ids = [evidence["evidence_id"]]
+                    elif mode == "multiple":
+                        second_reference = next(key for key, value in references.items() if value == second_evidence["evidence_id"])
+                        ids = [second_reference, evidence["evidence_id"], reference, " " + reference.lower() + " "]
+                    elif mode == "unknown":
+                        ids = ["E999999", "SECRET-DIAGNOSTIC-REDACTION-CHECK"]
+                    payload = {"candidates": [{
+                        "attribute_id": attribute["attribute_id"],
+                        "value": re.search(r"\b[A-Za-z]{4,}\b", evidence["text"]).group(),
+                        "evidence_ids": ids if mode != "schema" else "SECRET-DIAGNOSTIC-REDACTION-CHECK",
+                        "supporting_quote": evidence["text"] if mode != "quotation" else "SECRET-DIAGNOSTIC-REDACTION-CHECK",
+                        "qualification": "REPRODUCTION ONLY, not recovered model output or a product finding.",
+                    }]}
+                    raw = json.dumps(payload)
+                    self.last_response_sha256 = hashlib.sha256(raw.encode()).hexdigest()
+                    self.last_usage = {"input_tokens": 12, "output_tokens": 8}
+                    try:
+                        return schema.model_validate_json(raw)
+                    except ValidationError as error:
+                        raise LLMSchemaValidationError(schema, raw, error) from error
+
+            monkeypatch.setattr("backend.batch_worker.LLMClient", RepresentativeClient)
+            item = next(item for item in batch["items"] if item["item_key"] == capture["item_key"])
+            source_ids = list(dict.fromkeys(entry["source_id"] for entry in original["evidence"]))
+            manifest = Manifest(
+                product=original["product"], attributes=item["manifest"]["attributes"], source_ids=source_ids,
+            )
+            sources = [OfflineSource(
+                source_id=source_id, product=manifest.product,
+                source_tier=next(entry["source_tier"] for entry in original["evidence"] if entry["source_id"] == source_id),
+                excerpts=[Evidence.model_validate(entry) for entry in original["evidence"] if entry["source_id"] == source_id],
+            ) for source_id in source_ids]
+            result = run_enrichment(
+                LiveBundle(execution_mode="live_inference", manifest=manifest, sources=sources),
+                execution_mode="live_inference", completion=processor.completion(item), qualified=True,
+            )
+            candidates = [candidate for entry in result.attributes for candidate in entry.candidates]
+            if mode in {"unknown", "schema", "quotation"}:
+                assert not candidates and len(result.validation_diagnostics) == 1
+                diagnostic = result.validation_diagnostics[0]
+                assert diagnostic.raw_response_sha256 and diagnostic.raw_response_hash_basis == "provider_content"
+                assert "SECRET-DIAGNOSTIC-REDACTION-CHECK" not in diagnostic.model_dump_json()
+                assert diagnostic.issues[0].field_path.startswith("candidates[0].")
+            else:
+                assert len(candidates) == 1 and candidates[0].evidence_ids == expected_ids
+                assert not result.validation_diagnostics
+            pressure = next(attribute for attribute in result.attributes if attribute.attribute_id == "Pressure Rating")
+            assert pressure.status == "definition_clarification_needed" and not pressure.candidates
+            export_store = SQLiteStore.__new__(SQLiteStore)
+            export_store.path = case_home / f"export-{capture_index}.sqlite3"
+            with export_store.connect() as connection:
+                connection.execute("CREATE TABLE records (key TEXT PRIMARY KEY, value BLOB NOT NULL, version TEXT NOT NULL)")
+            write_json(export_store, f"batches/{batch['id']}.json", batch)
+            write_json(export_store, f"items/{batch['id']}/{item['item_key']}.json", {
+                "state": "unresolved", "error": "REPRODUCTION ONLY, not a live result",
+            })
+            write_json(export_store, f"results/{batch['id']}/{item['item_key']}.json", result.model_dump(mode="json"))
+            workbook = read_workbook(BatchService(export_store).export(batch["id"], batch["owner"]))
+            assert any("Pressure Rating" in row["Definition clarifications"] for row in workbook["Errors"])
+            if candidates:
+                rows = [row for row in workbook["Results"] if row["Proposed value"]]
+                assert len(rows) == 1 and json.loads(rows[0]["Evidence IDs"]) == expected_ids
+                for evidence_id in expected_ids:
+                    evidence_row = next(row for row in workbook["Evidence"] if row["Evidence ID"] == evidence_id)
+                    assert evidence_row["Locator"] == next(
+                        entry["source_locator"] for entry in original["evidence"] if entry["evidence_id"] == evidence_id
+                    )
+                assert "REPRODUCTION ONLY" in rows[0]["Qualifications"]
+            else:
+                restored = json.loads("".join(row["Sanitized diagnostic JSON"] for row in workbook["Diagnostics"]))
+                assert restored == result.validation_diagnostics[0].model_dump(mode="json")
+            outcomes.append({"item_key": capture["item_key"], "source_tier": sources[0].source_tier,
+                             "mode": mode, "accepted": bool(candidates), "owner_export_verified": True})
+    total_input = sum(row["input"] for row in planning)
+    total_output = sum(row["output"] for row in planning)
+    assert len(planning) == 4 and total_input <= remaining["input"] and total_output <= remaining["output"]
+    assert Path(snapshot_path).read_bytes() == snapshot_bytes
+    receipt_path = os.environ.get("DOCINTEL_TEST_SUBSET_DIAGNOSTIC_RECEIPT")
+    if receipt_path:
+        receipt = {
+            "reproduction_only": True, "recovered_output": False, "live_calls": 0,
+            "worker_authorization_simulated": False, "worker_executions_remaining": 0,
+            "consumption_snapshot_sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
+            "full_request_reservations": planning, "remaining_before_projection": remaining,
+            "projected_input": total_input, "projected_output": total_output,
+            "remaining_after_projection": {"requests": remaining["requests"] - 4,
+                                          "input": remaining["input"] - total_input,
+                                          "output": remaining["output"] - total_output},
+            "representative_responses": outcomes,
+        }
+        path = Path(receipt_path)
+        with path.open("x") as stream:
+            json.dump(receipt, stream, indent=2)
+        path.chmod(0o600)
+
+
+def test_failure_to_persist_diagnostic_stops_execution_without_refunding(configured, monkeypatch):
+    from backend import batch_worker as worker
+    from backend.extract import ExecutionConfigurationError
+
+    store, record, _ = configured
+    _, _, _, calls = install_services(monkeypatch)
+    internal_only(configured, monkeypatch)
+    original_client = worker.LLMClient
+    original_write = worker.write_json
+
+    def client(**kwargs):
+        value = original_client(**kwargs)
+        complete = value.complete_structured
+
+        def rejected(*args, **options):
+            response = complete(*args, **options)
+            response.candidates[0].evidence_ids = ["E999"]
+            return response
+
+        value.complete_structured = rejected
+        return value
+
+    def fail_diagnostic(store, key, value, *args, **kwargs):
+        if key.startswith("response-diagnostics/"):
+            raise Conflict("Synthetic diagnostic write failure")
+        return original_write(store, key, value, *args, **kwargs)
+
+    monkeypatch.setattr(worker, "LLMClient", client)
+    monkeypatch.setattr(worker, "write_json", fail_diagnostic)
+    with pytest.raises(ExecutionConfigurationError, match="diagnostic persistence failed"):
+        run_batch(store, record["id"], concurrency=1, item_limit=1)
+    assert len(calls) == 1 and not store.keys("results/")
+    ledger, _ = read_json(store, "budgets/real-pilot.json")
+    assert ledger["attempted"]["inference"] == 1 and len(ledger["executions"]) == 1
