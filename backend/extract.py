@@ -11,9 +11,10 @@ from pydantic import ValidationError
 
 from backend.core.instructions import product_extraction_system_message
 from backend.core.llm import LLMClient, LLMSchemaValidationError
+from backend.evidence_verification import Fragment, match_text, normalized, windows
 from backend.models.enrichment import (
     AttributeResult, EnrichmentResult, Evidence, ExtractionResponse, Manifest,
-    InferenceFailure, LiveBundle, OfflineBundle, OfflineSource, RetrievalOutcome, ReviewDecision,
+    EvidenceVerification, InferenceFailure, LiveBundle, OfflineBundle, OfflineSource, RetrievalOutcome, ReviewDecision,
 )
 from backend.real_pilot import RealPilotBudgetExceeded
 from backend.response_validation import (
@@ -153,9 +154,10 @@ def source_evidence(source: OfflineSource, observed_at: datetime) -> list[Eviden
 
 def validate_response(
     response: ExtractionResponse, manifest: Manifest, evidence: list[Evidence]
-) -> None:
+) -> list[EvidenceVerification]:
     definitions = {attribute.attribute_id: attribute for attribute in manifest.attributes}
     citations = {item.evidence_id: item for item in evidence}
+    verified = []
     for index, candidate in enumerate(response.candidates):
         path = f"candidates[{index}]"
         if candidate.attribute_id not in definitions or candidate.attribute_id in manifest.existing_values:
@@ -172,44 +174,56 @@ def validate_response(
             scope = citations[evidence_id].attribute_ids
             if scope is not None and candidate.attribute_id not in scope:
                 raise invalid(f"{path}.evidence_ids[{offset}]", "Candidate exceeds the approved product/attribute applicability")
-        if candidate.supporting_quote is not None and (
-            not candidate.supporting_quote.strip() or not any(
-                candidate.supporting_quote in citations[key].text for key in candidate.evidence_ids
-            )
-        ):
-            raise invalid(path + ".supporting_quote", "Supporting quotation must occur verbatim in cited evidence")
+        try:
+            spans = windows(evidence, set(candidate.evidence_ids))
+        except ValueError as error:
+            raise invalid(path + ".evidence_ids", str(error)) from error
+        quote_match = match_text(candidate.supporting_quote, spans) if candidate.supporting_quote is not None else None
+        if candidate.supporting_quote is not None and quote_match is None:
+            raise invalid(path + ".supporting_quote", "Supporting quotation has no normalized match in cited evidence")
         literal = str(candidate.value)
         if isinstance(candidate.value, float) and candidate.value.is_integer():
             literal = str(int(candidate.value))
         literals = ("true", "yes") if candidate.value is True else ("false", "no") if candidate.value is False else (literal,)
-        pattern = rf"(?<!\w)(?:{'|'.join(re.escape(value) for value in literals)})(?!\w)"
-        supporting_text = [candidate.supporting_quote] if candidate.supporting_quote else [
-            citations[evidence_id].text for evidence_id in candidate.evidence_ids
-        ]
-        if not any(re.search(pattern, text, re.IGNORECASE) for text in supporting_text):
-            raise invalid(path + ".value", "Candidates require literal value support in source excerpts")
-        if candidate.unit and not any(
-            re.search(rf"(?<!\w){re.escape(candidate.unit)}(?!\w)", text, re.IGNORECASE)
-            for text in supporting_text
-        ):
+        value_spans = [[part] for span in spans for part in span if part.vendor]
+        if not value_spans:
+            value_spans = spans
+            if candidate.supporting_quote is not None:
+                quote_span = [[Fragment(citations[candidate.evidence_ids[0]], candidate.supporting_quote)]]
+                if not any(match_text(value, quote_span) for value in literals):
+                    raise invalid(path + ".value", "Candidate value has no normalized support in its grounded quotation")
+        value_match = next((match for value in literals if (match := match_text(value, value_spans))), None)
+        if value_match is None:
+            raise invalid(path + ".value", "Candidate value has no normalized support in cited source text or vendor cells")
+        unit_match = match_text(candidate.unit, value_spans) if candidate.unit else None
+        if candidate.unit and (unit_match is None or (
+            candidate.supporting_quote and not any(part.vendor for span in spans for part in span)
+            and match_text(candidate.unit, [[Fragment(citations[candidate.evidence_ids[0]], candidate.supporting_quote)]]) is None
+        )):
             raise invalid(path + ".unit", "Candidates require explicit unit support in source excerpts")
+        semantic_quote = " ".join(normalized(candidate.supporting_quote or "")[0])
         if candidate.supporting_quote and re.search(r"\b(maximum|max)\b", candidate.attribute_id, re.IGNORECASE):
-            if re.search(r"\bworking\b", candidate.supporting_quote, re.IGNORECASE) and not re.search(
-                r"\b(maximum|max)\b", candidate.supporting_quote, re.IGNORECASE
+            if re.search(r"\bworking\b", semantic_quote) and not re.search(
+                r"\b(maximum|max)\b", semantic_quote
             ):
                 raise invalid(path + ".supporting_quote", "Working rating does not establish a maximum rating")
         if candidate.supporting_quote and candidate.attribute_id.casefold() in {"material", "primary material", "body material"}:
-            if re.search(r"\b(o-ring|seat|stem|seal|ball|pin|washer)s?\b", candidate.supporting_quote, re.IGNORECASE) and not re.search(
-                r"\b(body|primary material)\b", candidate.supporting_quote, re.IGNORECASE
+            if re.search(r"\b(o ring|seat|stem|seal|ball|pin|washer)s?\b", semantic_quote) and not re.search(
+                r"\b(body|primary material)\b", semantic_quote
             ):
                 raise invalid(path + ".supporting_quote", "A component material does not establish the product/body material")
         if candidate.supporting_quote and type(candidate.value) is bool:
-            answer = "(?:true|yes)" if candidate.value else "(?:false|no)"
-            if not re.search(
-                rf"{re.escape(candidate.attribute_id)}\s*[:=]\s*{answer}(?!\w)",
-                candidate.supporting_quote, re.IGNORECASE,
+            quote_tokens = normalized(candidate.supporting_quote)[0]
+            label = normalized(candidate.attribute_id)[0]
+            # Punctuation may vary, but a boolean still needs its explicit labeled answer.
+            answers = ("true", "yes") if candidate.value else ("false", "no")
+            if not any(
+                quote_tokens[offset:offset + len(label) + 1] == label + [answer]
+                for offset in range(len(quote_tokens)) for answer in answers
             ):
                 raise invalid(path + ".supporting_quote", "Boolean proposals require an explicit labeled answer, not negation or missing evidence")
+        verified.append(EvidenceVerification(quote=quote_match, value=value_match, unit=unit_match))
+    return verified
 
 
 class ReplayCompletion:
@@ -287,6 +301,7 @@ def run_enrichment(
             retrieval.append(RetrievalOutcome(source_tier=tier, status="not_attempted"))
 
     response = ExtractionResponse(candidates=[])
+    verification = []
     extraction_error = None
     failure = None
     diagnostics = []
@@ -338,8 +353,9 @@ def run_enrichment(
                         if not candidate.supporting_quote or not candidate.qualification or not candidate.qualification.strip():
                             field = "supporting_quote" if not candidate.supporting_quote else "qualification"
                             raise invalid(f"candidates[0].{field}", "Real proposals require quotations and applicability qualifications")
-                        validate_response(ExtractionResponse(candidates=[candidate]), manifest, evidence)
+                        checks = validate_response(ExtractionResponse(candidates=[candidate]), manifest, evidence)
                         accepted.append(candidate)
+                        verification.extend(checks)
                     except ResponseValidationError as error:
                         invalid_attributes.add(candidate.attribute_id)
                         extraction_error = "invalid_response"
@@ -359,7 +375,7 @@ def run_enrichment(
                     failure = sanitized_failure(error, stage)
                 response = ExtractionResponse(candidates=accepted)
             else:
-                validate_response(response, manifest, evidence)
+                verification = validate_response(response, manifest, evidence)
             if extraction_error is None:
                 cache_validated = getattr(type(generator), "validated_response", None)
                 if cache_validated is not None:
@@ -388,6 +404,7 @@ def run_enrichment(
                     raw_response_sha256=getattr(generator, "last_response_sha256", None),
                 ))
             response = ExtractionResponse(candidates=[])
+            verification = []
 
     results = []
     retrieval_failed = any(outcome.status == "failed" for outcome in retrieval)
@@ -408,6 +425,8 @@ def run_enrichment(
             status = "retrieval_failed" if retrieval_failed else "missing_evidence"
         results.append(AttributeResult(
             attribute_id=attribute.attribute_id, status=status, candidates=candidates,
+            verification=[check for candidate, check in zip(response.candidates, verification)
+                          if candidate.attribute_id == attribute.attribute_id],
             definition_clarification=(
                 f"Confirm the expected unit for {attribute.attribute_id}; no unit or dimensionless value is inferred."
                 if status == "definition_clarification_needed" else None

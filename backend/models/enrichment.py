@@ -168,16 +168,35 @@ class ReviewAnnotation(Contract):
     annotated_at: AwareDatetime
 
 
+class EvidenceMatch(Contract):
+    method: Literal["verbatim", "normalized", "adjacent_fragments", "vendor_cells"]
+    normalization: list[str]
+    evidence_ids: list[str]
+    source_locations: list[str]
+    cells: list[str] = Field(default_factory=list)
+    normalized_sha256: str
+
+
+class EvidenceVerification(Contract):
+    version: Literal["grounded-normalization-v1"] = "grounded-normalization-v1"
+    quote: EvidenceMatch | None = None
+    value: EvidenceMatch
+    unit: EvidenceMatch | None = None
+
+
 class AttributeResult(Contract):
     attribute_id: str
     status: Literal["existing", "proposed", "conflict", "missing_evidence", "retrieval_failed", "extraction_failed", "definition_clarification_needed"]
     definition_clarification: str | None = None
     candidates: list[Candidate] = Field(default_factory=list)
+    verification: list[EvidenceVerification] = Field(default_factory=list)
     review: ReviewDecision | None = None
     review_annotations: list[ReviewAnnotation] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_annotation_targets(self) -> Self:
+        if self.verification and len(self.verification) != len(self.candidates):
+            raise ValueError("Verification records must correspond to the candidate order")
         if any(annotation.candidate_index >= len(self.candidates) for annotation in self.review_annotations):
             raise ValueError("Review annotation must reference an existing candidate")
         return self

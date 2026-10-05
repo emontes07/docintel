@@ -392,7 +392,7 @@ def test_vendor_rows_supplement_pdf_before_web_without_variant_leakage(configure
                 assert "wrong-variant" not in evidence["text"]
                 return ExtractionResponse(candidates=[Candidate(
                     attribute_id="Inlet", value="threaded", evidence_ids=[evidence["evidence_id"]],
-                    supporting_quote='"value": "threaded"', qualification="Exact synthetic row and inlet field.",
+                    supporting_quote="threaded", qualification="Exact synthetic row and inlet field.",
                 )])
             return super().complete_structured(system, user, schema, **kwargs)
 

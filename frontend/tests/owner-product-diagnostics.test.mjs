@@ -62,6 +62,32 @@ function machine(attribute = {}) {
   };
 }
 
+test("owner review shows normalization and exact server verification provenance", () => {
+  const match = { method: "vendor_cells", normalization: ["unicode_nfkc", "inch_unit_alias", "numeric_format"], evidence_ids: ["source:v1:row2"], source_locations: ["synthetic.xlsx#sheet=Data&row=2"], cells: ["B2"], normalized_sha256: "d".repeat(64) };
+  const verification = { version: "grounded-normalization-v1", quote: match, value: match, unit: null };
+  const value = machine({ status: "proposed", candidates: [{ value: "5/8 in", unit: null, evidence_ids: [], supporting_quote: "5/8 inches" }], verification: [verification] });
+  const html = render(EnrichmentReview, { result: value, identity: "verified_entra" });
+  for (const text of ["Evidence verification", "5/8 inches", "unicode nfkc", "inch unit alias", "numeric format", "Matched cells: B2", "not product accuracy or human approval"]) assert.ok(html.includes(text), text);
+  assert.ok(html.includes(escaped(JSON.stringify(verification, null, 2))));
+  assert.doesNotMatch(html, /No verification record retained/);
+});
+
+test("legacy candidates do not receive fabricated verification records", () => {
+  const value = machine({ status: "proposed", candidates: [{ value: "legacy", unit: null, evidence_ids: [] }] });
+  const html = render(EnrichmentReview, { result: value, identity: "verified_entra" });
+  assert.match(html, /No verification record retained for this historical candidate/);
+  assert.doesNotMatch(html, /grounded-normalization-v1|none needed/);
+});
+
+test("verification quotes and locations remain escaped text", () => {
+  const attack = '<img src=x onerror="alert(1)">';
+  const match = { method: attack, normalization: [attack], evidence_ids: [attack], source_locations: [attack], cells: [attack], normalized_sha256: attack };
+  const value = machine({ status: "proposed", candidates: [{ value: "test", unit: null, evidence_ids: [], supporting_quote: attack }], verification: [{ version: attack, quote: match, value: match, unit: null }] });
+  const html = render(EnrichmentReview, { result: value, identity: "verified_entra" });
+  assert.ok(html.includes(escaped(attack)));
+  assert.doesNotMatch(html, /<img/);
+});
+
 function detail(overrides = {}) {
   return {
     state: "failed",

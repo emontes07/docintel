@@ -345,6 +345,15 @@ class BatchService:
             raise ValueError("Invalid item-bound result pointer")
         return key
 
+    def reconcile_interrupted(self, batch_id, item_key, actor, *, expected, evidence, evidence_sha256):
+        """Reconcile one stopped final attempt; never start work or replenish authority."""
+        from backend.interrupted_reconciliation import reconcile_interrupted
+
+        return reconcile_interrupted(
+            self.store, batch_id, item_key, actor, expected=expected,
+            evidence=evidence, evidence_sha256=evidence_sha256,
+        )
+
     def detail(self, batch_id, item_key, actor):
         record = self.get(batch_id, actor)
         if item_key not in {item["item_key"] for item in record["items"]}:
@@ -416,7 +425,7 @@ class BatchService:
         record = self.get(batch_id, actor)
         columns = list(record["items"][0]["original"])
         inputs = [columns, *[[item["original"].get(column, "") for column in columns] for item in record["items"]]]
-        results = [["Row", "Item ID", "Vendor", "MPN", "Attribute", "Status", "Candidate index", "Proposed value", "Unit", "Evidence IDs", "Qualifications", "Review status", "Reviewed value", "Reviewed unit", "Reviewer", "Reviewed at", "Reason", "Error", "Source tiers", "Supporting quote", "Model confidence (not measured accuracy)"]]
+        results = [["Row", "Item ID", "Vendor", "MPN", "Attribute", "Status", "Candidate index", "Proposed value", "Unit", "Evidence IDs", "Qualifications", "Review status", "Reviewed value", "Reviewed unit", "Reviewer", "Reviewed at", "Reason", "Error", "Source tiers", "Supporting quote", "Model confidence (not measured accuracy)", "Evidence verification JSON"]]
         evidence_rows = [["Row", "Evidence ID", "Source ID", "Locator", "Version", "Excerpt", "Observed at", "Source tier", "Applicability", "Approved attributes", "Discovery method"]]
         errors = [["Row", "State", "Error", "Warnings", "Definition clarifications", "Validation diagnostics"]]
         diagnostics_sheet = [["Row", "Diagnostic", "Part", "Parts", "Sanitized diagnostic JSON"]]
@@ -483,6 +492,8 @@ class BatchService:
                     results.append([item["row"], machine["manifest"]["product"]["item_id"], machine["manifest"]["product"]["vendor"], machine["manifest"]["product"]["mpn"], attribute["attribute_id"], attribute["status"], index if candidate else "", candidate.get("value", machine["manifest"]["existing_values"].get(attribute["attribute_id"], "")), candidate.get("unit", ""), json.dumps(candidate.get("evidence_ids", [])), notes, review.get("decision", "pending"), review.get("corrected_value", ""), review.get("corrected_unit", ""), review.get("reviewer", ""), review.get("reviewed_at", ""), review.get("reason", ""), detail.get("error", "")])
                     tiers = sorted({entry["source_tier"] for entry in machine["evidence"] if entry["evidence_id"] in candidate.get("evidence_ids", [])})
                     results[-1].extend([", ".join(tiers), candidate.get("supporting_quote"), candidate.get("confidence")])
+                    verification = attribute.get("verification", [])
+                    results[-1].append(json.dumps(verification[index], ensure_ascii=True) if index < len(verification) else "")
         definition_columns = list(record["original_definitions"][0])
         reviews_sheet = [["Row", "Attribute", "Decision", "Selected candidate index", "Corrected value", "Corrected unit", "Reviewer", "Identity status", "Reviewed at", "Reason"]]
         for item in record["items"]:

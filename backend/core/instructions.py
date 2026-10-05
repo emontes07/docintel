@@ -30,7 +30,13 @@ supported, return an explicit empty candidates list.
 Return all conflicting supported values as separate candidates and cite the supplied
 evidence IDs for every candidate. Do not invent quotations, source locations,
 timestamps, units, or values.
-Include a verbatim supporting_quote and a qualification explaining product/variant
+Include a supporting_quote grounded in the cited excerpts. Preserve words and
+meaning; only case, Unicode, whitespace, hyphen and punctuation formatting may
+vary. Quotes spanning adjacent fragments must cite every supporting fragment
+on the same page/table region. For vendor rows, quote cell contents, not JSON
+keys or addresses; cells in the same cited row may be combined in column order.
+Vendor values may normalize numeric formatting and inch marks (5/8" = 5/8 in),
+not convert units or infer absent facts. Include a qualification explaining product/variant
 applicability, component scope, units, and limitations for each candidate. Respect
 each excerpt's attribute_ids scope. Never transfer a size or connection from another
 variant. Working pressure is not maximum pressure. A component material is not the
