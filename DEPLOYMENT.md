@@ -1355,10 +1355,172 @@ Sanitize logs before sharing; do not export signed URLs, bearer tokens, account
 labels, document content, or secrets. No deployment, provisioning, rollback, grants,
 AI calls, customer processing, package installation, or push was performed to
 produce this guide.
+# Pinned Azure write contract — release blocker
+
+`scripts/azure_write_schema.py` derives request contracts from the **operation
+body schemas**, not from GET models or hand-maintained writable-field lists.
+The immutable source is Microsoft's
+[Azure REST API specifications at `1249f8e2b407b339083c5125a245bdd3057f6cd5`](https://github.com/Azure/azure-rest-api-specs/tree/1249f8e2b407b339083c5125a245bdd3057f6cd5/specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2024-03-01).
+`scripts/azure_write_schemas/provenance.json` records the public source URL prefix,
+commit, API version, and SHA-256 of every vendored specification, external
+definition, official request example, and MIT license. The manifest itself is
+hash-pinned in code. Missing or modified assets block validation. Runtime
+validation resolves only these local files; it cannot fetch another schema.
+
+`scripts/azure_write_schemas/generated-write-contracts.json` is a **generated**
+artifact, not an editable property allowlist. It contains four fully resolved
+Draft-4 write schemas, their operation IDs/routes, and the source commit/manifest
+pin. Read-only fields compile to prohibitions (`not: {}`), Azure nullable fields
+compile to explicit null unions, and declared numeric formats compile to their
+representable bounds. Runtime validation re-derives the contracts from the pinned
+official operation definitions and requires structural equality with this file
+before using them. Missing, weakened, stale, duplicate-key, or source-mismatched
+generated contracts block writes; harmless JSON key ordering does not.
+
+Intentional regeneration and its dependency-free CI check are:
+
+```sh
+"$PYTHON" -S -m scripts.azure_write_schema --write-generated
+"$PYTHON" -S -m scripts.azure_write_schema --check-generated
+```
+
+Do not regenerate in an immutable published context. Both existing CI jobs run
+`tests/test_release.py`, whose
+`test_release_helper_ci_regenerates_and_verifies_pinned_write_contracts` requires
+regeneration and source-pin verification. The full CI suite additionally collects
+`test_ci_regeneration_reproduces_all_four_contracts_from_pinned_operations`,
+executes `--check-generated` under `-S`, and verifies source/generated-artifact
+tamper rejection. The compiler audits every schema depth,
+including read-only subtrees, against explicit supported keyword and Azure
+annotation vocabularies. It does not ignore arbitrary `x-*` extensions or accept
+unimplemented constructs such as `oneOf`/`const`.
+
+The four independent contracts are `ContainerApps_Update` (PATCH),
+`ContainerApps_CreateOrUpdate` (PUT), `Jobs_Update` (PATCH), and
+`Jobs_CreateOrUpdate` (PUT), all at `2024-03-01`. Reference resolution and
+`allOf` inheritance preserve the declared required fields. Nested `readOnly`
+members are rejected. A strict release policy closes modeled objects to
+undeclared properties, while retaining explicitly declared dictionaries such as
+tags and user-assigned identities. Types, enums, declared bounds, array/string
+constraints and numeric formats are checked. The dependency-free interpreter
+supports the vocabulary used by these pinned bodies and fails closed on
+unimplemented schema constructs; it is not a general OpenAPI implementation.
+No dependency or lock-file change is needed, including during CI's pre-install
+`python scripts/release.py stage` operation.
+
+**Do not remove Container Apps PATCH's `location` requirement.** Its official
+request schema inherits required `location`, and Microsoft's PATCH example
+includes it. AutoRest's `x-ms-mutability` is a code-generation annotation, not
+permission to change the wire schema. Supply the observed existing resource's
+location; never invent a default region. Job PATCH uses its own narrower model:
+for example, it does not accept the PUT model's root `location`.
+
+The supported local APIs are:
+
+```python
+from scripts import azure_write_schema as schema, release
+
+# No requests: resource is a previously captured GET object.
+api_body = release.build_update_payload(api_resource, api_containers)
+job_body = release.build_update_payload(job_resource, job_containers, job=True)
+
+# Strict builders for any separately authorized complete body; no silent filtering.
+put_body = schema.build_payload(
+    "jobs", "PUT", location=observed_location, properties=approved_properties,
+)
+schema.validate_request("PATCH", exact_api_resource_url, api_body)
+schema.validate_request("PATCH", exact_job_resource_url, job_body)
+```
+
+Use the observed full URL ending in `?api-version=2024-03-01`. The existing
+`gap.patch(...)` path uses these builders. Its captured-GET adapters remove only
+documented compatibility metadata and schema-declared read-only/optional null
+values; the final submitted request is strictly validated again. In particular,
+empty newer `identitySettings` and legacy null `dapr` are not job write fields.
+Unsupported nonempty settings must not be silently discarded.
+Optional GET nulls normalize to omission on copies, never by rewriting retained
+receipts. Closure normalizes both the observed containers and the historical
+frontend comparison before comparing them, so an old null versus an omitted
+optional field does not manufacture frontend drift.
+
+`release.azure(...)` validates every explicit `az rest` PATCH/PUT before invoking
+the CLI, including calls originating in older continuation helpers. It rejects
+unknown resources/versions, ambiguous argument overrides, duplicate JSON keys,
+and malformed or invalid bodies. **An old hand-built API body missing location
+now fails locally**; callers must use the builder above, not bypass validation.
+Native Container Apps create/update/ingress/secret mutations are also rejected by
+this wrapper: only its existing read commands and separately guarded job
+start/stop POST actions remain admitted. In particular, the historical
+`--isolate-legacy-baseline` rollback's native ingress-disable/null-ingress write
+is not covered by this pinned contract and now fails closed rather than bypassing
+the schema. Do not use that path or restore an unauthenticated baseline until a
+separate, schema-backed isolation operation has been reviewed. Ordinary
+schema-valid updates and processing closure do not need that operation.
+The credential-bearing `gap.secure_worker_patch(...)` independently validates
+before reading the existing key and validates the completed in-memory body before
+obtaining a management token or invoking curl. Errors contain only fixed reason
+codes, not failing instance values, arbitrary property names, keys, tokens, URLs,
+or raw validator diagnostics.
+
+An independently approved operator can reuse the same existing-key transport:
+
+```python
+gap.send_existing_secret_patch(
+    config, observed_job, redacted_job_body,
+    secret_ref=decision["webiq_secret_ref"],
+    check_window=lambda: operator_window(work, decision, "overall", 600),
+)
+```
+
+`check_window` is a no-argument callback to that operator's **bound, nonrenewable
+clock**, requiring the full 600 seconds. It runs before any key/token access and
+again immediately before submission. This generic entrypoint has no work-root or
+receipt namespace and requires the callback. The original
+`secure_worker_patch(work, config, decision, resource, body, *, check_window=None)`
+remains a compatibility wrapper, retaining the gapfill clock by default.
+The only key supplier remains the existing owner `.env.local` reader; no new
+credential reader or arbitrary credential supplier is introduced.
+The transport writes no receipts and needs no filename factory;
+the caller must own its new scope's intent reservation, empty-secret-store and
+identity checks, immutable outcome records, read-back verification and closure.
+Neither a no-op callback nor an old approval is an authorization substitute.
+Do not invoke this transport from local `prepare`/`check`; pure builders and
+validators never read credentials.
+
+The publication upload is deliberately separate: `upload_publication_context`
+validates the existing source-path-bound HTTPS Blob SAS contract, an existing
+binary archive and a finite positive timeout, then uses a fixed single
+`PUT`/`x-ms-blob-type: BlockBlob` transport. **There is no generic Blob or unknown
+PUT exemption in `release.azure`.** Neither schema validity nor this upload
+contract grants deployment, build, worker, credential, or provider authorization.
+Prior stopped attempts remain consumed; only a separately approved scope may run.
+
+Offline regressions include Microsoft's four unchanged wire examples, realistic
+API/worker GET-to-write payloads, nested forbidden/read-only properties, asset
+tampering, safe errors, both transport boundaries and the separate Blob contract:
+
+```sh
+"$PYTHON" -m pytest -q \
+  tests/test_azure_write_schema.py tests/test_gapfill_continuation.py \
+  --basetemp=.azure-write-schema-tests
+```
+
 # One backend-only Mueller gapfill continuation (Track A)
+
+**Stopped attempt; no retry authorized.** The approved backend build and API
+update completed, but the manual-worker PATCH returned HTTP 400 before activation.
+The worker remained unchanged; no worker execution, model request, WebIQ search
+or direct-page retrieval started. Processing is closed. The offline corrections
+below do not renew that approval, reset an attempt, or authorize another deployment.
+Preserve all existing publication, deployment-failure and closure receipts.
 
 `scripts/gapfill_continuation.py` is a separate, single-use continuation of the
 **existing pinned release root**, not another pilot approval or a fresh allowance.
+Invoke it from the reviewed repository root as
+`python -m scripts.gapfill_continuation`, using the selected Python environment.
+Do not invoke the file directly: its package imports require the repository root.
+The sequence below documents the CLI contract, not permission to resume the
+stopped attempt.
 Its source boundary is `f56d7eafd56ba3dec90ca87500e1ddf71a1453c8`: only
 `backend/real_pilot.py`, this helper, its two focused tests, deployment/batch
 documentation and one exact worker admission exception may differ. The worker
@@ -1389,7 +1551,7 @@ DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
 
 1. Merge the guard/helper-only successor with all required CI checks. Prepare
    its immutable context **under the existing root** with
-   `gapfill_continuation.py prepare --work "$WORK" --revision "$REV"`.
+   `python -m scripts.gapfill_continuation prepare --work "$WORK" --revision "$REV"`.
    Populate the existing publisher's exact-source `clean-checks.json`,
    `backend-smoke.json`, and merged `ci.json` receipts under `gapfill-v1`.
    The original root pin, all old receipts, snapshot, caches and results are
@@ -1426,7 +1588,21 @@ DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
    non-retried HTTPS PATCH, never command arguments, stdout, private receipts,
    source context, or local credential files. Its redacted create-once intent records
    contain only the reference and resource identity. Responses/errors are discarded
-   or sanitized. No key is generated, rotated, fetched from another service, or
+   or sanitized. The `2024-03-01` job request projects only supported configuration:
+   secrets, registries, trigger type, replica timeout/retry limit and
+   manual/schedule/event trigger settings. Empty GET-only `identitySettings` and
+   the legacy null `dapr` field are omitted from the request, not from read-back
+   comparisons. Nonempty unsupported settings require API compatibility review
+   instead of silently discarding them. A failed existing-key PATCH retains only
+   bounded `phase`, `http_status` and `curl_returncode` diagnostics (unknown values
+   remain null), plus `retry_permitted=false`, in its exception and create-once
+   mode-`0600` `gapfill-deploy-worker-failure.json`. No raw response body, stderr,
+   owner key or access token is recorded; HTTP 400/curl 22 is not mislabeled as an
+   unknown outcome. If the diagnostic receipt cannot be written, the sanitized
+   exception still retains that status; existing receipts are never replaced.
+   This does not overwrite the stopped attempt's separately
+   captured `gapfill-deployment-failure.json`.
+   No key is generated, rotated, fetched from another service, or
    granted new access. A locally present key alone is not proof of an installed
    hosted binding. The owner-approved service prices are
    `web_prices={"search": "0.0125", "web_retrieval": "0"}`. A direct HTTPS page has
@@ -1450,6 +1626,9 @@ DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
    This uses exact retained MPN/source/host/batch bindings, the documented endpoint,
    `198000` microdollars for full build+worker compute, and a `210920`-microdollar
    optional-web cap (two searches plus two complete web-model reservations).
+   The legacy two-item serialized policy omits the newer per-item page-limit
+   default, preserving its original approved JSON shape and aggregate four-page
+   cap. Separately approved four-item policies retain their explicit allocations.
    `credential_source="unavailable", webiq_secret_ref=null` explicitly represents a missing key for offline checks,
    not proof of an available credential or permission to manufacture one.
    `ready` refuses that unresolved choice **before writing either clock receipt**:
@@ -1502,11 +1681,13 @@ DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
    `GIT_DIR` pointing at the original repository's existing Git directory so
    read-only `git show`/HEAD attestations resolve the same reviewed revision.
    Never copy `.env.local` into that source tree or build context.
-   `ready --approve ready` creates the nonrenewable 45-minute publication and
-   90-minute overall windows. `publish --approve publish` records model capacity
+   `python -m scripts.gapfill_continuation ready --approve ready` creates the
+   nonrenewable 45-minute publication and 90-minute overall windows.
+   `python -m scripts.gapfill_continuation publish --approve publish` records model capacity
    **before** the build, reserves the sole attempt before requesting an upload,
    and rechecks a full 900 seconds at upload and build submission.
-5. `deploy --approve deploy` updates only API and worker immutable backend digest,
+5. `python -m scripts.gapfill_continuation deploy --approve deploy`
+   updates only API and worker immutable backend digest,
    verifies the frontend unchanged and starts a processing window of at most
    20 minutes, clipped to the original 90-minute deadline. A full 600 seconds
    must still fit. Before activation, the operator supplies
@@ -1514,11 +1695,19 @@ DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
    `authenticated=true`, the authenticated `owner`/`batch_id`, backend image,
    exact activation `amendment_sha256` and `observed_at` within this window.
    The helper never manufactures authentication evidence.
-6. `activate --approve activate` verifies live resource shapes, installs only
+6. `python -m scripts.gapfill_continuation activate --approve activate`
+   verifies live resource shapes, installs only
    `configuration/real-pilot-gapfill.json`, conditionally queues the existing batch,
    temporarily enables the API and submits one exact two-item worker override.
    Its `finally` always attempts API processing closure, even after a guard,
-   probe or start error. `close --approve close` remains available after expiry.
+   probe or start error.
+   `python -m scripts.gapfill_continuation close --approve close` remains available
+   after expiry. Both the CLI and `gap.close(work, config, decision)` resolve
+   backend/frontend image pins from the bound `gapfill-published.json`, not the
+   original images in `target.json`. Closure therefore handles a published/API-only
+   partial deployment without a successful worker deployment or `deployed` receipt.
+   It never needs the owner key, reopens processing, or rewrites an existing
+   `closed` receipt.
    There are no standalone configure/enable/start retry commands.
 
 All commands after `prepare` require `--work "$WORK" --decision "$DECISION"`;

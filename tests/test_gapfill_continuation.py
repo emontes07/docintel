@@ -3,6 +3,7 @@
 import copy
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -153,6 +154,31 @@ def test_decision_factory_is_complete_canonical_and_does_not_start_a_clock(state
     assert decision["policy"] == gap.POLICY and decision["policy"] is not gap.POLICY
     assert decision["gate_sha256"] == gap.digest_file(state.work / "gapfill-private-gate.json")
     assert {candidate.name: candidate.read_bytes() for candidate in state.work.glob("*.json")} == existing
+
+
+def test_legacy_web_configuration_omits_new_item_page_defaults_only(monkeypatch):
+    from backend.core.websearch_policy import OptionalWebPolicy
+    from backend.real_pilot import RealPilotGuard
+
+    monkeypatch.setattr(RealPilotGuard, "_cost", lambda *args: 185920)
+    selected = ["row-2", "row-3"]
+    records = {
+        "configuration/real-pilot-approval.json": {"batch_id": "synthetic", "batch_sha256": "a" * 64},
+        "configuration/real-pilot-row-rerun.json": {"selected_item_keys": selected},
+        "batches/synthetic.json": {"items": [
+            {"item_key": key, "manifest": {"product": {"mpn": "PUBLIC-" + key}},
+             "sources": [{"kind": "web", "source_tier": "manufacturer_web",
+                          "source_id": "web-" + key, "url": "https://www.muellercompany.com"}]}
+            for key in selected
+        ]},
+    }
+    configuration = gap.web_configuration(records, {key: {"material": "Material"} for key in selected})
+    policy = configuration["public_web_policy"]
+    assert policy["max_direct_page_attempts"] == 4
+    assert policy["max_search_calls"] == policy["max_inference_calls"] == 2
+    assert all("max_direct_page_attempts" not in item for item in policy["items"].values())
+    parsed = OptionalWebPolicy.model_validate(policy)
+    assert all(getattr(item, "max_direct_page_attempts", 2) == 2 for item in parsed.items.values())
 
 
 @pytest.mark.parametrize("failure", ["configure", "enable", "start", "observe"])
@@ -381,7 +407,8 @@ def test_credential_transport_uses_stdin_only_and_does_not_change_redacted_paylo
     config = {"subscription": "subscription", "tenant": "tenant", "group": "group", "job": "worker"}
     resource = {"id": "/subscriptions/subscription/resourceGroups/group/providers/Microsoft.App/jobs/worker",
                 "etag": "synthetic-etag"}
-    payload = {"properties": {"configuration": {"secrets": [{"name": "existing-gbbdemo"}]},
+    payload = {"properties": {"configuration": {"replicaTimeout": 600, "triggerType": "Manual",
+                                               "secrets": [{"name": "existing-gbbdemo"}]},
                               "template": {"containers": [{"name": "worker", "image": "digest"}]}}}
     before = copy.deepcopy(payload)
     key, token = "SYNTHETIC-EXISTING-KEY", "SYNTHETIC-ACCESS-TOKEN"
@@ -406,25 +433,119 @@ def test_credential_transport_uses_stdin_only_and_does_not_change_redacted_paylo
         assert key.encode() not in candidate.read_bytes() and token.encode() not in candidate.read_bytes()
 
 
-def test_credential_transport_failure_is_sanitized_without_retry(state, monkeypatch):
+@pytest.mark.parametrize("returncode,stdout,expected_status", [
+    (22, b"400", 400), (22, b"503", 503), (7, b"", None), (22, b"000", None),
+    (28, b"000", None),
+    (22, b"400 SYNTHETIC-RESPONSE-BODY", None), (0, b"204", 204),
+])
+def test_credential_transport_failure_is_sanitized_without_retry(
+    state, monkeypatch, returncode, stdout, expected_status,
+):
     config = {"subscription": "subscription", "tenant": "tenant", "group": "group", "job": "worker"}
     resource = {"id": "/subscriptions/subscription/resourceGroups/group/providers/Microsoft.App/jobs/worker"}
-    payload = {"properties": {"configuration": {"secrets": [{"name": "existing-gbbdemo"}]}}}
+    payload = {"properties": {"configuration": {"replicaTimeout": 600, "triggerType": "Manual",
+                                               "secrets": [{"name": "existing-gbbdemo"}]}}}
     monkeypatch.setattr(gap, "existing_webiq_key", lambda: "SYNTHETIC-KEY")
     monkeypatch.setattr(gap.release, "azure", lambda *a, **k: {"accessToken": "SYNTHETIC-TOKEN"})
     calls = []
 
     def transport(*args, **kwargs):
         calls.append(1)
-        return SimpleNamespace(returncode=1, stdout=b"", stderr=b"SYNTHETIC-KEY SYNTHETIC-TOKEN")
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=b"SYNTHETIC-KEY SYNTHETIC-TOKEN")
 
     monkeypatch.setattr(gap.subprocess, "run", transport)
-    with pytest.raises(ValueError, match="details withheld, no retry") as error:
+    with pytest.raises(gap.WorkerPatchFailure, match="details withheld, no retry") as error:
         gap.secure_worker_patch(state.work, config, state.decision, resource, payload)
+    assert error.value.metadata() == {
+        "phase": "worker_patch", "http_status": expected_status,
+        "curl_returncode": returncode, "retry_permitted": False,
+    }
     assert "SYNTHETIC" not in str(error.value) and calls == [1]
 
 
-def test_worker_patch_preserves_configuration_and_records_no_key(state, monkeypatch):
+@pytest.mark.parametrize("phase", ["configuration", "credential", "management_token", "worker_patch"])
+def test_credential_phase_failures_and_timeout_never_expose_raw_details(state, monkeypatch, phase):
+    config = {"subscription": "subscription", "tenant": "tenant", "group": "group", "job": "worker"}
+    resource = {"id": "/subscriptions/subscription/resourceGroups/group/providers/Microsoft.App/jobs/worker"}
+    payload = {"properties": {"configuration": {"replicaTimeout": 600, "triggerType": "Manual",
+                                               "secrets": [{"name": "existing-gbbdemo"}]}}}
+    calls = []
+
+    def credential():
+        calls.append("credential")
+        if phase == "credential":
+            raise OSError("SYNTHETIC-KEY")
+        return "SYNTHETIC-KEY"
+
+    def token(*args, **kwargs):
+        calls.append("management_token")
+        if phase == "management_token":
+            raise ValueError("SYNTHETIC-TOKEN")
+        return {"accessToken": "SYNTHETIC-TOKEN"}
+
+    def transport(*args, **kwargs):
+        calls.append("worker_patch")
+        raise gap.subprocess.TimeoutExpired(["curl"], 70, output=b"", stderr=b"SYNTHETIC-KEY SYNTHETIC-TOKEN")
+
+    monkeypatch.setattr(gap, "existing_webiq_key", credential)
+    monkeypatch.setattr(gap.release, "azure", token)
+    monkeypatch.setattr(gap.subprocess, "run", transport)
+    if phase == "configuration":
+        payload["properties"]["configuration"]["secrets"] = [{"name": "SYNTHETIC-INVALID"}]
+    with pytest.raises(gap.WorkerPatchFailure, match="details withheld, no retry") as error:
+        gap.secure_worker_patch(state.work, config, state.decision, resource, payload)
+    assert error.value.metadata() == {
+        "phase": phase, "http_status": None, "curl_returncode": None, "retry_permitted": False,
+    }
+    assert error.value.__suppress_context__ and "SYNTHETIC" not in str(error.value)
+    phases = ["credential", "management_token", "worker_patch"]
+    assert calls == ([] if phase == "configuration" else phases[:phases.index(phase) + 1])
+
+
+@pytest.mark.parametrize("trigger,field,settings", [
+    ("Manual", "manualTriggerConfig", {"parallelism": 1, "replicaCompletionCount": 1}),
+    ("Schedule", "scheduleTriggerConfig", {"cronExpression": "0 0 * * *", "parallelism": 1, "replicaCompletionCount": 1}),
+    ("Event", "eventTriggerConfig", {
+        "parallelism": 1, "replicaCompletionCount": 1,
+        "scale": {"minExecutions": 0, "maxExecutions": 1, "pollingInterval": 30, "rules": []},
+    }),
+])
+def test_job_projection_preserves_all_supported_settings_without_mutating_get(trigger, field, settings):
+    configuration = {
+        "triggerType": trigger, "replicaTimeout": 600, "replicaRetryLimit": 0,
+        "manualTriggerConfig": None, "scheduleTriggerConfig": None, "eventTriggerConfig": None,
+        "secrets": [{"name": "existing-reference"}],
+        "registries": [{"server": "registry.invalid", "identity": "system",
+                        "username": None, "passwordSecretRef": None}],
+        "identitySettings": [], "dapr": None,
+        field: settings,
+    }
+    before = copy.deepcopy(configuration)
+    projected = gap.writable_job_configuration(configuration)
+    expected = {key: value for key, value in before.items()
+                if key not in {"identitySettings", "dapr"} and value is not None}
+    expected["registries"] = [{"server": "registry.invalid", "identity": "system"}]
+    assert projected == expected
+    projected[field]["parallelism"] = 2
+    projected["registries"][0]["identity"] = "changed"
+    projected["secrets"].clear()
+    assert configuration == before
+
+
+@pytest.mark.parametrize("unsupported", [
+    {"identitySettings": [{"identity": "system", "lifecycle": "Main"}]},
+    {"dapr": {"enabled": True}},
+    {"unknownWritableSetting": {"enabled": True}},
+])
+def test_job_projection_does_not_silently_drop_nonempty_unsupported_settings(unsupported):
+    before = copy.deepcopy(unsupported)
+    with pytest.raises(ValueError, match="2024-03-01"):
+        gap.writable_job_configuration(unsupported)
+    assert unsupported == before
+
+
+@pytest.mark.parametrize("status,failed_receipt_write", [(200, False), (202, False), (400, False), (400, True)])
+def test_worker_patch_preserves_configuration_and_records_no_key(state, monkeypatch, status, failed_receipt_write):
     decision = {**state.decision, "credential_source": "owner_env_file"}
     # Supply new matching local clock receipts for this synthetic decision.
     for name in ("readiness", "readiness-pin"):
@@ -434,26 +555,211 @@ def test_worker_patch_preserves_configuration_and_records_no_key(state, monkeypa
     pin = gap.release.private_json(gap.path(state.work, "readiness-pin"))
     pin["sha256"] = gap.digest_file(gap.path(state.work, "readiness"))
     gap.release.save(gap.path(state.work, "readiness-pin"), pin)
-    resource = {"id": "synthetic-worker", "properties": {
+    config = {"subscription": "subscription", "tenant": "tenant", "group": "group", "job": "worker"}
+    resource = {
+        "id": "/subscriptions/subscription/resourceGroups/group/providers/Microsoft.App/jobs/worker",
+        "etag": "synthetic-etag", "identity": {"type": "SystemAssigned"}, "properties": {
         "configuration": {"secrets": None, "replicaTimeout": 600, "replicaRetryLimit": 0,
-                          "triggerType": "Manual", "manualTriggerConfig": {"parallelism": 1, "replicaCompletionCount": 1}},
+                          "triggerType": "Manual", "manualTriggerConfig": {"parallelism": 1, "replicaCompletionCount": 1},
+                          "eventTriggerConfig": None, "scheduleTriggerConfig": None,
+                          "registries": [{"server": "registry.invalid", "identity": "system",
+                                          "username": None, "passwordSecretRef": None}],
+                          "dapr": None, "identitySettings": []},
         "template": {"containers": [{"name": "worker", "image": "old"}]},
     }}
+    original = copy.deepcopy(resource)
     actual = copy.deepcopy(resource)
     containers = [{"name": "worker", "image": "new"}]
+    key, token = "SYNTHETIC-KEY", "SYNTHETIC-TOKEN"
+    monkeypatch.setattr(gap, "existing_webiq_key", lambda: key)
+    monkeypatch.setattr(gap.release, "azure", lambda *a, **k: {"accessToken": token})
     monkeypatch.setattr(gap.release, "active_executions", lambda *a: (copy.deepcopy(actual), []))
+    requests = []
+    if failed_receipt_write:
+        save_once = gap.release.save_once
 
-    def secure(work, config, value, before, payload):
-        assert payload["properties"]["configuration"] == {
-            **resource["properties"]["configuration"], "secrets": [{"name": "existing-gbbdemo"}],
+        def save(candidate, value):
+            if candidate == gap.path(state.work, "deploy-worker-failure"):
+                raise OSError("SYNTHETIC-PRIVATE-ERROR")
+            return save_once(candidate, value)
+
+        monkeypatch.setattr(gap.release, "save_once", save)
+
+    def transport(arguments, **kwargs):
+        encoded = next(line.removeprefix("data = ") for line in kwargs["input"].decode().splitlines()
+                       if line.startswith("data = "))
+        payload = json.loads(json.loads(encoded))
+        requests.append(copy.deepcopy(payload))
+        assert key not in repr(arguments) and token not in repr(arguments)
+        assert "--retry" in arguments and arguments[arguments.index("--retry") + 1] == "0"
+        submitted = payload["properties"]["configuration"]
+        # The 2024 API rejects a newer GET shape; GET-only metadata survives successful PATCHes.
+        response_status = 400 if {"identitySettings", "dapr"} & submitted.keys() else status
+        if response_status in (200, 202):
+            assert submitted["secrets"] == [{"name": "existing-gbbdemo", "value": key}]
+            actual["properties"]["configuration"].update(copy.deepcopy(submitted))
+            actual["properties"]["configuration"]["secrets"] = [{"name": "existing-gbbdemo"}]
+            for registry in actual["properties"]["configuration"]["registries"]:
+                registry.update(username=None, passwordSecretRef=None)
+            actual["properties"]["template"]["containers"] = copy.deepcopy(containers)
+        return SimpleNamespace(returncode=22 if response_status == 400 else 0,
+                               stdout=str(response_status).encode(), stderr=b"SYNTHETIC-PRIVATE-ERROR")
+
+    monkeypatch.setattr(gap.subprocess, "run", transport)
+    if status == 400:
+        with pytest.raises(gap.WorkerPatchFailure) as error:
+            gap.patch(state.work, config, decision, "deploy-worker", resource, containers,
+                      job=True, bind_existing_secret="existing-gbbdemo")
+        assert error.value.metadata() == {
+            "http_status": 400, "curl_returncode": 22, "phase": "worker_patch", "retry_permitted": False,
         }
-        assert "value" not in payload["properties"]["configuration"]["secrets"][0]
-        actual["properties"]["configuration"] = copy.deepcopy(payload["properties"]["configuration"])
-        actual["properties"]["template"]["containers"] = copy.deepcopy(containers)
-
-    monkeypatch.setattr(gap, "secure_worker_patch", secure)
-    gap.patch(state.work, {}, decision, "deploy-worker", resource, containers,
-              job=True, bind_existing_secret="existing-gbbdemo")
+        if failed_receipt_write:
+            assert not gap.path(state.work, "deploy-worker-failure").exists()
+            assert "SYNTHETIC" not in str(error.value) and error.value.__suppress_context__
+        else:
+            assert gap.receipt(state.work, "deploy-worker-failure", decision) == {
+                **gap.binding(decision), **error.value.metadata(), "observed_at": state.clock.isoformat(),
+            }
+        retained = {candidate.name: candidate.read_bytes() for candidate in state.work.glob("*.json")}
+        with pytest.raises(ValueError):
+            gap.patch(state.work, config, decision, "deploy-worker", resource, containers,
+                      job=True, bind_existing_secret="existing-gbbdemo")
+        assert {candidate.name: candidate.read_bytes() for candidate in state.work.glob("*.json")} == retained
+        assert actual == original
+    else:
+        gap.patch(state.work, config, decision, "deploy-worker", resource, containers,
+                  job=True, bind_existing_secret="existing-gbbdemo")
+        assert actual["properties"]["configuration"] == {
+            **original["properties"]["configuration"], "secrets": [{"name": "existing-gbbdemo"}],
+        }
+        assert actual["properties"]["template"]["containers"] == containers
+    assert resource == original and len(requests) == 1
+    redacted = gap.release.private_json(gap.path(state.work, "deploy-worker-patch"))
+    assert redacted["properties"]["configuration"] == {
+        **{key: value for key, value in original["properties"]["configuration"].items()
+           if key not in {"identitySettings", "dapr"} and value is not None},
+        "registries": [{"server": "registry.invalid", "identity": "system"}],
+        "secrets": [{"name": "existing-gbbdemo"}],
+    }
     intent = gap.receipt(state.work, "credential-binding", decision)
     assert intent["value_persisted_locally"] is False and intent["credential_created"] is False
     assert all(candidate.stat().st_mode & 0o777 == 0o600 for candidate in state.work.glob("*.json"))
+    assert all(b"SYNTHETIC-KEY" not in candidate.read_bytes()
+               and b"SYNTHETIC-TOKEN" not in candidate.read_bytes()
+               and b"SYNTHETIC-PRIVATE-ERROR" not in candidate.read_bytes()
+               for candidate in state.work.glob("*.json"))
+
+
+@pytest.mark.parametrize("invocation", ["api", "cli"])
+def test_close_resolves_published_images_after_partial_deployment_without_reopening(state, monkeypatch, invocation):
+    config = {"backend": "backend", "frontend": "frontend",
+              "backend_image": "original-target-backend", "frontend_image": "original-target-frontend"}
+    images = {"backend_image": "published-backend", "frontend_image": "retained-current-frontend"}
+    original_config = copy.deepcopy(config)
+    gap.path(state.work, "deployed").unlink()
+    gap.release.save_once(gap.path(state.work, "published"), {**gap.binding(state.decision), **images})
+    resources = {
+        name: {"id": name, "properties": {"configuration": {}, "template": {
+            "containers": [{"name": name, "image": images[name + "_image"], "env": []}],
+        }}} for name in ("backend", "frontend")
+    }
+    resources["frontend"]["properties"]["template"]["containers"][0]["env"] = [{"name": "OTHER", "value": "retained"}]
+    captured_frontend = gap.prior.shape(resources["frontend"])
+    captured_frontend["template"]["containers"][0]["env"][0]["secretRef"] = None
+    gap.release.save_once(gap.path(state.work, "deploy-attempt"), {
+        **gap.binding(state.decision), "frontend": captured_frontend,
+    })
+    state.clock += timedelta(seconds=7200)
+
+    def ready(current, kind):
+        assert current == {**config, **images}
+        state.calls.append(kind)
+        return copy.deepcopy(resources[kind])
+
+    monkeypatch.setattr(gap.release, "app", ready)
+    monkeypatch.setattr(gap.prior, "ready", ready)
+    monkeypatch.setattr(gap.release, "azure", lambda *a, **k: pytest.fail("No Azure transport"))
+    monkeypatch.setattr(gap.release, "active_executions", lambda *a: pytest.fail("No worker action during closure"))
+    monkeypatch.setattr(gap, "existing_webiq_key", lambda: pytest.fail("Closure must not read credentials"))
+    monkeypatch.setattr(gap, "validate", lambda *a: pytest.fail("Closure must not need a gate or readiness window"))
+    monkeypatch.setattr(gap, "patch", lambda *a, **k: pytest.fail("Already-closed processing must not be changed"))
+    monkeypatch.setattr(gap.prior, "root", lambda *a: state.work)
+    monkeypatch.setattr(gap.release, "load_config", lambda *a: copy.deepcopy(config))
+    decision_file = state.work / "synthetic-decision.json"
+    gap.release.save_once(decision_file, state.decision)
+    monkeypatch.setattr(sys, "argv", [
+        "scripts.gapfill_continuation", "close", "--work", str(state.work),
+        "--decision", str(decision_file), "--approve", "close",
+    ])
+    retained = {candidate.name: candidate.read_bytes() for candidate in state.work.glob("*.json")}
+    for attempt in range(2):
+        if invocation == "api":
+            gap.close(state.work, config, state.decision)
+        else:
+            gap.main()
+        if attempt == 0:
+            closed = gap.path(state.work, "closed").read_bytes()
+        assert gap.path(state.work, "closed").read_bytes() == closed
+    assert all((state.work / name).read_bytes() == value for name, value in retained.items())
+    assert config == original_config and state.calls == ["backend", "backend", "frontend"] * 2
+    assert not gap.path(state.work, "activation-attempt").exists()
+    assert not gap.path(state.work, "deployed").exists()
+
+
+def test_module_cli_help_requires_no_owner_configuration_or_credentials():
+    result = gap.subprocess.run(
+        [sys.executable, "-m", "scripts.gapfill_continuation", "--help"],
+        cwd=gap.release.ROOT, capture_output=True, timeout=30, check=False,
+    )
+    assert result.returncode == 0 and b"--work" in result.stdout and not result.stderr
+
+
+@pytest.mark.parametrize("expired_check", [None, 1, 2])
+@pytest.mark.parametrize("entrypoint", ["wrapper", "generic"])
+def test_secure_binding_reuses_explicit_owner_clock_without_old_namespace_or_receipt_writes(
+    state, monkeypatch, expired_check, entrypoint,
+):
+    config = {"subscription": "subscription", "tenant": "tenant", "group": "group", "job": "worker"}
+    resource = {"id": "/subscriptions/subscription/resourceGroups/group/providers/Microsoft.App/jobs/worker"}
+    payload = {"properties": {"configuration": {"replicaTimeout": 600, "triggerType": "Manual",
+                                               "secrets": [{"name": "existing-gbbdemo"}]}}}
+    original = copy.deepcopy(payload)
+    retained = {candidate.name: candidate.read_bytes() for candidate in state.work.glob("*.json")}
+    events = []
+
+    def check_window():
+        events.append("window")
+        if events.count("window") == expired_check:
+            raise ValueError("New scope expired")
+
+    def key():
+        events.append("key")
+        return "SYNTHETIC-KEY"
+
+    def token(*args, **kwargs):
+        events.append("token")
+        return {"accessToken": "SYNTHETIC-TOKEN"}
+
+    def transport(*args, **kwargs):
+        events.append("patch")
+        return SimpleNamespace(returncode=0, stdout=b"200", stderr=b"")
+
+    monkeypatch.setattr(gap, "window", lambda *a, **k: pytest.fail("Old gapfill namespace must not be read"))
+    monkeypatch.setattr(gap, "existing_webiq_key", key)
+    monkeypatch.setattr(gap.release, "azure", token)
+    monkeypatch.setattr(gap.subprocess, "run", transport)
+    def send():
+        if entrypoint == "generic":
+            return gap.send_existing_secret_patch(
+                config, resource, payload, secret_ref=state.decision["webiq_secret_ref"], check_window=check_window,
+            )
+        return gap.secure_worker_patch(state.work, config, state.decision, resource, payload, check_window=check_window)
+    if expired_check is not None:
+        with pytest.raises(ValueError):
+            send()
+        assert events == (["window"] if expired_check == 1 else ["window", "key", "token", "window"])
+    else:
+        send()
+        assert events == ["window", "key", "token", "window", "patch"]
+    assert payload == original
+    assert {candidate.name: candidate.read_bytes() for candidate in state.work.glob("*.json")} == retained
