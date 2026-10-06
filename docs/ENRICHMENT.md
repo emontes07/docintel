@@ -102,6 +102,17 @@ include the complete system/user payload, response schema, 4,096 framing
 allowance and 2,048 output allowance per request. Smaller evidence presentation
 does not establish that the cumulative PDF and vendor-tier requests fit.
 
+The opt-in `tests/test_private_pdf_rows.py` gate uses existing private, hash-bound
+inputs via `DOCINTEL_TEST_PDF_ROWS_WORK` and `DOCINTEL_TEST_PDF_ROWS_DOCUMENTS`.
+Set `DOCINTEL_TEST_PDF_ROWS_REQUIRE_COMMITTED=true` and a new
+`DOCINTEL_TEST_PDF_ROWS_OUTPUT` filename prefix to retain exact-source private
+receipts. It checks the real cascade payloads, supplied-response verification,
+original export locators, isolated stale-state reconciliation, and the unchanged
+production reservation guard. A passing test can deliberately report `NO_GO`.
+Its verifier-only workbook is not a live enrichment result, budget approval,
+hosted reconciliation, or evidence of model accuracy. Customer fixtures and
+outputs must never be supplied to public Git or CI.
+
 `--reviews` imports separate `ReviewDecision` records with attribute, decision,
 reviewer, timestamp, and reason. Approval selects `candidate_index`; correction
 supplies `corrected_value` and the definition's unit where applicable. Rejection
