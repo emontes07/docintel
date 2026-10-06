@@ -851,6 +851,104 @@ release-helper-only correction can retain the exact previously validated
 application source and build context; it does not create readiness or authorize
 another execution.
 
+#### One Append-Only PDF-Row Successor
+
+`scripts/row_continuation.py` is a separate, single-use operator path. It leaves
+the historical `final_continuation.py` workflow and all three earlier worker
+attempts/publications untouched. Its immutable application baseline is
+`34fd22e13056ef8fea01cc073a573e9f395a6796`. The selected merged successor must
+change only the approved guard, this helper, their focused tests and related
+documentation; extraction, prompts, evidence presentation and frontend code
+cannot change. Passing CI or running `--help` does not grant live authority.
+
+All receipts remain under the original owner-only release root, using
+`row-rerun-*.json` and the `row-rerun-v1` source/build child. The existing root
+pin, original approval and ledger are never replaced. Preparation pins every
+historical JSON receipt outside source/context trees. The unchanged consumption
+must remain three executions, seven inference reservations, 165722 reserved input
+tokens and 14336 reserved output tokens. The amendment adds exactly 57868 input
+tokens to the original 200000 ceiling (257868 effective ceiling), one 600-second
+server-limited execution, at most four inference calls and 8192 further output
+tokens. No analysis, external retrieval, SharePoint, Ford or second worker start
+is authorized.
+
+**Local prerequisites and receipt contract.** `prepare --revision MERGED_SHA`
+exports the exact successor and writes the append-only baseline; it performs no
+Azure operations and starts no clock. Retain the usual exact-source clean,
+backend/frontend smoke and merged-main `ci.json` receipts in `row-rerun-v1`.
+The approved private decision uses the fields in `DECISION_FIELDS` and references
+three owner-only, root-confined JSON files by basename and raw SHA-256:
+
+* `snapshot_file` / `snapshot_sha256`: a verified post-closure snapshot with
+  `temporary_processing_closed: true`, `active_executions: 0`, the exact
+  `consumption` above, and canonical `ledger_sha256` /
+  `prior_final_audit_sha256`.
+* `reconciliation_file` / `reconciliation_sha256`: verified, `status_only: true`,
+  bound to `snapshot_sha256`, the identical consumption/ledger/final-audit
+  hashes, and `object_sha256` (hosted object-key to raw-byte digest).
+* `gate_file` / `gate_sha256`: a successful no-live-operations private gate bound
+  to decision target/approval/history/source/snapshot/reconciliation/scope hashes,
+  every named `GATE_CHECKS` entry true, and `amendment_scope` matching the backend
+  `ROW_RERUN_FIELDS` except the four readiness/activation timestamps.
+  `remote_object_sha256` must equal the reconciled `object_sha256`; it includes
+  the original approval, ledger, batch, selected items, final-attempt audit,
+  cached documents, every existing immutable result, and the applied
+  interrupted-reconciliation audit. Missing historical attempt results remain
+  explicitly `null` in the amendment result map and are checked for absence.
+
+The separately approved status-only row-3 reconciliation is performed by the
+operator using `backend/interrupted_reconciliation.py`, **not by this helper**,
+only after merged-source CI and the preliminary offline private gate pass.
+Capture its actual applied audit and unchanged ledger, then seal the final
+private gate/amendment scope against those real raw-byte hashes. These final
+receipts must exist before `check`/`ready`: the helper cannot infer a stopped
+worker, fabricate reconciliation, or reuse hypothetical item hashes. This
+ordering also leaves the readiness clock unstarted during reconciliation.
+
+The gate records `planned_input_tokens: 89596`,
+`full_fallthrough_input_tokens: 92146`, `full_output_tokens: 8192`,
+`maximum_direct_microdollars: 726132`, `verified_rates` matching helper `RATES`,
+`incidentals_disclosure_only: true`, and `historical_forecasts_stacked: false`.
+The $0.726132 maximum direct envelope uses two 2-vCPU/900-second builds, one
+1-vCPU/2-GiB/600-second worker and all four full-fallthrough model reservations.
+Observed incidentals are disclosed separately, not stacked historical forecasts.
+The new incremental operating allowance is exactly $5, not a cloud billing cap.
+
+After the final local prerequisites pass, the following commands describe the
+operator sequence; they require explicit separate live approval and the actual
+private `$WORK`, `$CFG` and `$ROW_DECISION` paths:
+
+```sh
+python scripts/row_continuation.py check --work "$WORK" --config "$CFG" --decision "$ROW_DECISION"
+python scripts/row_continuation.py ready --work "$WORK" --config "$CFG" --decision "$ROW_DECISION" --approve ready
+python scripts/row_continuation.py publish --work "$WORK" --config "$CFG" --decision "$ROW_DECISION" --approve publish
+python scripts/row_continuation.py deploy --work "$WORK" --config "$CFG" --decision "$ROW_DECISION" --approve deploy
+python scripts/row_continuation.py activate --work "$WORK" --config "$CFG" --decision "$ROW_DECISION" --approve activate
+```
+
+`ready` creates the immutable 45-minute publication / 90-minute operating clock
+once, only after the prior final operating window has expired, and checks
+committed, staged and running helper/publisher bytes. Publication
+uses the existing corrected upload/publisher, backend then frontend; each upload
+and submission requires a full 900 seconds remaining. Failed/unknown submissions
+remain consumed without retry. Deployment changes only images on the existing
+API, manual worker and frontend while checking runtime/authentication identity.
+Only after both app revisions are ready does the at-most-20-minute activation
+window begin, clipped to the overall deadline. A full 600 seconds must still
+remain at the single fourth-worker start.
+
+The amendment is installed at `configuration/real-pilot-row-rerun.json` using
+the backend's read-only validator and batch/budget leases; original ledger and
+results are not reset. Telemetry failure (including missing console markers),
+unknown usage and overbudget observations produce sanitized, append-only
+warnings and never stop or prematurely close the worker. There is **no local
+600-second observation deadline**: that hard worker timeout remains server-side.
+Only actual terminal worker status or independent authorization-window expiry
+ends observation; expiry may stop only that reserved execution. Activation
+always restores its temporary API settings, including on failed/unknown control
+operations. Receipts prevent second activation, publication, configuration or
+worker starts; any uncertain outcome requires inspection, not regenerated state.
+
 The existing PDF request still selects `pages="1-5"` with a 120-second polling
 bound. Offline SDK tests verify those arguments, not server handling when a PDF
 has fewer pages. No undocumented out-of-range acceptance is assumed and no

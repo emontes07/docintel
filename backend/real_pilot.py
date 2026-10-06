@@ -90,11 +90,21 @@ RECOVERY_KEY = "configuration/real-pilot-recovery.json"
 RECOVERY_AUDIT_KEY = "operations/real-pilot-recovery.json"
 FINAL_RERUN_KEY = "configuration/real-pilot-final-rerun.json"
 FINAL_RERUN_AUDIT_KEY = "operations/real-pilot-final-rerun.json"
+ROW_RERUN_KEY = "configuration/real-pilot-row-rerun.json"
+ROW_RERUN_AUDIT_KEY = "operations/real-pilot-row-rerun.json"
 FINAL_RERUN_FIELDS = {
     "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
     "ledger_sha256", "prior_recovery_sha256", "prior_execution_ids",
     "selected_item_keys", "item_sha256", "result_sha256", "cached_documents",
     "readiness_at", "operating_expires_at", "not_before", "expires_at",
+}
+ROW_RERUN_FIELDS = {
+    "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
+    "ledger_sha256", "prior_final_rerun_sha256", "prior_final_audit_sha256",
+    "prior_execution_ids", "selected_item_keys", "item_sha256", "result_sha256",
+    "cached_documents", "additional_input_tokens", "effective_input_ceiling",
+    "max_requests", "max_output_tokens", "readiness_at", "operating_expires_at",
+    "not_before", "expires_at",
 }
 RECOVERY_FIELDS = {
     "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
@@ -265,6 +275,29 @@ def validate_final_rerun(amendment, approval, batch, ledger, store):
     return copy.deepcopy(checker.final_rerun)
 
 
+def validate_row_rerun(amendment, approval, batch, ledger, store):
+    """Verify the append-only row-rerun exception without changing any record."""
+    class ReadOnlyCandidate:
+        def read_bytes(self, key):
+            if key == ROW_RERUN_KEY:
+                return json.dumps(amendment).encode(), None
+            return store.read_bytes(key)
+
+    if (_sha256(read_json(store, APPROVAL_KEY)[0]) != _sha256(approval)
+            or _sha256(read_json(store, BUDGET_KEY)[0]) != _sha256(ledger)
+            or ledger.get("approval_sha256") != _sha256(approval)
+            or ledger.get("invalidated")):
+        raise ValueError("Row rerun original approval or consumption binding changed")
+    checker = RealPilotGuard.__new__(RealPilotGuard)
+    checker.store, checker.batch = ReadOnlyCandidate(), copy.deepcopy(batch)
+    try:
+        checker._validate_approval(approval, verify_runtime=False)
+        checker.verify_recovery(ledger)
+    except (KeyError, TypeError, AttributeError):
+        raise ValueError("Incomplete or malformed row rerun prerequisite") from None
+    return copy.deepcopy(checker.row_rerun)
+
+
 class RealPilotGuard:
     def __init__(self, store, batch_record):
         self.store = store
@@ -290,7 +323,7 @@ class RealPilotGuard:
 
     @property
     def active_recovery(self):
-        return self.final_rerun or self.recovery
+        return self.row_rerun or self.final_rerun or self.recovery
 
     def result_key(self, item_key):
         root = f"results/{self.batch['id']}/{item_key}"
@@ -336,6 +369,117 @@ class RealPilotGuard:
                 or not ready <= start < end <= deadline):
             raise ValueError("Final rerun activation must fit the readiness-anchored 90-minute operating window")
         return amendment
+
+    def _row_rerun(self, approval):
+        try:
+            raw, _ = self.store.read_bytes(ROW_RERUN_KEY)
+        except Missing:
+            return None
+        if len(raw) > 65536:
+            raise ValueError("Row rerun exceeds its metadata bound")
+        amendment = json.loads(raw)
+        if not isinstance(amendment, dict) or set(amendment) != ROW_RERUN_FIELDS:
+            raise ValueError("Row rerun schema mismatch")
+        if (self.final_rerun is None or type(amendment["schema_version"]) is not int
+                or amendment["schema_version"] != 1 or amendment["approved"] is not True
+                or amendment["approved_by"] != approval["approved_by"]
+                or amendment["approval_sha256"] != _sha256(approval)
+                or amendment["batch_sha256"] != approval["batch_sha256"]
+                or amendment["prior_final_rerun_sha256"] != _sha256(self.final_rerun)
+                or amendment["selected_item_keys"] != self.final_rerun["selected_item_keys"]
+                or amendment["cached_documents"] != self.final_rerun["cached_documents"]
+                or approval_scope(approval) != "internal_only"
+                or approval["limits"]["input_tokens"] != 200000
+                or approval["limits"]["inference"] != 16
+                or approval["limits"]["output_tokens"] != 32768):
+            raise ValueError("Row rerun must preserve the original approval and selected cached workload")
+        grants = {
+            "additional_input_tokens": 57868, "effective_input_ceiling": 257868,
+            "max_requests": 4, "max_output_tokens": 8192,
+        }
+        if any(type(amendment[name]) is not int or amendment[name] != value for name, value in grants.items()):
+            raise ValueError("Row rerun requires exactly the authorized bounded exception")
+        prior = amendment["prior_execution_ids"]
+        if (not isinstance(prior, list) or len(prior) != 3 or len(set(prior)) != 3
+                or not isinstance(amendment["item_sha256"], dict)
+                or set(amendment["item_sha256"]) != set(amendment["selected_item_keys"])
+                or not isinstance(amendment["result_sha256"], dict)):
+            raise ValueError("Row rerun requires three consumed executions and exact history bindings")
+        hashes = [amendment["ledger_sha256"], amendment["prior_final_audit_sha256"],
+                  *prior, *amendment["item_sha256"].values(),
+                  *(value for value in amendment["result_sha256"].values() if value is not None)]
+        if not all(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) for value in hashes):
+            raise ValueError("Row rerun requires exact SHA-256 bindings")
+        prior_audit, _ = read_json(self.store, FINAL_RERUN_AUDIT_KEY)
+        if (_sha256(prior_audit) != amendment["prior_final_audit_sha256"]
+                or prior_audit.get("amendment_sha256") != amendment["prior_final_rerun_sha256"]
+                or prior_audit.get("execution_id") not in prior):
+            raise ValueError("Row rerun prior final-attempt audit changed")
+        ready, deadline = (_timestamp(amendment[name]) for name in ("readiness_at", "operating_expires_at"))
+        start, end = (_timestamp(amendment[name]) for name in ("not_before", "expires_at"))
+        if ((deadline - ready).total_seconds() != 5400
+                or ready < _timestamp(self.final_rerun["operating_expires_at"])
+                or not ready <= start < end <= deadline):
+            raise ValueError("Row rerun must follow the prior window and fit its readiness-anchored 90 minutes")
+        return amendment
+
+    def _row_states(self):
+        states, results = {}, {}
+        amendment = self.row_rerun
+        for item in self.batch["items"]:
+            key = item["item_key"]
+            raw, version = self.store.read_bytes(f"items/{self.batch['id']}/{key}.json")
+            state = json.loads(raw)
+            if key not in amendment["selected_item_keys"]:
+                if state.get("state") != "deferred":
+                    raise ValueError("Row rerun must leave other products deferred")
+                continue
+            if (hashlib.sha256(raw).hexdigest() != amendment["item_sha256"][key]
+                    or state.get("state") not in {"unresolved", "interrupted"}
+                    or state.get("recovery_sha256") != amendment["prior_final_rerun_sha256"]):
+                raise ValueError("Row rerun requires the exact stopped, reconciled item history")
+            if state["state"] == "interrupted":
+                prior_audit, _ = read_json(self.store, FINAL_RERUN_AUDIT_KEY)
+                execution = prior_audit["execution_id"]
+                audit_key = f"operations/interrupted-reconciliation/{self.batch['id']}/{key}/{execution}.json"
+                interruption = state.get("interruption", {})
+                audit_raw, _ = self.store.read_bytes(audit_key)
+                applied, _ = read_json(self.store, audit_key.removesuffix(".json") + ".applied.json")
+                if (interruption.get("audit_key") != audit_key or interruption.get("execution_id") != execution
+                        or applied.get("kind") != "interrupted_reconciliation_applied"
+                        or applied.get("execution_id") != execution
+                        or applied.get("audit_sha256") != _sha256(json.loads(audit_raw))
+                        or applied.get("records", {}).get("item", {}).get("sha256") != hashlib.sha256(raw).hexdigest()):
+                    raise ValueError("Row rerun requires the preserved applied stopped-state reconciliation")
+            root = f"results/{self.batch['id']}/{key}"
+            previous = state
+            depth = 0
+            while previous is not None:
+                if not isinstance(previous, dict) or depth >= 32:
+                    raise ValueError("Row rerun item history is malformed or exceeds its bound")
+                result_key = previous.get("result_key") or root + ".json"
+                if not isinstance(result_key, str) or not (
+                    result_key == root + ".json"
+                    or re.fullmatch(re.escape(root) + r"/attempts/[a-f0-9]{64}\.json", result_key)
+                ):
+                    raise ValueError("Row rerun history references an unrelated result")
+                try:
+                    result, _ = self.store.read_bytes(result_key)
+                    results[result_key] = hashlib.sha256(result).hexdigest()
+                except Missing:
+                    results[result_key] = None
+                previous = previous.get("previous_attempt")
+                depth += 1
+            future = f"{root}/attempts/{_sha256(amendment)}.json"
+            try:
+                self.store.read_bytes(future)
+            except Missing:
+                states[key] = (raw, version)
+                continue
+            raise Conflict("Row rerun result already exists; no automatic retry")
+        if results != amendment["result_sha256"] or not any(value is not None for value in results.values()):
+            raise ValueError("Row rerun immutable result history changed")
+        return states
 
     def _final_states(self):
         states = {}
@@ -443,6 +587,24 @@ class RealPilotGuard:
 
     def verify_recovery(self, ledger):
         """Read-only preflight; no new allowance, recovery write or service call."""
+        if self.row_rerun is not None:
+            amendment = self.row_rerun
+            if (_sha256(ledger) != amendment["ledger_sha256"]
+                    or list(ledger["executions"]) != amendment["prior_execution_ids"]
+                    or ledger["attempted"]["inference"] != 7
+                    or ledger["reserved"]["input_tokens"] != 165722
+                    or ledger["reserved"]["output_tokens"] != 14336
+                    or ledger.get("final_rerun", {}).get("sha256") != amendment["prior_final_rerun_sha256"]
+                    or ledger.get("row_rerun")):
+                raise ValueError("Row rerun requires unchanged consumed reservations and prior executions")
+            for key in amendment["cached_documents"]:
+                self.check_recovery_cache(key)
+            self._row_states()
+            try:
+                self.store.read_bytes(ROW_RERUN_AUDIT_KEY)
+            except Missing:
+                return
+            raise Conflict("Row rerun already attempted; no automatic retry")
         if self.final_rerun is not None:
             amendment = self.final_rerun
             if (_sha256(ledger) != amendment["ledger_sha256"]
@@ -487,6 +649,29 @@ class RealPilotGuard:
             return
         with self._mutex, self.store.lease(BUDGET_KEY):
             _, ledger, _ = self._fresh_ledger()
+            if self.row_rerun is not None:
+                if ledger.get("row_rerun", {}).get("execution_id") != self._execution_id:
+                    raise Conflict("Row rerun execution exception is not reserved")
+                states = self._row_states()
+                fence()
+                write_json(self.store, ROW_RERUN_AUDIT_KEY, {
+                    "amendment": self.row_rerun, "amendment_sha256": self.recovery_sha256,
+                    "execution_id": self._execution_id, "recorded_at": _now().isoformat(),
+                    "prior_states": {
+                        key: {"base64": base64.b64encode(raw).decode(), "version": version}
+                        for key, (raw, version) in states.items()
+                    },
+                    "prior_result_sha256": self.row_rerun["result_sha256"],
+                    "prior_final_audit_sha256": self.row_rerun["prior_final_audit_sha256"],
+                })
+                for key, (raw, version) in states.items():
+                    fence()
+                    write_json(self.store, f"items/{self.batch['id']}/{key}.json", {
+                        "id": key, "batch_id": self.batch["id"], "state": "recovery_ready",
+                        "requested_mode": "real_pilot", "recovery_sha256": self.recovery_sha256,
+                        "result_key": self.result_key(key), "previous_attempt": json.loads(raw),
+                    }, version)
+                return
             if self.final_rerun is not None:
                 if ledger.get("final_rerun", {}).get("execution_id") != self._execution_id:
                     raise Conflict("Final rerun execution exception is not reserved")
@@ -580,6 +765,7 @@ class RealPilotGuard:
             raise ValueError("Real-pilot approving operator is not server-verified")
         self.recovery = self._recovery(approval)
         self.final_rerun = self._final_rerun(approval)
+        self.row_rerun = self._row_rerun(approval)
         window = self.active_recovery or approval
         original_start, original_end = _timestamp(approval["not_before"]), _timestamp(approval["expires_at"])
         if self.recovery is not None and not 0 < (original_end - original_start).total_seconds() <= 1200:
@@ -712,6 +898,8 @@ class RealPilotGuard:
             raise ValueError("Real-pilot recovery changed after budget use")
         if ledger.get("final_rerun") and ledger["final_rerun"]["sha256"] != _sha256(self.final_rerun):
             raise ValueError("Final rerun changed after budget use")
+        if ledger.get("row_rerun") and ledger["row_rerun"]["sha256"] != _sha256(self.row_rerun):
+            raise ValueError("Row rerun changed after budget use")
 
     def _fresh_ledger(self):
         try:
@@ -763,14 +951,26 @@ class RealPilotGuard:
                 raise ValueError("Worker must explicitly select real_pilot mode")
             if key in ledger["executions"]:
                 raise Conflict("Real-pilot execution already attempted; no automatic retry")
-            limit = approval["limits"]["executions"] + (1 if self.final_rerun else 0)
+            limit = approval["limits"]["executions"] + (1 if self.final_rerun else 0) + (1 if self.row_rerun else 0)
             if len(ledger["executions"]) >= limit:
                 raise ValueError("Real-pilot execution budget exhausted")
             self.verify_recovery(ledger)
-            if self.final_rerun and (_timestamp(self.final_rerun["expires_at"]) - _now()).total_seconds() < 600:
+            if self.final_rerun and (_timestamp(self.active_recovery["expires_at"]) - _now()).total_seconds() < 600:
                 raise ValueError("Final rerun requires the full 600-second execution window")
             ledger["executions"][key] = {"started_at": _now().isoformat()}
-            if self.final_rerun is not None:
+            if self.row_rerun is not None:
+                ledger["row_rerun"] = {
+                    "sha256": self.recovery_sha256, "execution_id": key,
+                    "baseline_sha256": self.row_rerun["ledger_sha256"],
+                    "inference_before": ledger["attempted"]["inference"],
+                    "input_before": ledger["reserved"]["input_tokens"],
+                    "output_before": ledger["reserved"]["output_tokens"],
+                    "not_before": self.row_rerun["not_before"], "expires_at": self.row_rerun["expires_at"],
+                    "selected_item_keys": self.row_rerun["selected_item_keys"],
+                    "additional_execution_exception": 1, "additional_input_tokens": 57868,
+                    "effective_input_ceiling": 257868,
+                }
+            elif self.final_rerun is not None:
                 ledger["final_rerun"] = {
                     "sha256": self.recovery_sha256, "execution_id": key,
                     "baseline_sha256": self.final_rerun["ledger_sha256"],
@@ -849,14 +1049,22 @@ class RealPilotGuard:
                     raise ValueError("Recovery permits only selected-item inference; new analysis is forbidden")
                 if max_input_tokens + max_output_tokens > 30000:
                     raise RealPilotBudgetExceeded("recovery_request_tokens", max_input_tokens + max_output_tokens, 30000)
-                baseline = ledger.get("final_rerun", {}).get("inference_before", 0) if self.final_rerun else 0
+                active = "row_rerun" if self.row_rerun else "final_rerun"
+                baseline = ledger.get(active, {}).get("inference_before", 0) if self.final_rerun else 0
                 if ledger["attempted"]["inference"] >= baseline + 4:
                     raise RealPilotBudgetExceeded("recovery_inference", 1, 0)
             if self._execution_id not in ledger["executions"]:
                 raise Conflict("Real-pilot worker execution is not reserved")
             if key in ledger["reservations"]:
                 raise Conflict("Real-pilot operation already attempted; no automatic retry")
-            limits = approval["limits"]
+            limits = dict(approval["limits"])
+            if self.row_rerun is not None:
+                limits["input_tokens"] = self.row_rerun["effective_input_ceiling"]
+                available_output = self.row_rerun["max_output_tokens"] - (
+                    ledger["reserved"]["output_tokens"] - ledger["row_rerun"]["output_before"]
+                )
+                if max_output_tokens > available_output:
+                    raise RealPilotBudgetExceeded("row_rerun_output_tokens", max_output_tokens, available_output)
             if ledger["attempted"][operation] >= limits[operation]:
                 raise RealPilotBudgetExceeded(operation, 1, limits[operation] - ledger["attempted"][operation])
             usage = {"input_tokens": max_input_tokens, "output_tokens": max_output_tokens, "analysis_pages": analysis_pages}
@@ -936,4 +1144,6 @@ class RealPilotGuard:
             output["recovery"] = ledger["recovery"]
         if ledger.get("final_rerun"):
             output["final_rerun"] = ledger["final_rerun"]
+        if ledger.get("row_rerun"):
+            output["row_rerun"] = ledger["row_rerun"]
         return copy.deepcopy(output)
