@@ -7,6 +7,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
@@ -102,6 +103,38 @@ def _location(locator: str) -> str:
                      if key in allowed and value.isascii() and value.isdecimal())
 
 
+def _candidate_location(candidate: Candidate, evidence: Evidence) -> str:
+    location = _location(evidence.source_locator)
+    if evidence.source_tier != "vendor_table":
+        return location
+    try:
+        row = json.loads(evidence.text)
+    except json.JSONDecodeError:
+        return "; ".join(filter(None, (location, "cell details unavailable")))
+    cells = row.get("cells", []) if isinstance(row, dict) else []
+    quote = candidate.supporting_quote.strip()
+    if len(quote) >= 2 and quote[0] == quote[-1] and quote[0] in "\"'":
+        quote = quote[1:-1]
+
+    def normalized(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+    quote = normalized(quote)
+    matched: list[str] = []
+    for cell in cells if isinstance(cells, list) else []:
+        if not isinstance(cell, dict):
+            continue
+        name = cell.get("cell")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}", name):
+            continue
+        value = cell.get("value")
+        if isinstance(value, (str, int, float, bool)) and quote and quote in normalized(str(value)):
+            matched.append(name)
+    # Legacy candidates cite a row; these are quote matches, not invented cell citations.
+    detail = "quote matched cells " + ", ".join(dict.fromkeys(matched)) if matched else "row-level citation"
+    return "; ".join(filter(None, (location, detail)))
+
+
 @dataclass
 class _PresentationResult:
     manifest: Manifest
@@ -168,7 +201,7 @@ def _build_package(
                     applicability.append(scope)
                     evidence_rows.append([
                         product.item_id, product.mpn, attribute.attribute_id,
-                        _display(candidate.value), _display(candidate.unit), label, evidence.source_tier, _location(evidence.source_locator),
+                        _display(candidate.value), _display(candidate.unit), label, evidence.source_tier, _candidate_location(candidate, evidence),
                         _display(candidate.supporting_quote), url, date, scope, candidate.evidence_basis,
                     ])
             review = attribute.review

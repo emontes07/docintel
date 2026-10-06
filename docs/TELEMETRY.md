@@ -210,3 +210,13 @@ The 20-item test is bounded to 40 synthetic completion invocations and verifies
 deliberately lack usage: both result summary and export retain unknown complete
 totals/cost, explicitly known subtotals of 420 input / 140 output tokens, and
 separate reservations of 40,000 input / 81,920 output units.
+## Vendor quotation locations
+
+Reviewer evidence retains the cited row and, for structured vendor rows, displays
+the cells containing the complete supporting quotation after Unicode, case and
+whitespace normalization. Surrounding quotation marks are removed only for this
+display match. These are labeled **quote matched cells**, not represented as
+additional model-supplied citations. Multiple matching cells are all shown.
+Without an exact cell match, the location remains explicitly row-level; unavailable
+cell metadata is identified. Values, grounding decisions and original results are
+unchanged.

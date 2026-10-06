@@ -341,6 +341,31 @@ def test_reviewer_internal_locator_coordinates_are_preserved_without_private_pat
     assert "private/customer" not in json.dumps(row)
 
 
+@pytest.mark.parametrize(("quote", "location"), [
+    ('"LOW LEAD BRASS"', "row 7; quote matched cells D7, F7"),
+    ('"3/4" COPPER SERVICE INLET"', "row 7; quote matched cells E7"),
+    ("Paraphrased material description", "row 7; row-level citation"),
+])
+def test_reviewer_vendor_quote_matched_cells_are_precise(quote, location):
+    result = result_for_review()
+    evidence = result.evidence[0]
+    evidence.source_tier = "vendor_table"
+    evidence.source_locator = "batchblob:///private/customer/table.xlsx#row=7&cells=C7,D7,E7,F7"
+    evidence.text = json.dumps({"sheet": "Vendor", "row": 7, "cells": [
+        {"cell": "C7", "column": "Part", "value": "SYN-001"},
+        {"cell": "D7", "column": "Material", "value": "Low  lead brass"},
+        {"cell": "E7", "column": "Connection", "value": '3/4" COPPER SERVICE INLET'},
+        {"cell": "F7", "column": "Description", "value": "LOW LEAD BRASS"},
+    ]})
+    result.attributes[0].candidates[0].supporting_quote = quote
+    before = result.model_dump_json()
+    row = read_workbook(build_reviewer_package([result]).workbook)["Evidence"][0]
+    assert row["Location"] == location
+    assert row["Quote"] == quote
+    assert "private/customer" not in json.dumps(row)
+    assert result.model_dump_json() == before
+
+
 def test_telemetry_source_failure_is_recorded_without_model_or_retry():
     from backend.models.enrichment import OfflineSource
 
