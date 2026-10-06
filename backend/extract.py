@@ -11,10 +11,11 @@ from pydantic import ValidationError
 
 from backend.core.instructions import product_extraction_system_message
 from backend.core.llm import LLMClient, LLMSchemaValidationError
-from backend.evidence_verification import Fragment, match_text, normalized, reconstructed_rows, value_windows, windows
+from backend.evidence_verification import Fragment, match_quote, match_text, normalized, value_windows, windows
 from backend.models.enrichment import (
-    AttributeResult, EnrichmentResult, Evidence, ExtractionResponse, Manifest,
+    AttributeResult, Candidate, EnrichmentResult, Evidence, EvidenceMatch, ExtractionResponse, Manifest,
     EvidenceVerification, InferenceFailure, LiveBundle, OfflineBundle, OfflineSource, RetrievalOutcome, ReviewDecision,
+    LEAD_FREE_DESCRIPTION_RULE, is_lead_free_attribute,
 )
 from backend.real_pilot import RealPilotBudgetExceeded
 from backend.pdf_presentation import pdf_items
@@ -153,6 +154,126 @@ def source_evidence(source: OfflineSource, observed_at: datetime) -> list[Eviden
     return evidence
 
 
+_LEAD_DESCRIPTION = r"(?:low lead|lead free|no lead)"
+_PRODUCT_DESCRIPTION = re.compile(
+    rf"\b(?:{_LEAD_DESCRIPTION} "
+    r"(?:(?:brass|bronze|copper|angle|ball|gate|check|stop|quarter turn|full port) ){0,6}"
+    r"(?:valve|product)"
+    rf"|(?:valve|product) (?:is |made of )?{_LEAD_DESCRIPTION})\b"
+)
+_UNSAFE_DESCRIPTION = re.compile(
+    r"\b(?:not|no|non|without|never|neither|nor|cannot|isn|isnt|isn't|aren|arent|doesn|doesnt|"
+    r"or|either|optional|option|options|may|might|could|if|unless|except|excluding|"
+    r"available|availability|alternative|alternatives|variant|variants|family|series|"
+    r"separate|separately|sold|recommended|recommend|use|install|select|choose|"
+    r"other|another|includes|include|contains|incorporates|compatible|compatibility|"
+    r"like|ish|almost|assumed|alleged|purported|claim|claims|"
+    r"only|component|components|body|bodies|stem|stems|seat|seats|seal|seals|"
+    r"ring|rings|washer|washers|handle|handles|coating|coatings|solder|"
+    r"kit|kits|accessory|accessories|replacement|replacements|"
+    r"example|examples|requirement|requirements|required|requires|should|must|"
+    r"nsf\d*|ansi\d*|certified|certification|certifications|certify|compliant|compliance|"
+    r"meets|approved|standard|standards|ab1953|s372|astm)\b"
+)
+_AMBIGUOUS_APPLICABILITY = re.compile(
+    r"\b(?:family (?:scope|only|level|applicability)|alternative variant|"
+    r"component (?:scope|only|material|description))\b"
+)
+
+
+def _boolean_answer(tokens: list[str], label: list[str], value: bool) -> bool:
+    answers = ("true", "yes") if value else ("false", "no")
+    return any(
+        tokens[offset:offset + len(label) + 1] == label + [answer]
+        for offset in range(len(tokens)) for answer in answers
+    )
+
+
+def _safe_description(text: str) -> bool:
+    semantic = " ".join(normalized(text)[0])
+    # "No-lead" is the one approved positive phrase containing a negation word.
+    return not _UNSAFE_DESCRIPTION.search(re.sub(r"\bno lead\b(?! free\b)", "lead free", semantic))
+
+
+def _vendor_description_context(candidate: Candidate, evidence: list[Evidence], quote: EvidenceMatch | None) -> bool:
+    if (
+        quote is None or len(quote.evidence_ids) != 1 or len(quote.cells) != 1
+        or set(candidate.evidence_ids) != set(quote.evidence_ids)
+    ):
+        return False
+    entry = next(entry for entry in evidence if entry.evidence_id == quote.evidence_ids[0])
+    if entry.source_tier != "vendor_table" or not entry.text.lstrip().startswith("{"):
+        return False
+    cells = json.loads(entry.text)["cells"]
+    cell = next((cell for cell in cells if cell["cell"] == quote.cells[0]), None)
+    if cell is None or not isinstance(cell.get("column"), str):
+        return False
+    label = " ".join(normalized(cell["column"])[0])
+    if label not in {"description", "product description", "general description"} and not re.fullmatch(r"descrgen[1-9]\d*", label):
+        return False
+    # A general-description cell describes the exact matched product row. Other
+    # cells' size alternatives or hardware features do not scope its lead claim,
+    # but explicit component-row scope or another unsafe lead claim still does.
+    for other in cells:
+        heading = " ".join(normalized(other.get("column", ""))[0]) if isinstance(other.get("column"), str) else ""
+        if heading in {"component", "component name", "component type", "component description"}:
+            return False
+        text = " ".join(normalized(other["value"])[0])
+        if re.search(rf"\b{_LEAD_DESCRIPTION}\b", text) and not _safe_description(other["value"]):
+            return False
+    return _safe_description(cell["value"]) and bool(
+        re.search(rf"\b{_LEAD_DESCRIPTION}\b", " ".join(normalized(cell["value"])[0]))
+    )
+
+
+def _infer_lead_free(
+    candidate: Candidate, evidence: list[Evidence], spans: list[list[Fragment]],
+    quote: EvidenceMatch | None,
+) -> bool:
+    if (
+        candidate.value is not True or not is_lead_free_attribute(candidate.attribute_id)
+        or candidate.unit is not None or not candidate.supporting_quote
+        or not _safe_description(candidate.supporting_quote)
+        or not re.search(rf"\b{_LEAD_DESCRIPTION}\b", " ".join(normalized(candidate.supporting_quote)[0]))
+    ):
+        return False
+    eligible = {
+        entry.evidence_id for entry in evidence
+        if entry.content_kind == "source_excerpt"
+        and (entry.attribute_ids is None or candidate.attribute_id in entry.attribute_ids)
+    }
+    # Prefer a literal answer anywhere in eligible exact-product evidence. In
+    # particular, an uncited explicit False must not be overwritten by inference.
+    try:
+        eligible_spans = windows(evidence, eligible)
+    except ValueError:
+        return False
+    for span in eligible_spans:
+        tokens = normalized(" ".join(part.text for part in span))[0]
+        if any(_boolean_answer(tokens, ["lead", "free"], value) for value in (True, False)):
+            return False
+    for entry in evidence:
+        if entry.evidence_id in eligible and entry.source_tier == "vendor_table" and entry.text.lstrip().startswith("{"):
+            row = json.loads(entry.text)
+            if any(
+                is_lead_free_attribute(cell["column"])
+                and normalized(cell["value"])[0] in (["true"], ["yes"], ["false"], ["no"])
+                for cell in row["cells"] if isinstance(cell.get("column"), str)
+            ):
+                return False
+    cited = [entry for entry in evidence if entry.evidence_id in candidate.evidence_ids]
+    if any(_AMBIGUOUS_APPLICABILITY.search(" ".join(normalized(entry.qualification or "")[0])) for entry in cited):
+        return False
+    if _vendor_description_context(candidate, evidence, quote):
+        return True
+    texts = [" ".join(part.text for part in span) for span in spans]
+    # Inspect complete cited fragments, not just the model's cropped/reordered
+    # quote, so omitted negations, alternatives and component scope fail closed.
+    return all(_safe_description(text) for text in texts) and any(
+        _PRODUCT_DESCRIPTION.search(" ".join(normalized(text)[0])) for text in texts
+    )
+
+
 def validate_response(
     response: ExtractionResponse, manifest: Manifest, evidence: list[Evidence]
 ) -> list[EvidenceVerification]:
@@ -177,13 +298,33 @@ def validate_response(
                 raise invalid(f"{path}.evidence_ids[{offset}]", "Candidate exceeds the approved product/attribute applicability")
         try:
             spans = windows(evidence, set(candidate.evidence_ids))
-            row_spans = reconstructed_rows(evidence, set(candidate.evidence_ids))
             source_values = value_windows(evidence, set(candidate.evidence_ids))
+            quote_match = match_quote(candidate.supporting_quote, evidence, set(candidate.evidence_ids)) if candidate.supporting_quote is not None else None
         except ValueError as error:
             raise invalid(path + ".evidence_ids", str(error)) from error
-        quote_match = match_text(candidate.supporting_quote, row_spans + spans) if candidate.supporting_quote is not None else None
         if candidate.supporting_quote is not None and quote_match is None:
             raise invalid(path + ".supporting_quote", "Supporting quotation has no normalized match in cited evidence")
+        if type(candidate.value) is bool:
+            label = normalized(candidate.attribute_id)[0]
+            literal_boolean = bool(candidate.supporting_quote) and _boolean_answer(
+                normalized(candidate.supporting_quote or "")[0], label, candidate.value,
+            )
+            if not literal_boolean:
+                if not _infer_lead_free(candidate, evidence, spans, quote_match):
+                    raise invalid(path + ".supporting_quote", "Boolean proposals require an explicit labeled answer or the approved Lead-Free descriptive rule")
+                inferred = Candidate.model_validate({
+                    **candidate.model_dump(), "evidence_basis": "inferred_from_description",
+                    "inference_rule": LEAD_FREE_DESCRIPTION_RULE, "confidence": None,
+                    "qualification": "Exact-product description; product applicability must be reviewed.",
+                })
+                response.candidates[index] = inferred
+                verified.append(EvidenceVerification(
+                    quote=quote_match, value=None, evidence_basis=inferred.evidence_basis,
+                    inference_rule=inferred.inference_rule,
+                ))
+                continue
+        if candidate.evidence_basis != "literal" or candidate.inference_rule is not None:
+            raise invalid(path + ".evidence_basis", "Literal candidates must not carry descriptive inference metadata")
         literal = str(candidate.value)
         if isinstance(candidate.value, float) and candidate.value.is_integer():
             literal = str(int(candidate.value))
@@ -231,11 +372,7 @@ def validate_response(
             quote_tokens = normalized(candidate.supporting_quote)[0]
             label = normalized(candidate.attribute_id)[0]
             # Punctuation may vary, but a boolean still needs its explicit labeled answer.
-            answers = ("true", "yes") if candidate.value else ("false", "no")
-            if not any(
-                quote_tokens[offset:offset + len(label) + 1] == label + [answer]
-                for offset in range(len(quote_tokens)) for answer in answers
-            ):
+            if not _boolean_answer(quote_tokens, label, candidate.value):
                 raise invalid(path + ".supporting_quote", "Boolean proposals require an explicit labeled answer, not negation or missing evidence")
         verified.append(EvidenceVerification(quote=quote_match, value=value_match, unit=unit_match))
     return verified
@@ -368,8 +505,9 @@ def run_enrichment(
                         if not candidate.supporting_quote or not candidate.qualification or not candidate.qualification.strip():
                             field = "supporting_quote" if not candidate.supporting_quote else "qualification"
                             raise invalid(f"candidates[0].{field}", "Real proposals require quotations and applicability qualifications")
-                        checks = validate_response(ExtractionResponse(candidates=[candidate]), manifest, evidence)
-                        accepted.append(candidate)
+                        proposed = ExtractionResponse(candidates=[candidate])
+                        checks = validate_response(proposed, manifest, evidence)
+                        accepted.extend(proposed.candidates)
                         verification.extend(checks)
                     except ResponseValidationError as error:
                         invalid_attributes.add(candidate.attribute_id)

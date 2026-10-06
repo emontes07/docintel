@@ -7,7 +7,7 @@ from backend.models.enrichment import (
     AttributeDefinition, Candidate, Evidence, ExtractionResponse, Manifest,
     OfflineSource, ProductKey,
 )
-from backend.multisource import run_cascade
+from backend.multisource import OptionalTierSkipped, run_cascade
 
 
 @pytest.fixture(autouse=True)
@@ -174,6 +174,56 @@ def test_unqualified_response_is_not_a_real_proposal(manifest):
     )
     assert not result.attributes[0].candidates
     assert result.extraction_error == "invalid_response"
+
+
+def test_descriptive_boolean_remains_pending_until_literal_support(manifest):
+    manifest.attributes = [AttributeDefinition(attribute_id="Lead-Free", description="Lead-Free", value_type="boolean")]
+    requests = []
+
+    class BooleanCompletion:
+        def complete_structured(self, system, user, schema):
+            evidence = json.loads(user)["evidence"][0]
+            return ExtractionResponse(candidates=[Candidate(
+                attribute_id="Lead-Free", value=True, evidence_ids=[evidence["evidence_id"]],
+                supporting_quote=evidence["text"], qualification="Exact synthetic product.",
+            )])
+
+    def load(tier, pending):
+        requests.append((tier, pending))
+        if tier == "internal_pdf":
+            supplied = source(manifest, tier, "Lead-free brass valve")
+            supplied.excerpts[0].qualification = "Exact synthetic product."
+            return [supplied]
+        if tier == "manufacturer_web":
+            return [source(manifest, tier, "Lead-Free: Yes")]
+        return []
+
+    result = run_cascade(manifest, load, BooleanCompletion())
+    assert requests == [
+        ("internal_pdf", ["Lead-Free"]), ("vendor_table", ["Lead-Free"]),
+        ("manufacturer_web", ["Lead-Free"]),
+    ]
+    assert [candidate.evidence_basis for candidate in result.attributes[0].candidates] == [
+        "inferred_from_description", "literal",
+    ]
+    assert result.attributes[0].status == "proposed"
+
+
+def test_optional_skip_preserves_only_product_matched_original_evidence(manifest):
+    good = source(manifest, "manufacturer_web", "Body Material: brass", "original")
+    wrong = source(manifest, "manufacturer_web", "Body Material: gold", "wrong")
+    wrong.product = manifest.product.model_copy(update={"mpn": "OTHER-PART"})
+
+    class Skip:
+        def complete_structured(self, system, user, schema):
+            raise OptionalTierSkipped("optional_complete_input_capacity")
+
+    result = run_cascade(
+        manifest, lambda tier, _: [good, wrong] if tier == "manufacturer_web" else [], Skip(),
+    )
+    assert [entry.source_id for entry in result.evidence] == ["original"]
+    assert not any(attribute.candidates for attribute in result.attributes)
+    assert any(entry.error_code == "optional_complete_input_capacity" for entry in result.retrieval)
 
 
 @pytest.mark.parametrize("name,value,kind,quote,unit", [

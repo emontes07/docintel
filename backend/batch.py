@@ -425,7 +425,7 @@ class BatchService:
         record = self.get(batch_id, actor)
         columns = list(record["items"][0]["original"])
         inputs = [columns, *[[item["original"].get(column, "") for column in columns] for item in record["items"]]]
-        results = [["Row", "Item ID", "Vendor", "MPN", "Attribute", "Status", "Candidate index", "Proposed value", "Unit", "Evidence IDs", "Qualifications", "Review status", "Reviewed value", "Reviewed unit", "Reviewer", "Reviewed at", "Reason", "Error", "Source tiers", "Supporting quote", "Model confidence (not measured accuracy)", "Evidence verification JSON"]]
+        results = [["Row", "Item ID", "Vendor", "MPN", "Attribute", "Status", "Candidate index", "Proposed value", "Unit", "Evidence IDs", "Qualifications", "Review status", "Reviewed value", "Reviewed unit", "Reviewer", "Reviewed at", "Reason", "Error", "Source tiers", "Supporting quote", "Model confidence (not measured accuracy)", "Evidence verification JSON", "Evidence basis", "Inference rule"]]
         evidence_rows = [["Row", "Evidence ID", "Source ID", "Locator", "Version", "Excerpt", "Observed at", "Source tier", "Applicability", "Approved attributes", "Discovery method"]]
         errors = [["Row", "State", "Error", "Warnings", "Definition clarifications", "Validation diagnostics"]]
         diagnostics_sheet = [["Row", "Diagnostic", "Part", "Parts", "Sanitized diagnostic JSON"]]
@@ -494,6 +494,7 @@ class BatchService:
                     results[-1].extend([", ".join(tiers), candidate.get("supporting_quote"), candidate.get("confidence")])
                     verification = attribute.get("verification", [])
                     results[-1].append(json.dumps(verification[index], ensure_ascii=True) if index < len(verification) else "")
+                    results[-1].extend([candidate.get("evidence_basis", "literal") if candidate else "", candidate.get("inference_rule")])
         definition_columns = list(record["original_definitions"][0])
         reviews_sheet = [["Row", "Attribute", "Decision", "Selected candidate index", "Corrected value", "Corrected unit", "Reviewer", "Identity status", "Reviewed at", "Reason"]]
         for item in record["items"]:

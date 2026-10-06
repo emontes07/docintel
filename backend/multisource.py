@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Callable
 
-from backend.extract import StructuredCompletion, run_enrichment
+from backend.extract import ExecutionConfigurationError, StructuredCompletion, run_enrichment, source_evidence
 from backend.models.enrichment import (
     AttributeResult, EnrichmentResult, LiveBundle, Manifest, OfflineSource,
     RetrievalOutcome, SourceTier,
@@ -12,6 +12,21 @@ from backend.models.enrichment import (
 TIERS: tuple[SourceTier, ...] = (
     "internal_pdf", "vendor_table", "manufacturer_web", "approved_web",
 )
+WEB_TIERS = frozenset({"manufacturer_web", "approved_web"})
+
+
+class OptionalTierSkipped(ExecutionConfigurationError):
+    """An optional admission decision, never a denial from the execution guard."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def attribute_resolved(result: AttributeResult) -> bool:
+    return result.status == "existing" or (
+        result.status == "proposed" and any(candidate.evidence_basis == "literal" for candidate in result.candidates)
+    )
 
 
 def run_cascade(
@@ -39,7 +54,7 @@ def run_cascade(
     extraction_error = None
     for tier in TIERS:
         eligible = {definition.attribute_id for definition in manifest.attributes if definition.unit_resolved}
-        pending = [name for name, result in attributes.items() if result.status not in {"existing", "proposed"} and name in eligible]
+        pending = [name for name, result in attributes.items() if not attribute_resolved(result) and name in eligible]
         if not pending:
             retrieval.append(RetrievalOutcome(source_tier=tier, status="not_attempted"))
             continue
@@ -54,10 +69,23 @@ def run_cascade(
             attributes=[definition for definition in manifest.attributes if definition.attribute_id in pending],
             source_ids=[source.source_id for source in sources],
         )
-        result = run_enrichment(
-            LiveBundle(execution_mode="live_inference", manifest=scoped, sources=sources),
-            execution_mode="live_inference", completion=completion, qualified=True,
-        )
+        try:
+            result = run_enrichment(
+                LiveBundle(execution_mode="live_inference", manifest=scoped, sources=sources),
+                execution_mode="live_inference", completion=completion, qualified=True,
+            )
+        except OptionalTierSkipped as error:
+            if tier not in WEB_TIERS:
+                raise
+            evidence.extend(
+                entry for source in sources
+                if source.product == manifest.product and source.error_code is None
+                for entry in source_evidence(source, datetime.now(timezone.utc))
+            )
+            retrieval.append(RetrievalOutcome(
+                source_tier=tier, status="not_attempted", error_code=error.code,
+            ))
+            continue
         evidence.extend(result.evidence)
         retrieval.extend(outcome for outcome in result.retrieval if outcome.source_tier == tier)
         calls.append(result.model_call_status)

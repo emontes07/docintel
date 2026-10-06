@@ -386,6 +386,7 @@ def test_llm_structured_wrapper_used_without_network(bundle, monkeypatch):
     assert set(schema["$defs"]["Candidate"]["required"]) == {
         "attribute_id", "value", "unit", "evidence_ids", "origin",
         "supporting_quote", "qualification", "confidence",
+        "evidence_basis", "inference_rule",
     }
 
 
