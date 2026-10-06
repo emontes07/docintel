@@ -24,13 +24,14 @@ from backend.extract import ExecutionConfigurationError, run_enrichment
 from backend.models.enrichment import Evidence, ExtractionResponse, LiveBundle, Manifest, OfflineBundle, OfflineSource, ProductKey, ReviewAnnotation
 from backend.pilot import PARSER_VERSION, QUALIFICATIONS
 from backend.multisource import run_cascade
+from backend.pdf_presentation import pdf_items
 from backend.real_pilot import RealPilotBudgetExceeded, RealPilotGuard
 from backend.response_validation import (
-    ResponseValidationError, map_citations, parsed_content, response_diagnostic, schema_issues,
+    CitationReferences, ResponseValidationError, map_citations, parsed_content, response_diagnostic, schema_issues,
 )
 
 
-COMPACT_PROMPT_FORMAT = "real-evidence-groups-v2"
+COMPACT_PROMPT_FORMAT = "real-evidence-rows-v3"
 COMPACT_PROMPT_INSTRUCTIONS = """
 Evidence rows use evidence_columns as headers. Cite the FIRST element of each
 supporting row in candidate.evidence_ids: a JSON list such as ["E1", "E2"].
@@ -40,24 +41,34 @@ one known row reference. Order and duplicates do not change citation meaning.
 Surrounding whitespace and lowercase e are accepted; use canonical E1 spelling.
 Exact original IDs are aliases unless they collide with a row-reference label.
 Each row inherits metadata, attribute_ids and qualification from its group.
-text_index selects the verbatim evidence_texts excerpt. location is appended to
-the group's evidence_id_prefix and source_locator_prefix; a two-string location
-gives their respective suffixes. The application restores the exact original IDs.
+text_index selects evidence_texts. PDF table_row items reconstruct one physical
+row with source header labels; their reference restores ALL contributing original
+cells and headers. Paragraph items preserve notes and title text separately.
+location identifies the anchor, not the full citation; presentation records its
+page/table/row. Row numbers, column labels and part-index numbers are not product
+values. Do not mix materials or variants merely because they share a row.
+context_only items contain drawing metadata; use only explicit product facts.
 Select only supporting rows; do not infer citations from a group or invent IDs.
 """
 
 
-def compact_inference_prompt(user: str) -> tuple[str, dict[str, str]]:
+def compact_inference_prompt(user: str) -> tuple[str, CitationReferences]:
     payload = json.loads(user)
+    pdf = [Evidence.model_validate(entry) for entry in payload["evidence"]
+           if entry.get("source_tier") == "internal_pdf"]
+    projected = pdf_items(pdf)
+    entries = [entry for entry in payload["evidence"] if entry.get("source_tier") != "internal_pdf"]
+    entries.extend(item.prompt_entry() for item in projected)
+    origins = {item.anchor.evidence_id: [entry.evidence_id for entry in item.originals] for item in projected}
     groups = {}
-    for entry in payload["evidence"]:
+    for entry in entries:
         shared = {name: value for name, value in entry.items()
-                  if name not in {"evidence_id", "source_locator", "text"}}
+                  if name not in {"evidence_id", "source_locator", "text", "presentation"}}
         key = json.dumps(shared, sort_keys=True, ensure_ascii=False)
         if key not in groups:
             groups[key] = (shared, [])
         groups[key][1].append(entry)
-    references = {}
+    references: dict[str, str | list[str]] = {}
     compact = []
     metadata = []
     texts = {}
@@ -72,14 +83,15 @@ def compact_inference_prompt(user: str) -> tuple[str, dict[str, str]]:
             if text not in texts:
                 texts[text] = len(texts)
             reference = f"E{len(references) + 1}"
-            references[reference] = entry["evidence_id"]
+            original_ids = origins.get(entry["evidence_id"], [entry["evidence_id"]])
+            references[reference] = original_ids[0] if len(original_ids) == 1 else original_ids
             id_suffix = entry["evidence_id"][len(id_prefix):]
             locator_suffix = entry["source_locator"][len(locator_prefix):]
             location = id_suffix if id_suffix == locator_suffix else [id_suffix, locator_suffix]
-            compact.append([reference, group_index, texts[text], location])
+            compact.append([reference, group_index, texts[text], location, entry.get("presentation")])
     payload.update(
         evidence=compact, evidence_groups=metadata, evidence_texts=list(texts),
-        evidence_columns=["evidence_id", "group", "text_index", "location"],
+        evidence_columns=["evidence_id", "group", "text_index", "location", "presentation"],
         prompt_format=COMPACT_PROMPT_FORMAT,
     )
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), references

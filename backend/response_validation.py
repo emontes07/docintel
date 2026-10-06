@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import ValidationError
@@ -16,6 +17,7 @@ MAX_CANDIDATES = 64
 MAX_REFERENCES = 512
 MAX_VALID_REFERENCES = 4096
 MAX_ISSUES = 32
+CitationReferences = Mapping[str, str | list[str]]
 
 
 class ResponseValidationError(ValueError):
@@ -56,8 +58,12 @@ def schema_issues(error: Exception) -> list[ValidationIssue]:
     return issues
 
 
-def map_citations(response: ExtractionResponse, references: dict[str, str]) -> ExtractionResponse:
-    originals = set(references.values())
+def original_references(references: CitationReferences) -> set[str]:
+    return {entry for value in references.values() for entry in ([value] if isinstance(value, str) else value)}
+
+
+def map_citations(response: ExtractionResponse, references: CitationReferences) -> ExtractionResponse:
+    originals = original_references(references)
     mapped = response.model_copy(deep=True)
     issues = []
     for index, candidate in enumerate(mapped.candidates):
@@ -65,7 +71,8 @@ def map_citations(response: ExtractionResponse, references: dict[str, str]) -> E
         for offset, supplied in enumerate(candidate.evidence_ids):
             reference = supplied.strip()
             if re.fullmatch(r"[Ee][1-9][0-9]*", reference) and reference.upper() in references:
-                citations.append(references[reference.upper()])
+                value = references[reference.upper()]
+                citations.extend([value] if isinstance(value, str) else value)
             elif reference in originals:
                 citations.append(reference)
             else:
@@ -80,14 +87,14 @@ def map_citations(response: ExtractionResponse, references: dict[str, str]) -> E
 
 
 def response_diagnostic(
-    *, payload: Any, references: dict[str, str], issues: list[ValidationIssue],
+    *, payload: Any, references: CitationReferences, issues: list[ValidationIssue],
     stage: Literal["structured_response_parsing", "evidence_validation"] = "evidence_validation",
     raw_response_sha256: str | None = None,
 ) -> ResponseValidationDiagnostic:
     """Only known keys, structural types and allowlisted citation tokens survive."""
     used = []
     truncated = len(references) > MAX_VALID_REFERENCES or len(issues) > MAX_ISSUES
-    known = set(references) | set(references.values())
+    known = set(references) | original_references(references)
     allowed_keys = {"candidates", *Candidate.model_fields}
     if not isinstance(raw_response_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", raw_response_sha256):
         raw_response_sha256 = None

@@ -61,7 +61,7 @@ Attribute examples never become prompt evidence or reference answers. Candidate
 validation checks cited IDs, type, unit, and literal support, not inferred
 conversions or full semantic correctness. Conflicts remain separate, existing
 values remain unchanged, and partial source failure can coexist with proposals.
-Real-pilot proposals additionally require verbatim supporting quotations and
+Real-pilot proposals additionally require grounded, normalized supporting quotations and
 product/component applicability qualifications. Evidence has an explicit source
 tier and approved attribute scope. Unknown numeric units are not assumed
 dimensionless: unit guidance must be resolved before a numeric proposal is accepted.
@@ -72,6 +72,35 @@ source content. PDF pilot analysis is bounded to the first five pages, with that
 limitation retained in provenance.
 Only missing definitions, product identity, and selected source excerpts/provenance
 enter the prompt. Model errors never fall back to replay or web.
+
+### PDF row presentation and citation round-trip
+
+The real-pilot compact prompt (`real-evidence-rows-v3`) projects cached PDF
+table cells into physical rows. Recognized source headers label the values;
+a changed header section or a gap between rows ends the previous mapping.
+Unrecognized columns are explicitly numbered, not assigned invented headers.
+Notes and title paragraphs remain separate. Duplicate paragraphs/cells, pure
+headers, and sparse drawing callouts are excluded from the presentation or
+marked as drawing context; dimensional values remain available. This changes
+neither the cached parse contract nor stored evidence. Results and exports retain
+every original evidence record and locator, including omitted presentation noise.
+
+A compact row reference expands to every contributing original cell and header.
+Paragraph duplicates retain their original IDs. Whitespace, reference ordering,
+and lowercase `e` remain harmless; unknown references and partial citations that
+cannot ground the quote remain invalid. The verifier uses the same row
+reconstruction as the prompt, including normalized header separators. It never
+joins different physical table rows. Row numbers, generated labels, header text,
+and part-index numbers cannot supply candidate values. Parallel component groups
+do not make a seal's material the body's material. Source scope, units, variant
+applicability, conflicts and human review requirements still apply.
+
+New verification records use `grounded-normalization-v2`; row quotes identify
+`reconstructed_row`, the normalization rules, and every original locator.
+Historical verification records remain unchanged. Budget reservations still
+include the complete system/user payload, response schema, 4,096 framing
+allowance and 2,048 output allowance per request. Smaller evidence presentation
+does not establish that the cumulative PDF and vendor-tier requests fit.
 
 `--reviews` imports separate `ReviewDecision` records with attribute, decision,
 reviewer, timestamp, and reason. Approval selects `candidate_index`; correction

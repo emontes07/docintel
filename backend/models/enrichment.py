@@ -169,7 +169,7 @@ class ReviewAnnotation(Contract):
 
 
 class EvidenceMatch(Contract):
-    method: Literal["verbatim", "normalized", "adjacent_fragments", "vendor_cells"]
+    method: Literal["verbatim", "normalized", "adjacent_fragments", "vendor_cells", "reconstructed_row"]
     normalization: list[str]
     evidence_ids: list[str]
     source_locations: list[str]
@@ -178,7 +178,7 @@ class EvidenceMatch(Contract):
 
 
 class EvidenceVerification(Contract):
-    version: Literal["grounded-normalization-v1"] = "grounded-normalization-v1"
+    version: Literal["grounded-normalization-v1", "grounded-normalization-v2"] = "grounded-normalization-v2"
     quote: EvidenceMatch | None = None
     value: EvidenceMatch
     unit: EvidenceMatch | None = None
