@@ -1355,3 +1355,198 @@ Sanitize logs before sharing; do not export signed URLs, bearer tokens, account
 labels, document content, or secrets. No deployment, provisioning, rollback, grants,
 AI calls, customer processing, package installation, or push was performed to
 produce this guide.
+# One backend-only Mueller gapfill continuation (Track A)
+
+`scripts/gapfill_continuation.py` is a separate, single-use continuation of the
+**existing pinned release root**, not another pilot approval or a fresh allowance.
+Its source boundary is `f56d7eafd56ba3dec90ca87500e1ddf71a1453c8`: only
+`backend/real_pilot.py`, this helper, its two focused tests, deployment/batch
+documentation and one exact worker admission exception may differ. The worker
+exception allows optional policy alongside recovery **only** when the real guard
+has validated `gapfill`; all other recovery scopes remain excluded. The helper
+checks the entire worker file against base bytes plus precisely that replacement,
+not merely an allowed filename. Do not deploy parallel Track B worker telemetry,
+extraction, model, cascade, batch/export, or frontend changes.
+
+The separately supplied `gapfill-worker-interface.patch` is an index-staging
+handoff, not a publication source file. The parent can check/apply it to the
+base worker in the index (`git apply --check --cached ...`, then
+`git apply --cached ...`) while leaving the Track B dirty working file untouched.
+Do not stage the handoff patch itself. The production gate runs the normal
+`run_batch` entrypoint on the exact base-plus-interface-patch worker.
+
+The exact authorization permits one backend source upload and one 2-vCPU,
+900-second backend build; API and existing manual-worker digest updates; **no
+frontend build/update**; then one 600-second, concurrency-one, two-item worker
+execution. All four previous executions remain consumed. Original inference/
+input/output reservations remain `11 / 257868 / 22528`. The only additions are
+`+1 inference / +151646 input / +2048 output`, yielding absolute ceilings
+`17 / 409514 / 34816`. At most four internal and two optional web model requests,
+two WebIQ `/web` discoveries, four direct-page attempts, zero `/browse`, zero new
+DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
+
+## Offline evidence and operator sequence
+
+1. Merge the guard/helper-only successor with all required CI checks. Prepare
+   its immutable context **under the existing root** with
+   `gapfill_continuation.py prepare --work "$WORK" --revision "$REV"`.
+   Populate the existing publisher's exact-source `clean-checks.json`,
+   `backend-smoke.json`, and merged `ci.json` receipts under `gapfill-v1`.
+   The original root pin, all old receipts, snapshot, caches and results are
+   prerequisites; copying a new work root or changing an old approval is rejected.
+   Preparation pins a finite set of preexisting records. Later append-only Track B
+   artifacts do not change that baseline or block Track A; validation checks only
+   the pinned records, never freezes directory membership. New private files are
+   create-once mode `0600`, with private directories mode `0700`.
+2. Supply an owner-only `gapfill-web-configuration.json` in that root, containing
+   `public_web_policy`, `web_environment`, `web_prices`, and
+   `fixed_cost_microdollars`. `amendment_scope()` constructs a canonical scope
+   from the retained raw-record snapshot. The public policy binds the exact two
+   existing Mueller MPNs, selected source IDs, exact hosts and explicitly reviewed
+   public attribute terms. It uses caps `2/4/2` for discovery/page/model calls and
+   complete per-web-prompt input/output caps `26000/2048`. Environment binds only
+   `WEBSEARCH_PROVIDER=webiq` and
+   `WEBIQ_ENDPOINT=https://api.microsoft.ai/v3/search/web`; never put a key or
+   token in this JSON. The immutable adapter reads **`WEBIQ_API_KEY`**, not
+   `WEBIQ_SUBSCRIPTION_KEY`, and sends it as `x-apikey`.
+   The decision binds `credential_origin="GBBdemo"`, `credential_source`, and a
+   nonsecret `webiq_secret_ref` on the **existing manual job**. Choose
+   `credential_source="existing_job_secret"` when that reference already exists,
+   or `"owner_env_file"` for the owner's existing key in the ignored, mode-`0600`
+   repository-root `.env.local` under `WEBIQ_API_KEY`. The latter does not create
+   a WebIQ credential: during the existing worker image PATCH it binds that same
+   key to the existing job's approved secret storage, without creating infrastructure
+   or changing grants. It is supported only when that job's secret store is empty;
+   unrelated secrets are never reconstructed or overwritten. The old worker
+   template need not contain a WebIQ environment entry: the one execution override
+   adds `WEBIQ_API_KEY` using that `secretRef`, never a literal value. The helper
+   checks the existing reference or owner-key presence before the sole build and
+   verifies hosted name-only metadata after deployment and before start.
+   The owner key and existing management token travel in memory over stdin to one
+   non-retried HTTPS PATCH, never command arguments, stdout, private receipts,
+   source context, or local credential files. Its redacted create-once intent records
+   contain only the reference and resource identity. Responses/errors are discarded
+   or sanitized. No key is generated, rotated, fetched from another service, or
+   granted new access. A locally present key alone is not proof of an installed
+   hosted binding. The owner-approved service prices are
+   `web_prices={"search": "0.0125", "web_retrieval": "0"}`. A direct HTTPS page has
+   **zero provider per-call fee**; it is not paid WebIQ `/browse`, which remains
+   forbidden. Model/search prices stay positive. Page-attempt counts still reserve
+   against their exact caps even when their provider charge is zero.
+
+   The local builder avoids manual copying of bindings and prices. Supply
+   `public_terms` as the reviewed per-item mapping
+   `{"row-2": {attribute_id: public_term, ...}, "row-3": {...}}`; it never reads
+   document text or private identity terms to compose public queries:
+
+   ```python
+   from scripts import gapfill_continuation as gap
+
+   records = gap.snapshot_records(work)
+   configuration = gap.web_configuration(records, public_terms)
+   gap.release.save_once(work / "gapfill-web-configuration.json", configuration)
+   ```
+
+   This uses exact retained MPN/source/host/batch bindings, the documented endpoint,
+   `198000` microdollars for full build+worker compute, and a `210920`-microdollar
+   optional-web cap (two searches plus two complete web-model reservations).
+   `credential_source="unavailable", webiq_secret_ref=null` explicitly represents a missing key for offline checks,
+   not proof of an available credential or permission to manufacture one.
+   `ready` refuses that unresolved choice **before writing either clock receipt**:
+   obtain the existing key location/binding from the owner first. If a credential
+   is absent at runtime, the unchanged optional provider reports
+   `not_configured` / `optional_provider_unavailable`, makes no search/page/model
+   request for web, and retains the internal result. It does not return a synthetic
+   search result or pretend that the two optional searches occurred. The private
+   gate separately reproduces this real missing-configuration path without any key.
+3. Run the opt-in **real production worker and real guard**, network-blocked gate:
+
+   ```sh
+   DOCINTEL_TEST_GAPFILL_WORK="$WORK" \
+   DOCINTEL_TEST_GAPFILL_DOCUMENTS="$APPROVED_LOCAL_DOCUMENTS" \
+   DOCINTEL_TEST_GAPFILL_CONFIGURATION=gapfill-web-configuration.json \
+   DOCINTEL_TEST_GAPFILL_OUTPUT=gapfill-private-gate.json \
+   "$PYTHON" -m pytest tests/test_gapfill_rerun.py \
+     -q --basetemp=.gapfill-test-state
+   ```
+
+   Output requires exact committed source; the gate rejects any business-pipeline
+   or frontend drift from the base. It hydrates `row-rerun-actual-outcome.json`,
+   uses only retained parses and hash-approved local source copies, executes all
+   six full-fallthrough payloads, measures the four complete internal payloads
+   at `99646` input units and caps the two unknown web payloads at `52000` more.
+   Search leads and retrieved pages are distinct **REPRODUCTION ONLY** mocks.
+   Fatal guard failures stop the second queued item. Original partial-draft
+   machine results, all prior records, attempt history and exports are checked.
+4. Create the owner-only decision with exactly `DECISION_FIELDS`, `POLICY`, the
+   canonical baseline/gate/snapshot/scope digests, target fingerprint, approving
+   operator and exact source revision. `check` is local and starts no clock.
+   The local Python API below constructs that exact document after preparation,
+   merged-source CI receipts and private gate emission. `work` is the existing
+   root `Path`; this does not start readiness or any live operation:
+
+   ```python
+   from scripts import gapfill_continuation as gap
+
+   config = gap.release.load_config(work / "target.json")
+   decision = gap.decision_from_gate(
+       work, config, "gapfill-private-gate.json",
+       credential_source="owner_env_file", secret_ref="webiq-gbbdemo",
+   )
+   gap.release.save_once(work / "gapfill-decision.json", decision)
+   gap.validate(work, config, decision)
+   ```
+
+   Run the private gate from the exact committed Track A source, not a working
+   tree containing Track B changes. For a staged source tree outside Git, provide
+   `GIT_DIR` pointing at the original repository's existing Git directory so
+   read-only `git show`/HEAD attestations resolve the same reviewed revision.
+   Never copy `.env.local` into that source tree or build context.
+   `ready --approve ready` creates the nonrenewable 45-minute publication and
+   90-minute overall windows. `publish --approve publish` records model capacity
+   **before** the build, reserves the sole attempt before requesting an upload,
+   and rechecks a full 900 seconds at upload and build submission.
+5. `deploy --approve deploy` updates only API and worker immutable backend digest,
+   verifies the frontend unchanged and starts a processing window of at most
+   20 minutes, clipped to the original 90-minute deadline. A full 600 seconds
+   must still fit. Before activation, the operator supplies
+   `gapfill-auth-preworker.json`: decision/target binding, `verified=true`,
+   `authenticated=true`, the authenticated `owner`/`batch_id`, backend image,
+   exact activation `amendment_sha256` and `observed_at` within this window.
+   The helper never manufactures authentication evidence.
+6. `activate --approve activate` verifies live resource shapes, installs only
+   `configuration/real-pilot-gapfill.json`, conditionally queues the existing batch,
+   temporarily enables the API and submits one exact two-item worker override.
+   Its `finally` always attempts API processing closure, even after a guard,
+   probe or start error. `close --approve close` remains available after expiry.
+   There are no standalone configure/enable/start retry commands.
+
+All commands after `prepare` require `--work "$WORK" --decision "$DECISION"`;
+live actions also require their explicit `--approve ACTION`. Unknown build/start
+outcomes consume the attempt; inspect the same resource, never reset a receipt or
+resubmit. Usage/status probe failures append sanitized warnings and continue;
+they never kill or retry the worker. Only authorization expiry requests a stop of
+the one reserved execution. Immutable usage receipts distinguish reservations
+from actual billing and exclude historical forecasts.
+
+The fresh **$5 incremental envelope** remains unchanged. At the owner's stated
+price basis its full direct upper bound is:
+
+| Direct component | Approved basis | Upper USD |
+| --- | --- | ---: |
+| Backend build | 900 seconds × $0.0002/second | 0.180000 |
+| Worker | 600 seconds × $0.00003/second | 0.018000 |
+| Complete model input | 151646 × $2/1M | 0.303292 |
+| Model output | 12288 × $20/1M | 0.245760 |
+| Two paid WebIQ searches | 2 × $0.0125 | 0.025000 |
+| At most four direct HTTPS pages | Zero provider service fee; no paid browse | 0.000000 |
+| **Total** | No historical forecast stacking | **0.772052** |
+
+Storage, logs and transfer are a **separate advisory estimate**: use observed
+quantities times the corresponding documented meter rates, in matching units.
+Label missing observations as unknown, not invented quantities or per-page paid
+fees. These incidentals are not inserted into `web_retrieval` service pricing or
+made a new forecast/readiness gate. Unavailable usage probes log and continue.
+Historical reservations remain consumed but are not stacked into this fresh
+envelope. Every paid call and direct-page attempt still reserves before submission,
+with no reset/refund/retry API.

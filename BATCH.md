@@ -597,3 +597,49 @@ The earlier local tests are not rebranded as deployment or production acceptance
 No push, deployment, grants, customer processing, AI calls or dependency changes
 were performed. The scoped documentation commit hash is supplied in the accompanying
 handoff response; it cannot be embedded in its own commit without changing the hash.
+# Append-only optional Mueller gapfill
+
+The focused `configuration/real-pilot-gapfill.json` amendment extends only the
+already consumed row-rerun lineage. It binds the unchanged original approval,
+batch/owner, exact four-execution ledger, prior row amendment/audit, both selected
+item records, compatible parse caches and every reachable prior machine result.
+New item/result/audit comparisons use parsed JSON and canonical hashes, not JSON
+property order. No original approval, prior result, diagnostic, audit, reservation
+or execution is rewritten or refunded.
+
+The current `11 / 257868 / 22528` inference/input/output baseline receives exactly
+`+1 / +151646 / +2048`; the effective ceilings are `17 / 409514 / 34816`.
+The fifth execution receives at most six calls (`4 internal + 2 optional web`),
+`151646` complete input units and `12288` output tokens. Per-item internal/web
+inference ceilings are two/one; WebIQ `/web` discovery is one per item, direct
+pages at most two per item, and `/browse`, new analysis, Graph/SharePoint and other
+products remain forbidden. An oversized complete web prompt is skipped by the
+existing optional-tier policy; no prompt truncation or hidden seventh request.
+The approved WebIQ search price is `$0.0125` per call; direct HTTPS
+`web_retrieval` has zero provider per-call price, not a paid browse charge.
+Model/search prices remain positive. Page attempts still consume their count
+reservations. Storage/log/transfer incidentals use separate advisory estimates
+from observed quantities, never an invented per-page fee or a new forecast gate.
+
+The business pipeline remains at `f56d7eafd56ba3dec90ca87500e1ddf71a1453c8`,
+except for one explicit worker admission condition: optional policy may accompany
+recovery only when the real guard has validated the exact `gapfill` amendment.
+The guard's `recovery` always describes the original immutable recovery;
+`active_recovery` always selects the gapfill amendment. Neither changes meaning
+before/after execution charging. All other recovery scopes still reject optional
+web, and normal `run_batch` enforces its exact two-item slice before processor
+construction. The fifth execution is durably charged before fenced item recovery
+or any paid call. The original recovery remains independently hash-bound throughout. Recovery
+audits retain the original raw item bytes and versions, result keys are new
+amendment-hash attempt paths, and `previous_attempt` preserves the current partial
+draft. The unchanged recovery pacing and fatal-error queue stop still apply.
+Optional web remains internal-first, unresolved-attribute-only, public-query-only,
+discovery-not-evidence, and original-page-verified.
+
+The private gate in `tests/test_gapfill_rerun.py` uses the actual retained snapshot,
+cached parses, production `run_batch` and real `RealPilotGuard`, with all services
+replaced by explicit reproductions. It checks full payload accounting, per-call
+reservations, distinct discovery/retrieval, append-only records, preserved partial
+draft/export attempts, owner isolation and a fatal denial before the next item.
+It creates no live authority. See `DEPLOYMENT.md` for the exact merged-source,
+backend-only publication and externally authenticated activation procedure.

@@ -321,7 +321,8 @@ class RealBatchProcessor(BatchProcessor):
         self.optional_item_attempted = {}
         self.optional_cost = 0
         if self.optional_web_policy:
-            if (guard.execution_scope != "full" or guard.recovery is not None
+            if (guard.execution_scope != "full"
+                    or (guard.recovery is not None and guard.gapfill is None)
                     or self.optional_web_policy.batch_sha256 != binding_digest(record)):
                 raise ExecutionConfigurationError("Optional web requires a separately authorized full, exact-batch scope")
             selected = {entry["item_key"]: entry for entry in record["items"]}
