@@ -12,15 +12,21 @@ release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 
+def test_release_helper_ci_regenerates_and_verifies_pinned_write_contracts():
+    contracts = release.write_schema().check_generated()
+    assert set(contracts["contracts"]) == {"containerApps", "jobs"}
+    assert all(set(methods) == {"PATCH", "PUT"} for methods in contracts["contracts"].values())
+
+
 @pytest.fixture
 def container_read_response():
-    return {"identity": {"type": "SystemAssigned"}, "properties": {
+    return {"location": "westus", "identity": {"type": "SystemAssigned"}, "properties": {
         "configuration": {"registries": [{"server": "synthetic.azurecr.io", "passwordSecretRef": "acr-password"}], "ingress": {
             "additionalPortMappings": None, "allowInsecure": False, "clientCertificateMode": None,
             "corsPolicy": None, "customDomains": None, "exposedPort": 0, "external": True,
             "fqdn": "synthetic.invalid", "ipSecurityRestrictions": None, "stickySessions": None,
             "targetPort": 80, "targetPortHttpScheme": None,
-            "traffic": [{"latestRevision": True, "weight": 100}], "transport": "Auto",
+            "traffic": [{"latestRevision": True, "weight": 100}], "transport": "auto",
         }},
         "template": {"volumes": [{"name": "cache", "storageType": "EmptyDir"}], "containers": [{
             "name": "synthetic", "image": "synthetic.azurecr.io/old:tag", "imageType": "ContainerImage",
@@ -41,12 +47,13 @@ def test_patch_projects_read_response_without_mutation(tmp_path, monkeypatch, co
     containers[0]["env"].append({"name": "AUTH_MICROSOFT_ENTRA_ID_SECRET", "secretRef": "entra-reference"})
     calls = []
     monkeypatch.setattr(release, "azure", lambda *arguments: calls.append(arguments))
+    monkeypatch.setattr(release, "app", lambda *arguments: copy.deepcopy(container_read_response))
     release.patch_app(config, kind, containers, tmp_path)
     payload = json.loads(next(tmp_path.glob(kind + "-patch-*.json")).read_text())
     expected = copy.deepcopy(containers)
     expected[0].pop("imageType")
     expected[0]["resources"].pop("ephemeralStorage")
-    assert payload == {"properties": {"template": {"containers": expected}}}
+    assert payload == {"location": "westus", "properties": {"template": {"containers": expected}}}
     assert container_read_response == original
     assert containers[0]["imageType"] == "ContainerImage"
     assert "api-version=2024-03-01" in calls[0][calls[0].index("--url") + 1]
@@ -89,7 +96,8 @@ def test_deploy_and_rollback_use_write_projection(tmp_path, monkeypatch, contain
             kind = path.name.split("-patch-")[0]
             payload = json.loads(path.read_text())
             payloads[kind] = payload
-            assert set(payload) == {"properties"}
+            assert set(payload) == {"location", "properties"}
+            assert payload["location"] == "westus"
             assert set(payload["properties"]) == {"template", "configuration"}
             assert set(payload["properties"]["template"]) == {"containers"}
             resources[kind]["properties"]["template"]["containers"] = payload["properties"]["template"]["containers"]
@@ -104,6 +112,12 @@ def test_deploy_and_rollback_use_write_projection(tmp_path, monkeypatch, contain
     monkeypatch.setattr(release, "identity_contract", lambda _: None)
     monkeypatch.setattr(release, "app", lambda _, kind: resources[kind])
     monkeypatch.setattr(release, "stop", lambda _: calls.append(("stop",)))
+    if action == "rollback":
+        # The official 2024 contract does not permit a null ingress write.
+        with pytest.raises(ValueError, match="contract reason=type"):
+            release.run(Namespace(action=action, approve=action, work=tmp_path, config=None, isolate_legacy_baseline=True))
+        assert not payloads and resources == before
+        return
     release.run(Namespace(action=action, approve=action, work=tmp_path, config=None, isolate_legacy_baseline=True))
     assert set(payloads) == {"backend", "frontend"}
     for kind, payload in payloads.items():
@@ -115,7 +129,10 @@ def test_deploy_and_rollback_use_write_projection(tmp_path, monkeypatch, contain
         assert payload["properties"]["template"]["containers"] == expected
         assert resources[kind]["identity"] == before[kind]["identity"]
         assert {key: value for key, value in resources[kind]["properties"]["configuration"].items() if key != "ingress"} == {key: value for key, value in before[kind]["properties"]["configuration"].items() if key != "ingress"}
-        assert payload["properties"]["configuration"]["ingress"] == (release.desired_ingress(kind, baseline["apps"][kind]["ingress"]) if action == "deploy" else None)
+        expected_ingress = release.desired_ingress(kind, baseline["apps"][kind]["ingress"])
+        assert payload["properties"]["configuration"]["ingress"] == {
+            key: value for key, value in expected_ingress.items() if value is not None
+        }
         assert resources[kind]["properties"]["template"]["volumes"] == before[kind]["properties"]["template"]["volumes"]
     if action == "rollback":
         assert calls[0] == ("stop",)
@@ -1055,6 +1072,7 @@ def test_publication_blob_put_never_exposes_sas_or_retries(tmp_path, monkeypatch
     from types import SimpleNamespace
     url = "https://registryaccount.blob.core.windows.net/context/source/20300203/source.tar.gz?sig=PRIVATE-SAS"
     calls = []
+    (tmp_path / "source.tar.gz").write_bytes(b"SYNTHETIC-ARCHIVE")
 
     def run(args, **kwargs):
         calls.append((args, kwargs))
@@ -1088,6 +1106,7 @@ def test_publication_accepts_safe_opaque_relative_paths_without_prefix_or_extens
     from types import SimpleNamespace
     from urllib.parse import quote
     calls = []
+    (tmp_path / "context.tar.gz").write_bytes(b"SYNTHETIC-ARCHIVE")
     monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(returncode=0, stdout=b"201"))
     blob_path = quote(source, safe="/%")
     location = {"relativePath": source, "uploadUrl": "https://registryaccount.blob.core.windows.net/container/" + blob_path + "?sig=SYNTHETIC"}
@@ -1674,7 +1693,7 @@ def pilot_release(tmp_path, monkeypatch):
             "env": [{"name": "PRESERVED", "value": "original"}, {"name": "WEBIQ_API_KEY", "secretRef": "existing-web-key"}],
         }])
         resources[kind] = {
-            "id": prefix + "containerApps/" + kind, "etag": "synthetic-etag",
+            "id": prefix + "containerApps/" + kind, "etag": "synthetic-etag", "location": "westus",
             "identity": {"type": "SystemAssigned", "principalId": approval["identities"]["api_principal_id"]},
             "properties": {
                 "provisioningState": "Succeeded", "latestRevisionName": "ready", "latestReadyRevisionName": "ready",

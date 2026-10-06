@@ -134,7 +134,10 @@ def web_configuration(records, public_attribute_terms):
         batch_sha256=approval["batch_sha256"], items=items, max_cost_microdollars=optional_cost,
     )
     return {
-        "public_web_policy": policy.model_dump(mode="json"),
+        # Preserve the original two-item approval format as newer scopes add defaults.
+        "public_web_policy": policy.model_dump(
+            mode="json", exclude={"items": {"__all__": {"max_direct_page_attempts"}}},
+        ),
         "web_environment": {"WEBSEARCH_PROVIDER": "webiq", "WEBIQ_ENDPOINT": ENDPOINT},
         "web_prices": {"search": "0.0125", "web_retrieval": "0"},
         "fixed_cost_microdollars": 198000,
@@ -534,19 +537,55 @@ def current_config(work, config, decision):
     return {**config, **{kind + "_image": published[kind + "_image"] for kind in ("backend", "frontend")}}
 
 
+def writable_job_configuration(configuration):
+    """Remove two captured GET-only defaults, then use the pinned write schema."""
+    require(isinstance(configuration, dict), "Job configuration must be an object")
+    require(configuration.get("identitySettings") in (None, []) and configuration.get("dapr") is None,
+            "Nonempty GET-only job settings cannot be preserved by API 2024-03-01")
+    projected = copy.deepcopy(configuration)
+    projected.pop("identitySettings", None)
+    projected.pop("dapr", None)
+    return release.write_schema().project_component("jobs", "PATCH", ("properties", "configuration"), projected)
+
+
+class WorkerPatchFailure(ValueError):
+    """Only bounded transport metadata may cross the private credential boundary."""
+
+    def __init__(self, phase, *, http_status=None, curl_returncode=None):
+        self.phase = phase if phase in {"configuration", "credential", "management_token", "worker_patch"} else "unknown"
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        self.curl_returncode = curl_returncode if type(curl_returncode) is int else None
+        super().__init__(
+            f"Existing-key worker PATCH did not confirm deployment: phase={self.phase}, "
+            f"http_status={self.http_status}, curl_returncode={self.curl_returncode}; details withheld, no retry"
+        )
+
+    def metadata(self):
+        return {"phase": self.phase, "http_status": self.http_status,
+                "curl_returncode": self.curl_returncode, "retry_permitted": False}
+
+
+def http_status(output):
+    if isinstance(output, bytes) and re.fullmatch(rb"[1-5][0-9]{2}", output.strip()):
+        return int(output.strip())
+    return None
+
+
 def patch(work, config, decision, label, resource, containers, *, job=False, bind_existing_secret=None):
     with live(work, decision, "cleanup" if label == "close" else "overall"):
         fresh, active = release.active_executions(config) if job else (release.app(config, config["backend"]), [])
         require(not active and fresh == resource, "Resource drift; never overwrite")
         candidate = path(work, label + "-patch")
-        payload = {"properties": {"template": {"containers": release.writable_containers(containers)}}}
+        configuration = release.UNCHANGED_INGRESS
         if bind_existing_secret is not None:
             require(job and label == "deploy-worker" and decision["credential_source"] == "owner_env_file"
                     and bind_existing_secret == decision["webiq_secret_ref"]
                     and not resource["properties"]["configuration"].get("secrets"),
                     "Only the approved owner key may bind to the existing empty job secret store")
-            payload["properties"]["configuration"] = copy.deepcopy(resource["properties"]["configuration"])
-            payload["properties"]["configuration"]["secrets"] = [{"name": bind_existing_secret}]
+            configuration = writable_job_configuration(resource["properties"]["configuration"])
+            configuration["secrets"] = [{"name": bind_existing_secret}]
+        payload = release.build_update_payload(resource, containers, job=job, configuration=configuration)
+        if bind_existing_secret is not None:
             release.save_once(path(work, "credential-binding"), {
                 **binding(decision), "secret_ref": bind_existing_secret, "resource_id": resource["id"],
                 "credential_origin": "GBBdemo", "source": "owner_env_file",
@@ -562,7 +601,16 @@ def patch(work, config, decision, label, resource, containers, *, job=False, bin
         if bind_existing_secret is None:
             release.azure(*args)
         else:
-            secure_worker_patch(work, config, decision, resource, payload)
+            try:
+                secure_worker_patch(work, config, decision, resource, payload)
+            except WorkerPatchFailure as error:
+                try:
+                    release.save_once(path(work, label + "-failure"), {
+                        **binding(decision), **error.metadata(), "observed_at": now().isoformat(),
+                    })
+                except (OSError, ValueError):
+                    raise error from None
+                raise
         expected = prior.shape(resource)
         expected["template"]["containers"] = release.writable_containers(containers)
         if bind_existing_secret is not None:
@@ -578,17 +626,35 @@ def patch(work, config, decision, label, resource, containers, *, job=False, bin
             sleep(5)
 
 
-def secure_worker_patch(work, config, decision, resource, redacted_payload):
-    """Existing owner key and ARM token travel over stdin, never argv or files."""
+def secure_worker_patch(work, config, decision, resource, redacted_payload, *, check_window=None):
+    """Compatibility wrapper retaining the original gapfill clock by default."""
+    if check_window is None:
+        check_window = lambda: window(work, decision, "overall", 600)
+    return send_existing_secret_patch(
+        config, resource, redacted_payload,
+        secret_ref=decision.get("webiq_secret_ref"), check_window=check_window,
+    )
+
+
+def send_existing_secret_patch(config, resource, redacted_payload, *, secret_ref, check_window):
+    """Namespace-independent transport; the only key source is the existing owner file."""
     expected_id = (f"/subscriptions/{config['subscription']}/resourceGroups/{config['group']}"
                    f"/providers/Microsoft.App/jobs/{config['job']}")
     require(resource["id"].lower() == expected_id.lower(), "Credential binding must target the existing manual job")
-    window(work, decision, "overall", 600)
+    url = "https://management.azure.com" + resource["id"] + "?api-version=2024-03-01"
+    release.write_schema().validate_request("PATCH", url, redacted_payload)
+    require(callable(check_window), "A bounded operation clock check is required")
+    check_window()
+    phase = "configuration"
+    status, returncode = None, None
     try:
         payload = copy.deepcopy(redacted_payload)
         secrets = payload["properties"]["configuration"]["secrets"]
-        require(secrets == [{"name": decision["webiq_secret_ref"]}], "Exact owner-key reference required")
+        require(secrets == [{"name": secret_ref}], "Exact owner-key reference required")
+        phase = "credential"
         secrets[0]["value"] = existing_webiq_key()
+        release.write_schema().validate_request("PATCH", url, payload)
+        phase = "management_token"
         token = release.azure("account", "get-access-token", "--subscription", config["subscription"],
                               "--resource", "https://management.azure.com/", timeout=30)
         bearer = token["accessToken"]
@@ -601,20 +667,27 @@ def secure_worker_patch(work, config, decision, resource, redacted_payload):
         if resource.get("etag"):
             transport += "header = " + json.dumps("If-Match: " + resource["etag"]) + "\n"
         transport += "data = " + json.dumps(json.dumps(payload, separators=(",", ":"))) + "\n"
-        window(work, decision, "overall", 600)
+        phase = "worker_patch"
+        check_window()
         result = subprocess.run([
             "curl", "--disable", "--silent", "--show-error", "--fail",
             "--proto", "=https", "--retry", "0", "--max-redirs", "0", "--noproxy", "*",
             "--request", "PATCH", "--header", "Content-Type: application/json",
-            "--url", "https://management.azure.com" + resource["id"] + "?api-version=2024-03-01",
+            "--url", url,
             "--max-time", "60", "--output", "/dev/null", "--write-out", "%{http_code}", "--config", "-",
         ], input=transport.encode(), capture_output=True, timeout=60,
             env={key: value for key, value in os.environ.items()
                  if key not in {"WEBIQ_API_KEY", "WEBIQ_SUBSCRIPTION_KEY"}})
-        require(result.returncode == 0 and result.stdout in (b"200", b"202"),
-                "Existing-key binding outcome unconfirmed")
+        status = http_status(result.stdout)
+        returncode = result.returncode if type(result.returncode) is int else None
+        if returncode != 0 or status not in (200, 202):
+            raise WorkerPatchFailure(phase, http_status=status, curl_returncode=returncode)
+    except WorkerPatchFailure:
+        raise
+    except subprocess.TimeoutExpired as error:
+        raise WorkerPatchFailure(phase, http_status=http_status(error.stdout)) from None
     except Exception:
-        raise ValueError("Existing-key worker deployment failed or is unknown; details withheld, no retry") from None
+        raise WorkerPatchFailure(phase, http_status=status, curl_returncode=returncode) from None
 
 
 def deploy(work, config, decision):
@@ -869,6 +942,7 @@ print("DOCINTEL_GAPFILL_USAGE:" + base64.b64encode(json.dumps(value).encode()).d
 
 def close(work, config, decision):
     # Closure deliberately does not depend on gate/CI validation or an unexpired clock.
+    config = current_config(work, config, decision)
     with release.pilot_lock(work), live(work, decision, "cleanup"):
         backend = release.app(config, config["backend"])
         if path(work, "enablement").exists():
@@ -887,7 +961,9 @@ def close(work, config, decision):
                 containers[0]["env"] = list(entries.values())
                 patch(work, config, decision, "close", backend, containers)
         release.require_real_pilot_off(prior.ready(config, "backend"))
-        require(prior.shape(prior.ready(config, "frontend")) == receipt(work, "deploy-attempt", decision)["frontend"],
+        frontend = receipt(work, "deploy-attempt", decision)["frontend"]
+        frontend["template"]["containers"] = release.writable_containers(frontend["template"]["containers"])
+        require(prior.shape(prior.ready(config, "frontend")) == frontend,
                 "Frontend drift detected at closure")
         if not path(work, "closed").exists():
             release.save_once(path(work, "closed"), binding(decision))
@@ -931,8 +1007,6 @@ def main():
             validate(work, config, decision)
         else:
             require(options.approve == options.action, "Explicit bounded action approval required")
-            if options.action == "close":
-                config = current_config(work, config, decision)
             globals()[options.action](work, config, decision)
     print("Gapfill action confirmed; prior approvals, history and consumption preserved.")
 
