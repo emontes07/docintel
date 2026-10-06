@@ -7,6 +7,7 @@ from typing import Literal, Self
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from backend.core.docintel import ParsedDocument
+from backend.telemetry import ItemTelemetry
 
 AttributeValue = str | int | float | bool
 SourceTier = Literal["internal_pdf", "vendor_table", "manufacturer_web", "approved_web"]
@@ -305,3 +306,4 @@ class EnrichmentResult(Contract):
     extraction_error: Literal["invalid_response", "model_failed"] | None = None
     failure: InferenceFailure | None = None
     validation_diagnostics: list[ResponseValidationDiagnostic] = Field(default_factory=list)
+    telemetry: ItemTelemetry | None = None
