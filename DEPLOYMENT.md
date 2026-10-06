@@ -1357,8 +1357,20 @@ AI calls, customer processing, package installation, or push was performed to
 produce this guide.
 # One backend-only Mueller gapfill continuation (Track A)
 
+**Stopped attempt; no retry authorized.** The approved backend build and API
+update completed, but the manual-worker PATCH returned HTTP 400 before activation.
+The worker remained unchanged; no worker execution, model request, WebIQ search
+or direct-page retrieval started. Processing is closed. The offline corrections
+below do not renew that approval, reset an attempt, or authorize another deployment.
+Preserve all existing publication, deployment-failure and closure receipts.
+
 `scripts/gapfill_continuation.py` is a separate, single-use continuation of the
 **existing pinned release root**, not another pilot approval or a fresh allowance.
+Invoke it from the reviewed repository root as
+`python -m scripts.gapfill_continuation`, using the selected Python environment.
+Do not invoke the file directly: its package imports require the repository root.
+The sequence below documents the CLI contract, not permission to resume the
+stopped attempt.
 Its source boundary is `f56d7eafd56ba3dec90ca87500e1ddf71a1453c8`: only
 `backend/real_pilot.py`, this helper, its two focused tests, deployment/batch
 documentation and one exact worker admission exception may differ. The worker
@@ -1389,7 +1401,7 @@ DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
 
 1. Merge the guard/helper-only successor with all required CI checks. Prepare
    its immutable context **under the existing root** with
-   `gapfill_continuation.py prepare --work "$WORK" --revision "$REV"`.
+   `python -m scripts.gapfill_continuation prepare --work "$WORK" --revision "$REV"`.
    Populate the existing publisher's exact-source `clean-checks.json`,
    `backend-smoke.json`, and merged `ci.json` receipts under `gapfill-v1`.
    The original root pin, all old receipts, snapshot, caches and results are
@@ -1426,7 +1438,21 @@ DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
    non-retried HTTPS PATCH, never command arguments, stdout, private receipts,
    source context, or local credential files. Its redacted create-once intent records
    contain only the reference and resource identity. Responses/errors are discarded
-   or sanitized. No key is generated, rotated, fetched from another service, or
+   or sanitized. The `2024-03-01` job request projects only supported configuration:
+   secrets, registries, trigger type, replica timeout/retry limit and
+   manual/schedule/event trigger settings. Empty GET-only `identitySettings` and
+   the legacy null `dapr` field are omitted from the request, not from read-back
+   comparisons. Nonempty unsupported settings require API compatibility review
+   instead of silently discarding them. A failed existing-key PATCH retains only
+   bounded `phase`, `http_status` and `curl_returncode` diagnostics (unknown values
+   remain null), plus `retry_permitted=false`, in its exception and create-once
+   mode-`0600` `gapfill-deploy-worker-failure.json`. No raw response body, stderr,
+   owner key or access token is recorded; HTTP 400/curl 22 is not mislabeled as an
+   unknown outcome. If the diagnostic receipt cannot be written, the sanitized
+   exception still retains that status; existing receipts are never replaced.
+   This does not overwrite the stopped attempt's separately
+   captured `gapfill-deployment-failure.json`.
+   No key is generated, rotated, fetched from another service, or
    granted new access. A locally present key alone is not proof of an installed
    hosted binding. The owner-approved service prices are
    `web_prices={"search": "0.0125", "web_retrieval": "0"}`. A direct HTTPS page has
@@ -1502,11 +1528,13 @@ DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
    `GIT_DIR` pointing at the original repository's existing Git directory so
    read-only `git show`/HEAD attestations resolve the same reviewed revision.
    Never copy `.env.local` into that source tree or build context.
-   `ready --approve ready` creates the nonrenewable 45-minute publication and
-   90-minute overall windows. `publish --approve publish` records model capacity
+   `python -m scripts.gapfill_continuation ready --approve ready` creates the
+   nonrenewable 45-minute publication and 90-minute overall windows.
+   `python -m scripts.gapfill_continuation publish --approve publish` records model capacity
    **before** the build, reserves the sole attempt before requesting an upload,
    and rechecks a full 900 seconds at upload and build submission.
-5. `deploy --approve deploy` updates only API and worker immutable backend digest,
+5. `python -m scripts.gapfill_continuation deploy --approve deploy`
+   updates only API and worker immutable backend digest,
    verifies the frontend unchanged and starts a processing window of at most
    20 minutes, clipped to the original 90-minute deadline. A full 600 seconds
    must still fit. Before activation, the operator supplies
@@ -1514,11 +1542,19 @@ DI, zero internal retrieval, zero Ford, and zero SharePoint are admitted.
    `authenticated=true`, the authenticated `owner`/`batch_id`, backend image,
    exact activation `amendment_sha256` and `observed_at` within this window.
    The helper never manufactures authentication evidence.
-6. `activate --approve activate` verifies live resource shapes, installs only
+6. `python -m scripts.gapfill_continuation activate --approve activate`
+   verifies live resource shapes, installs only
    `configuration/real-pilot-gapfill.json`, conditionally queues the existing batch,
    temporarily enables the API and submits one exact two-item worker override.
    Its `finally` always attempts API processing closure, even after a guard,
-   probe or start error. `close --approve close` remains available after expiry.
+   probe or start error.
+   `python -m scripts.gapfill_continuation close --approve close` remains available
+   after expiry. Both the CLI and `gap.close(work, config, decision)` resolve
+   backend/frontend image pins from the bound `gapfill-published.json`, not the
+   original images in `target.json`. Closure therefore handles a published/API-only
+   partial deployment without a successful worker deployment or `deployed` receipt.
+   It never needs the owner key, reopens processing, or rewrites an existing
+   `closed` receipt.
    There are no standalone configure/enable/start retry commands.
 
 All commands after `prepare` require `--work "$WORK" --decision "$DECISION"`;
