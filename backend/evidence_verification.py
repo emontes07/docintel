@@ -9,6 +9,7 @@ from fractions import Fraction
 from urllib.parse import parse_qs, urldefrag
 
 from backend.models.enrichment import Evidence, EvidenceMatch
+from backend.pdf_presentation import pdf_items
 
 
 _NUMBER = r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
@@ -26,6 +27,8 @@ class Fragment:
     position: tuple[int, ...] = ()
     cell: str | None = None
     vendor: bool = False
+    originals: tuple[Evidence, ...] = ()
+    header_labels: tuple[str, ...] = ()
 
 
 def normalized(text: str, *, vendor: bool = False) -> tuple[list[str], list[str]]:
@@ -166,9 +169,7 @@ def windows(evidence: list[Evidence], cited: set[str]) -> list[list[Fragment]]:
                 or (part.region[-1] == "paragraph" and part.position[0] != previous.position[0] + 1)
                 or (len(part.position) == 2 and (
                     part.position[0] == previous.position[0] and part.position[1] != previous.position[1] + 1
-                    or part.position[0] != previous.position[0] and (
-                        part.position[0] != previous.position[0] + 1 or part.position[1] != 0
-                    )
+                    or part.position[0] != previous.position[0]
                 ))
             )
             if part.evidence.evidence_id not in cited or gap:
@@ -183,17 +184,47 @@ def windows(evidence: list[Evidence], cited: set[str]) -> list[list[Fragment]]:
     return selected
 
 
+def reconstructed_rows(evidence: list[Evidence], cited: set[str]) -> list[list[Fragment]]:
+    return [[Fragment(item.anchor, item.text, originals=item.originals, header_labels=item.header_labels)]
+            for item in pdf_items(evidence) if item.kind == "table_row"
+            and {entry.evidence_id for entry in item.originals} <= cited]
+
+
+def value_windows(evidence: list[Evidence], cited: set[str]) -> list[list[Fragment]]:
+    items = pdf_items(evidence)
+    values = {entry.evidence_id for item in items for entry in item.values}
+    metadata = {entry.evidence_id for item in items for entry in item.originals} - values
+    return windows(evidence, cited - metadata)
+
+
 def match_text(text: str, spans: list[list[Fragment]]) -> EvidenceMatch | None:
     for span in spans:
         vendor = all(part.vendor for part in span)
-        target, target_rules = normalized(text, vendor=vendor)
+        labels = tuple(label for part in span for label in part.header_labels)
+
+        def comparison(value: str) -> str:
+            if labels:
+                value = unicodedata.normalize("NFKC", value)
+            for label in labels:
+                label = unicodedata.normalize("NFKC", label)
+                value = re.sub(
+                    rf"(?<!\w){re.escape(label)}\s*=\s*", lambda _, replacement=label + " ": replacement,
+                    value, flags=re.IGNORECASE,
+                )
+            return value
+
+        target, target_rules = normalized(comparison(text), vendor=vendor)
+        if labels and unicodedata.normalize("NFKC", text) != text:
+            target_rules.append("unicode_nfkc")
         if not target:
             continue
         haystack = []
         owners = []
         rules = []
         for part in span:
-            tokens, applied = normalized(part.text, vendor=vendor)
+            tokens, applied = normalized(comparison(part.text), vendor=vendor)
+            if labels and unicodedata.normalize("NFKC", part.text) != part.text:
+                applied.append("unicode_nfkc")
             haystack.extend(tokens)
             owners.extend([part] * len(tokens))
             rules.extend([applied] * len(tokens))
@@ -211,12 +242,14 @@ def match_text(text: str, spans: list[list[Fragment]]) -> EvidenceMatch | None:
             applied = [] if literal else sorted(set(target_rules + [
                 rule for group in rules[start:end] for rule in group
             ]))
+            originals = [entry for part in matched for entry in (part.originals or (part.evidence,))]
+            reconstructed = any(part.originals for part in matched)
             return EvidenceMatch(
-                method="vendor_cells" if any(part.cell for part in matched) else
+                method="reconstructed_row" if reconstructed else "vendor_cells" if any(part.cell for part in matched) else
                 "adjacent_fragments" if len(matched) > 1 else "verbatim" if literal else "normalized",
-                normalization=applied,
-                evidence_ids=list(dict.fromkeys(part.evidence.evidence_id for part in matched)),
-                source_locations=list(dict.fromkeys(part.evidence.source_locator for part in matched)),
+                normalization=sorted(set(applied + (["table_row_reconstruction", "row_header_separators"] if reconstructed else []))),
+                evidence_ids=list(dict.fromkeys(entry.evidence_id for entry in originals)),
+                source_locations=list(dict.fromkeys(entry.source_locator for entry in originals)),
                 cells=[part.cell for part in matched if part.cell],
                 normalized_sha256=hashlib.sha256(" ".join(target).encode()).hexdigest(),
             )

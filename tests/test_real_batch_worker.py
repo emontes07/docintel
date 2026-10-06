@@ -579,16 +579,16 @@ def test_discovery_failure_keeps_independently_supported_reference(configured, m
 
 
 def model_evidence(payload):
-    assert payload["evidence_columns"] == ["evidence_id", "group", "text_index", "location"]
+    assert payload["evidence_columns"] == ["evidence_id", "group", "text_index", "location", "presentation"]
     return [
         {**payload["evidence_groups"][group], "evidence_id": reference, "text": payload["evidence_texts"][text_index]}
-        for reference, group, text_index, _ in payload["evidence"]
+        for reference, group, text_index, _, _ in payload["evidence"]
     ]
 
 
 def expand_prompt_evidence(payload):
     expanded = []
-    for _, group, text_index, location in payload["evidence"]:
+    for _, group, text_index, location, _ in payload["evidence"]:
         shared = dict(payload["evidence_groups"][group])
         id_prefix = shared.pop("evidence_id_prefix")
         locator_prefix = shared.pop("source_locator_prefix")
@@ -627,11 +627,12 @@ def test_compact_prompt_is_lossless_and_never_merges_different_applicability(con
     assert len(prompt.encode()) < 12000
     assert projected["product"] == original["product"] and projected["attributes"] == original["attributes"]
     assert len(projected["evidence_groups"]) == 2
-    assert len(projected["evidence"]) == 80
+    assert len(projected["evidence"]) == 2
     assert len(projected["evidence_texts"]) == 1
-    assert expand_prompt_evidence(projected) == sorted(entries, key=lambda entry: entry["evidence_id"])
-    assert sorted(references.values()) == sorted(entry["evidence_id"] for entry in entries)
-    assert references["E1"] == entries[0]["evidence_id"]
+    assert expand_prompt_evidence(projected) == sorted([entries[0], entries[-1]], key=lambda entry: entry["evidence_id"])
+    from backend.response_validation import original_references
+    assert original_references(references) == {entry["evidence_id"] for entry in entries}
+    assert references["E1"] == [entry["evidence_id"] for entry in entries[:-1]]
     assert entries[0]["evidence_id"] != "E1"
 
 
@@ -672,7 +673,7 @@ def test_compact_citation_selects_only_one_original_location(configured, monkeyp
             return ParsedDocument(
                 source=source, cache_key="sha256:" + hashlib.sha256(content).hexdigest(),
                 parsed_at=datetime.now(timezone.utc), raw_text=text,
-                paragraphs=[ParsedParagraph(text=text, page_number=1) for _ in range(2)],
+                paragraphs=[ParsedParagraph(text=text, page_number=page) for page in (1, 2)],
             )
 
     client = Mock()

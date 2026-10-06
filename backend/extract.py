@@ -11,12 +11,13 @@ from pydantic import ValidationError
 
 from backend.core.instructions import product_extraction_system_message
 from backend.core.llm import LLMClient, LLMSchemaValidationError
-from backend.evidence_verification import Fragment, match_text, normalized, windows
+from backend.evidence_verification import Fragment, match_text, normalized, reconstructed_rows, value_windows, windows
 from backend.models.enrichment import (
     AttributeResult, EnrichmentResult, Evidence, ExtractionResponse, Manifest,
     EvidenceVerification, InferenceFailure, LiveBundle, OfflineBundle, OfflineSource, RetrievalOutcome, ReviewDecision,
 )
 from backend.real_pilot import RealPilotBudgetExceeded
+from backend.pdf_presentation import pdf_items
 from backend.response_validation import (
     ResponseValidationError, invalid, parsed_content, response_diagnostic, schema_issues,
 )
@@ -176,18 +177,20 @@ def validate_response(
                 raise invalid(f"{path}.evidence_ids[{offset}]", "Candidate exceeds the approved product/attribute applicability")
         try:
             spans = windows(evidence, set(candidate.evidence_ids))
+            row_spans = reconstructed_rows(evidence, set(candidate.evidence_ids))
+            source_values = value_windows(evidence, set(candidate.evidence_ids))
         except ValueError as error:
             raise invalid(path + ".evidence_ids", str(error)) from error
-        quote_match = match_text(candidate.supporting_quote, spans) if candidate.supporting_quote is not None else None
+        quote_match = match_text(candidate.supporting_quote, row_spans + spans) if candidate.supporting_quote is not None else None
         if candidate.supporting_quote is not None and quote_match is None:
             raise invalid(path + ".supporting_quote", "Supporting quotation has no normalized match in cited evidence")
         literal = str(candidate.value)
         if isinstance(candidate.value, float) and candidate.value.is_integer():
             literal = str(int(candidate.value))
         literals = ("true", "yes") if candidate.value is True else ("false", "no") if candidate.value is False else (literal,)
-        value_spans = [[part] for span in spans for part in span if part.vendor]
+        value_spans = [[part] for span in source_values for part in span if part.vendor]
         if not value_spans:
-            value_spans = spans
+            value_spans = source_values
             if candidate.supporting_quote is not None:
                 quote_span = [[Fragment(citations[candidate.evidence_ids[0]], candidate.supporting_quote)]]
                 if not any(match_text(value, quote_span) for value in literals):
@@ -195,6 +198,18 @@ def validate_response(
         value_match = next((match for value in literals if (match := match_text(value, value_spans))), None)
         if value_match is None:
             raise invalid(path + ".value", "Candidate value has no normalized support in cited source text or vendor cells")
+        if candidate.attribute_id.casefold() in {"material", "primary material", "body material"}:
+            non_body = {
+                evidence_id for item in pdf_items(evidence) for evidence_id, component in item.component_materials
+                if not re.fullmatch(r"(?:(?:main|valve) )*body(?: casting| assembly)?", " ".join(normalized(component)[0]))
+            }
+            if non_body.intersection(value_match.evidence_ids):
+                body_spans = windows(evidence, {
+                    part.evidence.evidence_id for span in value_spans for part in span
+                } - non_body)
+                value_match = next((match for value in literals if (match := match_text(value, body_spans))), None)
+                if value_match is None:
+                    raise invalid(path + ".value", "A component material does not establish the product/body material")
         unit_match = match_text(candidate.unit, value_spans) if candidate.unit else None
         if candidate.unit and (unit_match is None or (
             candidate.supporting_quote and not any(part.vendor for span in spans for part in span)
