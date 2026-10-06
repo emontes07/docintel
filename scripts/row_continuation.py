@@ -93,6 +93,23 @@ def path(work, name):
     return work / f"{PREFIX}-{name}.json"
 
 
+def baseline_path(work):
+    original = path(work, "baseline")
+    selected = path(work, "source-selection")
+    if selected.exists():
+        previous, current = release.private_json(original), release.private_json(selected)
+        require(current["supersedes_baseline_sha256"] == raw_sha(original)
+                and all(current.get(key) == value for key, value in previous.items() if key != "source_revision"),
+                "Superseding source selection must preserve the original prepared baseline")
+        return selected
+    return original
+
+
+def source_work(work):
+    original = work / CHILD
+    return original / "canonical-ledger" if baseline_path(work) != path(work, "baseline") else original
+
+
 def binding(decision, work=None):
     value = {"decision_sha256": sha(decision), "target": decision["target"]}
     if work is not None:
@@ -195,8 +212,8 @@ def validate(work, config, decision):
             and decision["approved_by"] == approval["approved_by"]
             and decision["policy"] == POLICY and all(type(value) is int for value in decision["policy"].values())
             and decision["window_policy"] == WINDOW_POLICY, "Exact bounded row-rerun decision required")
-    baseline = release.private_json(path(work, "baseline"))
-    require(raw_sha(path(work, "baseline")) == decision["baseline_sha256"]
+    baseline = release.private_json(baseline_path(work))
+    require(raw_sha(baseline_path(work)) == decision["baseline_sha256"]
             and baseline["work_root"] == str(work)
             and baseline["root_pin_sha256"] == raw_sha(prior.ROOT_PIN)
             and baseline["history"] == history(work)
@@ -208,8 +225,8 @@ def validate(work, config, decision):
     require(all(decision[key] == baseline[key] == value for key, value in expected.items()),
             "Decision source/root/approval/history binding changed")
     source_boundary(decision["source_revision"])
-    child = work / CHILD
-    require(not child.is_symlink() and child.resolve().parent == work, "Context must remain in the original root")
+    child = source_work(work)
+    require(not child.is_symlink() and child.resolve() == child, "Context must remain in the original root")
     for kind in ("backend", "frontend"):
         release.require_component_source_receipts(child, kind)
     require(release.verify_source(child)["revision"] == decision["source_revision"]
@@ -299,7 +316,7 @@ def ready(work, config, decision):
         for name in HELPER_FILES:
             local = release.ROOT / name
             require(local.read_bytes() == release.command(["git", "show", head + ":" + name], cwd=release.ROOT)
-                    == (work / CHILD / "source" / name).read_bytes(),
+                    == (source_work(work) / "source" / name).read_bytes(),
                     "Helper/publisher/test bytes must match committed and staged CI source")
         anchor = now()
         previous_amendment = release.private_json(work / "final-configure-attempt.json")["recovery"]
@@ -323,7 +340,7 @@ def readiness(work, decision):
             and all(value.get(key) == expected for key, expected in binding(decision).items())
             and value["source_revision"] == decision["source_revision"]
             and value["window_policy"] == WINDOW_POLICY, "Immutable row readiness binding changed")
-    require(raw_sha(path(work, "baseline")) == decision["baseline_sha256"]
+    require(raw_sha(baseline_path(work)) == decision["baseline_sha256"]
             and all(raw_sha(historical.evidence_path(work, decision[name + "_file"]))
                     == decision[name + "_sha256"] for name in ("gate", "snapshot", "reconciliation")),
             "Readiness prerequisite evidence changed")
@@ -528,7 +545,7 @@ def publish(work, config, decision):
                     "status": "attempted_outcome_unknown",
                 })
                 result = release.execute_publication(
-                    config, work / CHILD, kind, decision["source_revision"], attempt,
+                    config, source_work(work), kind, decision["source_revision"], attempt,
                     expires=instant(value["publication_expires_at"]), validate_upload_window=True,
                 )
                 build_cost(work, decision, kind, result)
@@ -540,19 +557,19 @@ def publish(work, config, decision):
         for kind in ("backend", "frontend"):
             result = receipt(work, kind + "-published", decision)
             images[kind], images[kind + "_run_id"] = result["image"], result["runId"]
-        release.save_once(work / CHILD / "images.json", images)
+        release.save_once(source_work(work) / "images.json", images)
         release.save_once(path(work, "published"), {**binding(decision, work),
-                                                   "images_sha256": raw_sha(work / CHILD / "images.json")})
+                                                   "images_sha256": raw_sha(source_work(work) / "images.json")})
 
 
 def published_config(work, config, decision):
     published = receipt(work, "published", decision)
-    candidate = work / CHILD / "images.json"
+    candidate = source_work(work) / "images.json"
     require(raw_sha(candidate) == published["images_sha256"], "Row image receipt changed")
     images = release.private_json(candidate)
     current = {**config, **{kind + "_image": images[kind] for kind in ("backend", "frontend")}}
-    release.require_release_images(current, work / CHILD)
-    release.require_pilot_build_receipts(current, work / CHILD)
+    release.require_release_images(current, source_work(work))
+    release.require_pilot_build_receipts(current, source_work(work))
     return current
 
 

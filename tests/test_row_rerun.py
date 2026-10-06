@@ -227,7 +227,7 @@ def load_hosted_records(root, descriptor_name, documents):
 
 
 def helper_bindings(root, approval, revision, hosted):
-    _, baseline_raw, baseline = private_json(root, "row-rerun-baseline.json")
+    _, baseline_raw, baseline = private_json(root, row_helper.baseline_path(root))
     _, target_raw, target = private_json(root, "target.json")
     assert baseline["work_root"] == str(root.resolve())
     assert baseline["baseline_revision"] == IMMUTABLE_BASELINE
@@ -530,6 +530,33 @@ def test_row_validation_is_read_only_and_binds_complete_result_history(row_case)
     assert len(amendment["result_sha256"]) == 4
     assert list(amendment["result_sha256"].values()).count(None) == 1
     assert approval["limits"]["input_tokens"] == 200000
+
+
+@pytest.mark.parametrize("reorder", ["ledger", "amendment", "both"])
+def test_row_ledger_comparison_ignores_json_key_order(row_case, reorder):
+    store, batch, approval, amendment = row_case
+    ledger = read_json(store, real_pilot.BUDGET_KEY)[0]
+    candidate = copy.deepcopy(amendment)
+    if reorder in {"ledger", "both"}:
+        ledger["executions"] = dict(reversed(list(ledger["executions"].items())))
+    if reorder in {"amendment", "both"}:
+        candidate["prior_execution_ids"].reverse()
+    before = all_records(store)
+    assert real_pilot._sha256(ledger) == amendment["ledger_sha256"]
+    assert real_pilot.validate_row_rerun(candidate, approval, batch, ledger, store) == candidate
+    assert all_records(store) == before
+
+
+def test_row_ledger_comparison_still_rejects_different_execution_ids(row_case):
+    store, batch, approval, amendment = row_case
+    candidate = copy.deepcopy(amendment)
+    candidate["prior_execution_ids"][0] = "f" * 64
+    before = all_records(store)
+    with pytest.raises(ValueError, match="unchanged consumed reservations"):
+        real_pilot.validate_row_rerun(
+            candidate, approval, batch, read_json(store, real_pilot.BUDGET_KEY)[0], store,
+        )
+    assert all_records(store) == before
 
 
 @pytest.mark.parametrize("field", [
