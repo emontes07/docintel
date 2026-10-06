@@ -22,7 +22,8 @@ fields (no credentials, prices guessed by code, or client-supplied approvals):
 * limits: products, executions, analysis, inference, search, web_retrieval, retrieval,
   analysis_pages, input_tokens, output_tokens, spend_microdollars (integers)
 * unit_prices_usd: analysis_page, input_token, output_token, search,
-  web_retrieval (positive decimal strings, per individual unit, never per 1M)
+  web_retrieval (decimal strings per individual unit, never per 1M). All must
+  be positive except web_retrieval, which may be zero for direct HTTPS pages.
 
 Enablement additionally requires DOCINTEL_REAL_PILOT_ENABLED=true. The operator
 allowlist is server-controlled: an uploaded name or a self-asserted verified flag
@@ -54,6 +55,14 @@ at most 1200 seconds. Only four selected-item inference requests are permitted,
 each reserving at most 30000 input-plus-output tokens. New analysis is forbidden.
 The remaining execution is charged before an immutable history audit and fenced
 conditional status recovery; every other batch item is explicitly deferred.
+
+The later fixed ``configuration/real-pilot-gapfill.json`` preserves that entire
+lineage, including the row-rerun amendment. It adds exactly one execution and
++1 inference/+151646 input/+2048 output capacity to the retained consumed ledger.
+Only the same two products, four internal and two optional web inferences, two
+WebIQ discoveries and four direct pages fit its fresh $5 incremental envelope.
+The original internal-only approval is never replaced; the effective full scope
+exists only for this hash-bound, runtime-policy-bound append-only amendment.
 """
 
 import base64
@@ -92,6 +101,21 @@ FINAL_RERUN_KEY = "configuration/real-pilot-final-rerun.json"
 FINAL_RERUN_AUDIT_KEY = "operations/real-pilot-final-rerun.json"
 ROW_RERUN_KEY = "configuration/real-pilot-row-rerun.json"
 ROW_RERUN_AUDIT_KEY = "operations/real-pilot-row-rerun.json"
+GAPFILL_KEY = "configuration/real-pilot-gapfill.json"
+GAPFILL_AUDIT_KEY = "operations/real-pilot-gapfill.json"
+GAPFILL_GRANTS = {
+    "additional_inference": 1, "additional_input_tokens": 151646,
+    "additional_output_tokens": 2048, "max_requests": 6,
+    "max_output_tokens": 12288, "incremental_microdollars": 5000000,
+}
+GAPFILL_FIELDS = {
+    "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
+    "ledger_sha256", "prior_row_sha256", "prior_row_audit_sha256", "prior_execution_ids",
+    "selected_item_keys", "item_sha256", "result_sha256", "cached_documents",
+    "readiness_at", "operating_expires_at", "not_before", "expires_at",
+    "public_web_policy", "web_environment", "web_prices", "fixed_cost_microdollars",
+    *GAPFILL_GRANTS,
+}
 FINAL_RERUN_FIELDS = {
     "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
     "ledger_sha256", "prior_recovery_sha256", "prior_execution_ids",
@@ -205,15 +229,15 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-def _price(value):
+def _price(value, *, allow_zero=False):
     if not isinstance(value, str) or not re.fullmatch(r"(?:0|[1-9][0-9]{0,8})(?:\.[0-9]{1,18})?", value):
-        raise ValueError("Real-pilot prices must be positive decimal strings per unit")
+        raise ValueError("Real-pilot prices must be decimal strings per unit")
     try:
         parsed = Decimal(value)
     except InvalidOperation:
         raise ValueError("Invalid real-pilot unit price") from None
-    if not parsed.is_finite() or parsed <= 0:
-        raise ValueError("Real-pilot unit prices must be positive")
+    if not parsed.is_finite() or parsed < 0 or (parsed == 0 and not allow_zero):
+        raise ValueError("Real-pilot unit prices must be positive; only direct web_retrieval may be zero")
     return parsed
 
 
@@ -298,6 +322,28 @@ def validate_row_rerun(amendment, approval, batch, ledger, store):
     return copy.deepcopy(checker.row_rerun)
 
 
+def validate_gapfill(amendment, approval, batch, ledger, store):
+    """Read-only verification; never replaces an approval or resets consumption."""
+    class ReadOnlyCandidate:
+        def read_bytes(self, key):
+            if key == GAPFILL_KEY:
+                return json.dumps(amendment).encode(), None
+            return store.read_bytes(key)
+
+    if (read_json(store, APPROVAL_KEY)[0] != approval
+            or read_json(store, BUDGET_KEY)[0] != ledger
+            or ledger.get("approval_sha256") != _sha256(approval) or ledger.get("invalidated")):
+        raise ValueError("Gapfill original approval or consumption binding changed")
+    checker = RealPilotGuard.__new__(RealPilotGuard)
+    checker.store, checker.batch = ReadOnlyCandidate(), copy.deepcopy(batch)
+    try:
+        checker._validate_approval(approval, verify_runtime=False)
+        checker.verify_recovery(ledger)
+    except (KeyError, TypeError, AttributeError):
+        raise ValueError("Incomplete or malformed gapfill prerequisite") from None
+    return copy.deepcopy(checker.gapfill)
+
+
 class RealPilotGuard:
     def __init__(self, store, batch_record):
         self.store = store
@@ -305,6 +351,7 @@ class RealPilotGuard:
         self._mutex = threading.Lock()
         self._execution_id = None
         self._operation_keys = {}
+        self._last_gapfill_inference = None
         try:
             approval = self._validate()
         except (ValueError, Missing):
@@ -319,15 +366,141 @@ class RealPilotGuard:
 
     @property
     def execution_scope(self):
-        return approval_scope(self._approval)
+        return "full" if self.gapfill else approval_scope(self._approval)
 
     @property
     def active_recovery(self):
-        return self.row_rerun or self.final_rerun or self.recovery
+        return self.gapfill or self.row_rerun or self.final_rerun or self.recovery
 
     def result_key(self, item_key):
         root = f"results/{self.batch['id']}/{item_key}"
         return f"{root}/attempts/{self.recovery_sha256}.json" if self.final_rerun else root + ".json"
+
+    def _gapfill(self, approval):
+        try:
+            raw, _ = self.store.read_bytes(GAPFILL_KEY)
+        except Missing:
+            return None
+        if len(raw) > 65536:
+            raise ValueError("Gapfill metadata exceeds its bound")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) != GAPFILL_FIELDS:
+            raise ValueError("Gapfill amendment schema mismatch")
+        if any(not isinstance(value[name], dict) for name in
+               ("cached_documents", "item_sha256", "result_sha256", "web_prices")):
+            raise ValueError("Gapfill requires complete canonical record and price bindings")
+        if (self.row_rerun is None or value["approved"] is not True
+                or type(value["schema_version"]) is not int or value["schema_version"] != 1
+                or value["approved_by"] != approval["approved_by"]
+                or value["approval_sha256"] != _sha256(approval)
+                or value["batch_sha256"] != binding_digest(self.batch)
+                or value["prior_row_sha256"] != _sha256(self.row_rerun)
+                or value["selected_item_keys"] != self.row_rerun["selected_item_keys"]
+                or set(value["cached_documents"]) != set(self.row_rerun["cached_documents"])
+                or len(value["selected_item_keys"]) != 2
+                or any(type(value[name]) is not int or value[name] != expected
+                       for name, expected in GAPFILL_GRANTS.items())):
+            raise ValueError("Gapfill must preserve the exact prior scope and additive grants")
+        prior = value["prior_execution_ids"]
+        if (not isinstance(prior, list) or len(prior) != 4 or len(set(prior)) != 4
+                or set(value["item_sha256"]) != set(value["selected_item_keys"])
+                or not isinstance(value["result_sha256"], dict)):
+            raise ValueError("Gapfill requires four consumed executions and exact history")
+        hashes = [value["ledger_sha256"], value["prior_row_audit_sha256"], *prior,
+                  *value["item_sha256"].values(), *value["result_sha256"].values(),
+                  *value["cached_documents"].values()]
+        if not all(isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest) for digest in hashes):
+            raise ValueError("Gapfill requires canonical SHA-256 bindings")
+        audit, _ = read_json(self.store, ROW_RERUN_AUDIT_KEY)
+        if (_sha256(audit) != value["prior_row_audit_sha256"]
+                or audit.get("amendment_sha256") != value["prior_row_sha256"]
+                or audit.get("execution_id") not in prior):
+            raise ValueError("Gapfill prior row audit changed")
+        ready, deadline = (_timestamp(value[name]) for name in ("readiness_at", "operating_expires_at"))
+        start, end = (_timestamp(value[name]) for name in ("not_before", "expires_at"))
+        if ((deadline - ready).total_seconds() != 5400
+                or ready < _timestamp(self.row_rerun["operating_expires_at"])
+                or not ready <= start < end <= deadline):
+            raise ValueError("Gapfill requires a new readiness-anchored 90-minute window")
+        from backend.core.websearch_policy import OptionalWebPolicy
+
+        policy = OptionalWebPolicy.model_validate(value["public_web_policy"])
+        if (policy.batch_sha256 != value["batch_sha256"]
+                or set(policy.items) != set(value["selected_item_keys"])
+                or (policy.max_search_calls, policy.max_direct_page_attempts, policy.max_inference_calls,
+                    policy.max_input_tokens, policy.max_output_tokens) != (2, 4, 2, 26000, 2048)):
+            raise ValueError("Gapfill requires the exact two-item optional web policy")
+        for item in self.batch["items"]:
+            if item["item_key"] not in policy.items:
+                continue
+            public = policy.items[item["item_key"]]
+            sources = {entry["source_id"]: entry for entry in item["sources"] if entry["kind"] == "web"}
+            if (public.mpn != item["manifest"]["product"]["mpn"]
+                    or public.manufacturer.casefold() != "mueller"
+                    or not set(public.source_ids) <= set(sources)
+                    or not set(public.attribute_terms) <= {
+                        entry["attribute_id"] for entry in item["manifest"]["attributes"]}
+                    or set(public.allowed_hosts) != {
+                        urlsplit(sources[key]["url"]).hostname for key in public.source_ids}):
+                raise ValueError("Gapfill public identities and exact source hosts changed")
+        environment = value["web_environment"]
+        if (not isinstance(environment, dict) or set(environment) != {"WEBSEARCH_PROVIDER", "WEBIQ_ENDPOINT"}
+                or environment["WEBSEARCH_PROVIDER"] != "webiq"):
+            raise ValueError("Gapfill permits only WebIQ /web discovery")
+        from backend.core.websearch_webiq import ENDPOINT
+
+        if environment["WEBIQ_ENDPOINT"] != ENDPOINT:
+            raise ValueError("Gapfill requires the immutable adapter's exact WebIQ /web endpoint")
+        if set(value["web_prices"]) != {"search", "web_retrieval"}:
+            raise ValueError("Explicit conservative web unit prices are required")
+        prices = {key: _price(price, allow_zero=key == "web_retrieval")
+                  for key, price in value["web_prices"].items()}
+        fixed = _integer(value["fixed_cost_microdollars"], "fixed cost", minimum=198000)
+        # One 2-vCPU/900s build plus one 1-vCPU/2GiB/600s worker, no historical stacking.
+        model = self._cost(approval, "inference", 151646, 12288, 0)
+        web = int(((2 * prices["search"] + 4 * prices["web_retrieval"]) * 1000000).to_integral_value(rounding=ROUND_CEILING))
+        if (fixed + model + web > 5000000 or policy.max_cost_microdollars < web + self._cost(
+                approval, "inference", 52000, 4096, 0) or policy.max_cost_microdollars > 5000000 - fixed):
+            raise ValueError("Gapfill conservative fresh incremental envelope exceeds $5")
+        return value
+
+    def _gapfill_states(self):
+        value, states, results = self.gapfill, {}, {}
+        for item in self.batch["items"]:
+            key = item["item_key"]
+            raw, version = self.store.read_bytes(f"items/{self.batch['id']}/{key}.json")
+            state = json.loads(raw)
+            if key not in value["selected_item_keys"]:
+                if state.get("state") != "deferred":
+                    raise ValueError("Gapfill must leave every other product deferred")
+                continue
+            if (_sha256(state) != value["item_sha256"][key]
+                    or state.get("state") not in {"partial_draft", "unresolved", "completed"}
+                    or state.get("recovery_sha256") != value["prior_row_sha256"]):
+                raise ValueError("Gapfill requires exact closed row item history")
+            root = f"results/{self.batch['id']}/{key}"
+            previous, depth = state, 0
+            while previous is not None:
+                if not isinstance(previous, dict) or depth >= 32:
+                    raise ValueError("Gapfill item history is malformed")
+                target = previous.get("result_key") or root + ".json"
+                if not (target == root + ".json" or re.fullmatch(
+                        re.escape(root) + r"/attempts/[a-f0-9]{64}\.json", target)):
+                    raise ValueError("Gapfill history references an unrelated result")
+                try:
+                    results[target] = _sha256(read_json(self.store, target)[0])
+                except Missing:
+                    pass
+                previous, depth = previous.get("previous_attempt"), depth + 1
+            try:
+                self.store.read_bytes(f"{root}/attempts/{_sha256(value)}.json")
+            except Missing:
+                states[key] = raw, version
+                continue
+            raise Conflict("Gapfill result already exists; no retry")
+        if not results or results != value["result_sha256"]:
+            raise ValueError("Gapfill immutable result history changed")
+        return states
 
     def _final_rerun(self, approval):
         try:
@@ -556,7 +729,8 @@ class RealPilotGuard:
     def check_recovery_cache(self, key):
         if self.active_recovery is not None:
             raw, _ = self.store.read_bytes(key)
-            if self.active_recovery["cached_documents"].get(key) != hashlib.sha256(raw).hexdigest():
+            digest = _sha256(json.loads(raw)) if self.gapfill else hashlib.sha256(raw).hexdigest()
+            if self.active_recovery["cached_documents"].get(key) != digest:
                 raise ValueError("Recovery parse cache is missing, changed or not approved")
 
     def _recovery_states(self):
@@ -587,6 +761,25 @@ class RealPilotGuard:
 
     def verify_recovery(self, ledger):
         """Read-only preflight; no new allowance, recovery write or service call."""
+        if self.gapfill is not None:
+            value = self.gapfill
+            if (_sha256(ledger) != value["ledger_sha256"]
+                    or set(ledger["executions"]) != set(value["prior_execution_ids"])
+                    or ledger["attempted"]["inference"] != 11
+                    or any(ledger["attempted"][name] for name in EXTERNAL_OPERATIONS)
+                    or ledger["reserved"]["input_tokens"] != 257868
+                    or ledger["reserved"]["output_tokens"] != 22528
+                    or ledger.get("row_rerun", {}).get("sha256") != value["prior_row_sha256"]
+                    or ledger.get("gapfill")):
+                raise ValueError("Gapfill requires unchanged consumption and four prior executions")
+            for key in value["cached_documents"]:
+                self.check_recovery_cache(key)
+            self._gapfill_states()
+            try:
+                self.store.read_bytes(GAPFILL_AUDIT_KEY)
+            except Missing:
+                return
+            raise Conflict("Gapfill already attempted; no retry")
         if self.row_rerun is not None:
             amendment = self.row_rerun
             if (_sha256(ledger) != amendment["ledger_sha256"]
@@ -645,10 +838,33 @@ class RealPilotGuard:
 
     def prepare_recovery(self, fence):
         """Called under the batch lease, after charging the final worker slice."""
-        if self.recovery is None:
+        if self.active_recovery is None:
             return
         with self._mutex, self.store.lease(BUDGET_KEY):
             _, ledger, _ = self._fresh_ledger()
+            if self.gapfill is not None:
+                if ledger.get("gapfill", {}).get("execution_id") != self._execution_id:
+                    raise Conflict("Gapfill execution exception is not reserved")
+                states = self._gapfill_states()
+                fence()
+                write_json(self.store, GAPFILL_AUDIT_KEY, {
+                    "amendment": self.gapfill, "amendment_sha256": self.recovery_sha256,
+                    "execution_id": self._execution_id, "recorded_at": _now().isoformat(),
+                    "prior_states": {
+                        key: {"base64": base64.b64encode(raw).decode(), "version": version}
+                        for key, (raw, version) in states.items()
+                    },
+                    "prior_result_sha256": self.gapfill["result_sha256"],
+                    "prior_row_audit_sha256": self.gapfill["prior_row_audit_sha256"],
+                })
+                for key, (raw, version) in states.items():
+                    fence()
+                    write_json(self.store, f"items/{self.batch['id']}/{key}.json", {
+                        "id": key, "batch_id": self.batch["id"], "state": "recovery_ready",
+                        "requested_mode": "real_pilot", "recovery_sha256": self.recovery_sha256,
+                        "result_key": self.result_key(key), "previous_attempt": json.loads(raw),
+                    }, version)
+                return
             if self.row_rerun is not None:
                 if ledger.get("row_rerun", {}).get("execution_id") != self._execution_id:
                     raise Conflict("Row rerun execution exception is not reserved")
@@ -766,6 +982,7 @@ class RealPilotGuard:
         self.recovery = self._recovery(approval)
         self.final_rerun = self._final_rerun(approval)
         self.row_rerun = self._row_rerun(approval)
+        self.gapfill = self._gapfill(approval)
         window = self.active_recovery or approval
         original_start, original_end = _timestamp(approval["not_before"]), _timestamp(approval["expires_at"])
         if self.recovery is not None and not 0 < (original_end - original_start).total_seconds() <= 1200:
@@ -790,10 +1007,18 @@ class RealPilotGuard:
         required_prices = INTERNAL_PRICE_KEYS if scope == "internal_only" else PRICE_KEYS
         if not isinstance(prices, dict) or set(prices) != required_prices:
             raise ValueError("All conservative upper-bound unit prices are required")
-        for price in prices.values():
-            _price(price)
+        for name, price in prices.items():
+            _price(price, allow_zero=name == "web_retrieval")
         self._validate_batch(approval)
         self._validate_environment(approval, verify_runtime=verify_runtime)
+        if self.gapfill:
+            from backend.core.websearch_policy import configured_optional_web_policy
+
+            if verify_runtime:
+                policy = configured_optional_web_policy()
+                if (policy is None or policy.model_dump(mode="json") != self.gapfill["public_web_policy"]
+                        or any(os.environ.get(key) != value for key, value in self.gapfill["web_environment"].items())):
+                    raise ValueError("Gapfill runtime public policy or WebIQ endpoint changed")
 
     def _validate_batch(self, approval):
         batch = self.batch
@@ -844,7 +1069,8 @@ class RealPilotGuard:
         scope = approval_scope(approval)
         if scope == "internal_only" and set(expected) & EXTERNAL_ENVIRONMENT_KEYS:
             raise ValueError("Internal-only approval must omit external service environment settings")
-        if verify_runtime and os.environ.get("DOCINTEL_REAL_PILOT_EXECUTION_SCOPE", scope) != scope:
+        runtime_scope = "full" if self.gapfill else scope
+        if verify_runtime and os.environ.get("DOCINTEL_REAL_PILOT_EXECUTION_SCOPE", runtime_scope) != runtime_scope:
             raise ValueError("Real-pilot runtime execution scope mismatch")
         required = {"AZURE_CLIENT_ID"}
         limits = approval["limits"]
@@ -900,6 +1126,8 @@ class RealPilotGuard:
             raise ValueError("Final rerun changed after budget use")
         if ledger.get("row_rerun") and ledger["row_rerun"]["sha256"] != _sha256(self.row_rerun):
             raise ValueError("Row rerun changed after budget use")
+        if ledger.get("gapfill") and ledger["gapfill"]["sha256"] != _sha256(self.gapfill):
+            raise ValueError("Gapfill changed after budget use")
 
     def _fresh_ledger(self):
         try:
@@ -919,7 +1147,7 @@ class RealPilotGuard:
                 write_json(self.store, BUDGET_KEY, ledger, version)
             raise
         if ledger is None:
-            if self.recovery is not None:
+            if self.active_recovery is not None:
                 raise ValueError("Recovery cannot create a fresh consumption ledger")
             ledger = {
                 "schema_version": 1, "approval_id": self.approval_id,
@@ -937,6 +1165,14 @@ class RealPilotGuard:
                 "cost_basis": "approved_upper_bound_prices_not_actual_billing",
                 "executions": {}, "reservations": {},
             }
+        if self.gapfill:
+            approval = copy.deepcopy(approval)
+            approval["execution_scope"] = "full"
+            approval["unit_prices_usd"].update(self.gapfill["web_prices"])
+            approval["limits"].update(inference=17, input_tokens=409514, output_tokens=34816,
+                                      search=2, web_retrieval=4, analysis=0, retrieval=0)
+            baseline = ledger.get("gapfill", {}).get("cost_before", ledger["reserved"]["microdollars"])
+            approval["limits"]["spend_microdollars"] = baseline + 5000000 - self.gapfill["fixed_cost_microdollars"]
         return approval, ledger, version
 
     def before_execution(self, execution_key):
@@ -951,14 +1187,24 @@ class RealPilotGuard:
                 raise ValueError("Worker must explicitly select real_pilot mode")
             if key in ledger["executions"]:
                 raise Conflict("Real-pilot execution already attempted; no automatic retry")
-            limit = approval["limits"]["executions"] + (1 if self.final_rerun else 0) + (1 if self.row_rerun else 0)
+            limit = approval["limits"]["executions"] + bool(self.final_rerun) + bool(self.row_rerun) + bool(self.gapfill)
             if len(ledger["executions"]) >= limit:
                 raise ValueError("Real-pilot execution budget exhausted")
             self.verify_recovery(ledger)
             if self.final_rerun and (_timestamp(self.active_recovery["expires_at"]) - _now()).total_seconds() < 600:
                 raise ValueError("Final rerun requires the full 600-second execution window")
             ledger["executions"][key] = {"started_at": _now().isoformat()}
-            if self.row_rerun is not None:
+            if self.gapfill is not None:
+                ledger["gapfill"] = {
+                    "sha256": self.recovery_sha256, "execution_id": key,
+                    "baseline_sha256": self.gapfill["ledger_sha256"],
+                    "inference_before": 11, "input_before": 257868, "output_before": 22528,
+                    "cost_before": ledger["reserved"]["microdollars"],
+                    "not_before": self.gapfill["not_before"], "expires_at": self.gapfill["expires_at"],
+                    "selected_item_keys": self.gapfill["selected_item_keys"],
+                    "additional_execution_exception": 1, **GAPFILL_GRANTS,
+                }
+            elif self.row_rerun is not None:
                 ledger["row_rerun"] = {
                     "sha256": self.recovery_sha256, "execution_id": key,
                     "baseline_sha256": self.row_rerun["ledger_sha256"],
@@ -1009,7 +1255,8 @@ class RealPilotGuard:
 
     @staticmethod
     def _cost(approval, operation, input_tokens, output_tokens, analysis_pages):
-        prices = {key: _price(value) for key, value in approval["unit_prices_usd"].items()}
+        prices = {key: _price(value, allow_zero=key == "web_retrieval")
+                  for key, value in approval["unit_prices_usd"].items()}
         with localcontext() as context:
             context.prec = 60
             cost = prices["input_token"] * input_tokens + prices["output_token"] * output_tokens
@@ -1042,9 +1289,33 @@ class RealPilotGuard:
         key = _sha256({"operation": operation, "operation_key": operation_key})
         with self._mutex, self.store.lease(BUDGET_KEY):
             approval, ledger, version = self._fresh_ledger()
+            gapfill_tier = None
             if approval_scope(approval) == "internal_only" and operation in EXTERNAL_OPERATIONS:
                 raise ValueError("External operations are forbidden by internal-only approval")
-            if self.recovery is not None:
+            if self.gapfill is not None:
+                if operation not in {"inference", "search", "web_retrieval"} or item_key not in self.gapfill["selected_item_keys"]:
+                    raise ValueError("Gapfill forbids analysis, internal retrieval and other products")
+                previous = [entry for entry in ledger["reservations"].values()
+                            if entry["execution_id"] == self._execution_id and entry["item_key"] == item_key]
+                counts = {name: sum(entry["operation"] == name for entry in previous)
+                          for name in ("inference", "search", "web_retrieval")}
+                maximum = {"inference": 3, "search": 1, "web_retrieval": 2}[operation]
+                if counts[operation] >= maximum:
+                    raise RealPilotBudgetExceeded("gapfill_item_" + operation, 1, 0)
+                if operation == "inference":
+                    gapfill_tier = "web" if counts["search"] else "internal"
+                    used = sum(entry.get("gapfill_tier") == gapfill_tier for entry in previous)
+                    if used >= (1 if gapfill_tier == "web" else 2):
+                        raise RealPilotBudgetExceeded("gapfill_" + gapfill_tier + "_inference", 1, 0)
+                    if (max_output_tokens != 2048 or max_input_tokens + max_output_tokens > 30000
+                            or max_input_tokens > (26000 if counts["search"] else 27952)
+                            or (not counts["search"] and counts["inference"] >= 2)):
+                        raise ValueError("Gapfill inference exceeds complete request or per-tier bounds")
+                elif max_input_tokens or max_output_tokens:
+                    raise ValueError("Web operations cannot reserve model tokens")
+                if operation == "web_retrieval" and not counts["search"]:
+                    raise ValueError("Direct pages require the selected item's bounded WebIQ discovery")
+            elif self.recovery is not None:
                 if operation != "inference" or item_key not in self.recovery["selected_item_keys"]:
                     raise ValueError("Recovery permits only selected-item inference; new analysis is forbidden")
                 if max_input_tokens + max_output_tokens > 30000:
@@ -1058,7 +1329,7 @@ class RealPilotGuard:
             if key in ledger["reservations"]:
                 raise Conflict("Real-pilot operation already attempted; no automatic retry")
             limits = dict(approval["limits"])
-            if self.row_rerun is not None:
+            if self.row_rerun is not None and self.gapfill is None:
                 limits["input_tokens"] = self.row_rerun["effective_input_ceiling"]
                 available_output = self.row_rerun["max_output_tokens"] - (
                     ledger["reserved"]["output_tokens"] - ledger["row_rerun"]["output_before"]
@@ -1085,6 +1356,8 @@ class RealPilotGuard:
                 "estimated_usage_cost_microdollars": None,
                 "status": "attempt_reserved_completion_unknown",
             }
+            if gapfill_tier is not None:
+                reservation["gapfill_tier"] = gapfill_tier
             ledger["attempted"][operation] += 1
             for name, value in usage.items():
                 ledger["reserved"][name] += value
@@ -1146,4 +1419,6 @@ class RealPilotGuard:
             output["final_rerun"] = ledger["final_rerun"]
         if ledger.get("row_rerun"):
             output["row_rerun"] = ledger["row_rerun"]
+        if ledger.get("gapfill"):
+            output["gapfill"] = ledger["gapfill"]
         return copy.deepcopy(output)
