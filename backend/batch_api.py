@@ -1,5 +1,6 @@
 """Authenticated batch routes shared by the deployed backend and development app."""
 
+import json
 from functools import lru_cache
 from typing import Literal
 from uuid import UUID
@@ -8,6 +9,7 @@ from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Quer
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.answer_key import AnswerKeyError, AnswerKeyService
 from backend.batch import BatchService
 from backend.batch_auth import actor
 from backend.batch_store import Conflict, Missing, configured_store
@@ -49,6 +51,8 @@ def call(operation):
         raise HTTPException(404, "Batch or item not found") from None
     except Conflict as error:
         raise HTTPException(409, str(error)) from None
+    except AnswerKeyError as error:
+        raise HTTPException(422, str(error)) from None
     except ValueError:
         raise HTTPException(422, "Invalid workbook, batch selection, or review contract. Check data-only XLSX, required columns, explicit bindings, and typed values") from None
     except HTTPException:
@@ -121,6 +125,66 @@ def review(batch_id: str, item_key: str, request: Review, identity=Depends(actor
 def export(batch_id: str, identity=Depends(actor)):
     content = call(lambda: service().export(batch_id, identity))
     return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": 'attachment; filename="docintel-batch.xlsx"', "Cache-Control": "no-store"})
+
+
+@router.post("/{batch_id}/scoring/snapshots")
+def scoring_snapshot(batch_id: str, identity=Depends(actor)):
+    return call(lambda: AnswerKeyService(service().store).snapshot(batch_id, identity))
+
+
+@router.get("/scoring/records")
+def scoring_records(identity=Depends(actor)):
+    return call(lambda: AnswerKeyService(service().store).list_records(identity))
+
+
+@router.get("/scoring/snapshots/{snapshot_id}")
+def scoring_snapshot_detail(snapshot_id: str, identity=Depends(actor)):
+    return call(lambda: AnswerKeyService(service().store).get_snapshot(snapshot_id, identity))
+
+
+@router.get("/scoring/answer-keys/{version_id}")
+def scoring_answer_key(version_id: str, identity=Depends(actor)):
+    return call(lambda: AnswerKeyService(service().store).get_version(version_id, identity))
+
+
+@router.get("/scoring/snapshots/{snapshot_id}/template")
+def scoring_template(snapshot_id: str, package_id: str | None = Query(default=None), identity=Depends(actor)):
+    content = call(lambda: AnswerKeyService(service().store).template(snapshot_id, identity, package_id))
+    return Response(content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="reviewer-scoring.xlsx"', "Cache-Control": "no-store"})
+
+
+@router.post("/scoring/snapshots/{snapshot_id}/reviewer-packages")
+async def scoring_register_baseline(snapshot_id: str, baseline: UploadFile = File(),
+                                    candidate_bindings: str | None = Form(default=None),
+                                    confirm_trusted_baseline: bool = Form(default=False), identity=Depends(actor)):
+    if not confirm_trusted_baseline:
+        raise HTTPException(422, "Explicitly confirm that this is the trusted, unedited reviewer baseline")
+    try:
+        bindings = json.loads(candidate_bindings) if candidate_bindings is not None else None
+    except json.JSONDecodeError:
+        raise HTTPException(422, "Private candidate_bindings must be valid JSON") from None
+    content = await baseline.read(MAX_BYTES + 1)
+    return call(lambda: AnswerKeyService(service().store).register_baseline(snapshot_id, identity, content, bindings))
+
+
+@router.post("/scoring/snapshots/{snapshot_id}/answer-keys")
+async def scoring_ingest(snapshot_id: str, workbook: UploadFile = File(),
+                         previous_version: str | None = Form(default=None),
+                         package_id: str | None = Form(default=None), identity=Depends(actor)):
+    content = await workbook.read(MAX_BYTES + 1)
+    return call(lambda: AnswerKeyService(service().store).ingest(snapshot_id, identity, content, previous_version, package_id))
+
+
+@router.get("/scoring/snapshots/{snapshot_id}/score")
+def scoring_score(snapshot_id: str, answer_key_id: str | None = Query(default=None), identity=Depends(actor)):
+    return call(lambda: AnswerKeyService(service().store).score(snapshot_id, identity, answer_key_id))
+
+
+@router.get("/scoring/snapshots/{snapshot_id}/delta")
+def scoring_delta(snapshot_id: str, previous_snapshot_id: str = Query(),
+                  answer_key_id: str | None = Query(default=None), identity=Depends(actor)):
+    return call(lambda: AnswerKeyService(service().store).delta(snapshot_id, previous_snapshot_id, identity, answer_key_id))
 
 
 development_app = FastAPI(title="DocIntel batch development")
