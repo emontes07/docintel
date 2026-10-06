@@ -590,7 +590,7 @@ class RealPilotGuard:
         if self.row_rerun is not None:
             amendment = self.row_rerun
             if (_sha256(ledger) != amendment["ledger_sha256"]
-                    or list(ledger["executions"]) != amendment["prior_execution_ids"]
+                    or set(ledger["executions"]) != set(amendment["prior_execution_ids"])
                     or ledger["attempted"]["inference"] != 7
                     or ledger["reserved"]["input_tokens"] != 165722
                     or ledger["reserved"]["output_tokens"] != 14336

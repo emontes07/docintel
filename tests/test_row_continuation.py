@@ -91,7 +91,7 @@ def row_state(final_state, monkeypatch):
     state.row_child = child
 
     def stage(revision, work):
-        assert work == child and revision == state.revision
+        assert work == state.row_child and revision == state.revision
         shutil.copytree(state.final_child / "source", work / "source")
         shutil.copytree(state.final_child / "context", work / "context")
         for name in ("scripts/row_continuation.py", "scripts/release.py", "scripts/pilot_continuation.py",
@@ -392,6 +392,44 @@ def test_end_to_end_preserves_history_and_uses_only_fourth_attempt(row_state):
         row.activate(state.work, state.config, state.decision)
     with pytest.raises(ValueError, match="retry"):
         row.publish(state.work, state.config, state.decision)
+
+
+def test_superseding_source_preserves_prepared_tree_and_existing_allowances(row_state):
+    state = row_state
+    original_baseline = row.path(state.work, "baseline").read_bytes()
+    original_child = state.row_child
+    prepared = {path: path.read_bytes() for path in original_child.rglob("*") if path.is_file()}
+    original_policy = copy.deepcopy(state.decision["policy"])
+    state.revision = "c" * 40
+    selected = {
+        **state.baseline, "source_revision": state.revision,
+        "supersedes_baseline_sha256": row.raw_sha(row.path(state.work, "baseline")),
+    }
+    selected_path = row.path(state.work, "source-selection")
+    release.save_once(selected_path, selected)
+    state.row_child = row.source_work(state.work)
+    assert state.row_child == original_child / "canonical-ledger"
+    release.stage(state.revision, state.row_child)
+    state.gate["source_revision"] = state.revision
+    release.save(row.path(state.work, "private-gate"), state.gate)
+    state.decision.update(
+        source_revision=state.revision, baseline_sha256=row.raw_sha(selected_path),
+        gate_sha256=row.raw_sha(row.path(state.work, "private-gate")),
+        validation_sha256=row.sha({name: row.raw_sha(state.row_child / name) for name in row.VALIDATION_FILES}),
+    )
+    row.validate(state.work, state.config, state.decision)
+    assert not state.calls and not state.console_calls
+    deployed(state)
+    row.activate(state.work, state.config, state.decision)
+    assert row.receipt(state.work, "worker-attempt", state.decision)["attempt"] == 4
+    assert row.receipt(state.work, "closed", state.decision)
+    assert state.decision["policy"] == original_policy
+    assert row.path(state.work, "baseline").read_bytes() == original_baseline
+    assert all(path.read_bytes() == raw for path, raw in prepared.items())
+    assert all((state.work / name).read_bytes() == raw for name, raw in state.old_bytes.items())
+    assert len([call for call in state.calls if call[:3] == ("containerapp", "job", "start")]) == 1
+    with pytest.raises(ValueError, match="already attempted"):
+        release.save_once(selected_path, selected)
 
 
 @pytest.mark.parametrize("failure", ["unknown", "backend_late", "frontend_upload_late"])

@@ -876,6 +876,12 @@ is authorized.
 exports the exact successor and writes the append-only baseline; it performs no
 Azure operations and starts no clock. Retain the usual exact-source clean,
 backend/frontend smoke and merged-main `ci.json` receipts in `row-rerun-v1`.
+The explicitly authorized canonical-ledger correction may select a newer
+CI-validated source with a create-once `row-rerun-source-selection.json`: retain
+all original baseline fields, replace only `source_revision`, and bind the old
+receipt with `supersedes_baseline_sha256`. Its source/CI context lives under
+`row-rerun-v1/canonical-ledger`; the original prepared tree and receipts remain
+unchanged. This selection does not create or renew any allowance or clock.
 The approved private decision uses the fields in `DECISION_FIELDS` and references
 three owner-only, root-confined JSON files by basename and raw SHA-256:
 
