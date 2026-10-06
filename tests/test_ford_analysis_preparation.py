@@ -5,10 +5,15 @@ import base64
 import json
 import socket
 from datetime import datetime, timezone
+from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.core.exceptions import ClientAuthenticationError
+from azure.core.pipeline.transport import HttpTransport
+from azure.identity._credentials import azure_cli
 
 from backend import analysis_provenance
 from backend.batch_store import Conflict, Missing, read_json, write_json
@@ -176,6 +181,59 @@ def fake_credential(packet, **overrides):
         token=token, expires_on=datetime.now(timezone.utc).timestamp() + 3600,
     ))
     return analysis_provenance.VerifiedOperatorCredential(inner, packet["analysis_identity"])
+
+
+def test_native_sdk_reproduces_conflicting_cli_selectors_before_di_transport(case, monkeypatch):
+    _, packet, _ = case
+    identity = packet["analysis_identity"]
+    commands = []
+
+    def rejected_command(arguments, timeout):
+        commands.append(arguments)
+        assert "--tenant" in arguments and "--subscription" in arguments
+        raise ClientAuthenticationError(message="Please specify only one of subscription and tenant, not both")
+
+    monkeypatch.setattr(azure_cli, "_run_command", rejected_command)
+    credential = azure_cli.AzureCliCredential(
+        tenant_id=identity["tenant_id"], subscription=identity["subscription_id"],
+    )
+    transport = MagicMock(spec=HttpTransport)
+    client = DocumentIntelligenceClient(
+        "https://synthetic.cognitiveservices.azure.com", credential=credential,
+        transport=transport, retry_total=0,
+    )
+    try:
+        with pytest.raises(ClientAuthenticationError, match="only one"):
+            client.begin_analyze_document(
+                "prebuilt-layout", body=BytesIO(b"%PDF-1.7 synthetic\n%%EOF"), pages="1-5",
+            )
+    finally:
+        client.close()
+    assert len(commands) == 1
+    transport.send.assert_not_called()
+
+
+def test_operator_factory_uses_native_cli_with_only_tenant_selector(case, monkeypatch):
+    _, packet, _ = case
+    identity = packet["analysis_identity"]
+    commands = []
+    token = fake_credential(packet)._credential.get_token()
+
+    def successful_command(arguments, timeout):
+        commands.append(arguments)
+        assert "--tenant" in arguments and "--subscription" not in arguments
+        assert arguments[arguments.index("--tenant") + 1] == identity["tenant_id"]
+        return json.dumps({"accessToken": token.token, "expires_on": int(token.expires_on)})
+
+    monkeypatch.setattr(azure_cli, "_run_command", successful_command)
+    monkeypatch.setattr("azure.identity.AzureCliCredential", azure_cli.AzureCliCredential)
+    credential = prep.operator_credential(
+        {"tenant": identity["tenant_id"], "subscription": identity["subscription_id"]}, packet,
+    )
+    credential.get_token(analysis_provenance.COGNITIVE_SCOPE)
+    assert len(commands) == 1
+    assert credential.verified_identity["principal_id"] == identity["principal_id"]
+    assert credential.verified_identity["subscription_id"] == identity["subscription_id"]
 
 
 def run(case, **kwargs):

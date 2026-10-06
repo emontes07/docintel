@@ -62,10 +62,13 @@ acknowledged by the API before the local SDK is constructed.
 2. API console performs the claim/archive/CAS charge. It returns metadata only,
    never PDF bytes or credentials. No SDK submission is allowed without an
    unambiguous acknowledged claim.
-3. Local `AzureCliCredential(tenant_id=..., subscription=...)` makes the single
+3. Local `AzureCliCredential(tenant_id=...)` makes the single
    `prebuilt-layout` request, API `2024-11-30`, `pages=1-5`. SDK total/connect/
    read/status retries are all zero; result wait is bounded to 120 seconds.
    Existing production byte parsing and mapping are reused.
+   Subscription selection is independently verified with the existing account
+   check; Azure CLI rejects simultaneous tenant and subscription token selectors.
+   The actual credential identity/audience check runs before the storage claim.
 4. The credential wrapper checks the actual credential token's `oid`, `tid` and
    Cognitive Services audience **in local memory only**. It records allowlisted
    identity metadata, not the token. This is not a claim of local JWT signature
@@ -117,6 +120,12 @@ Plan creation is offline and create-once:
 Plans v1–v3 and their gates remain preserved but are superseded for this changed
 identity route. The plan pins the existing API source/image, exact helper and
 storage-program hashes, latest semantic history, both identities and local PDF.
+
+The first live v4 claim was retained, but its local credential request failed
+before DI request transport because it supplied both selectors. No service
+operation ID or Ford cache was produced. Its reservation and failure are not
+refunded or overwritten. The corrected code does not authorize rerunning that
+one-use helper or resuming its consumed claim.
 
 The parent records a **narrow envelope derived from the already-granted split
 approval**, with exactly these fields (no new approval decision is implied):

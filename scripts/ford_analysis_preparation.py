@@ -628,6 +628,16 @@ def verify_existing_di_access(config, packet):
     }
 
 
+def operator_credential(config, packet):
+    from azure.identity import AzureCliCredential
+    from backend.analysis_provenance import VerifiedOperatorCredential
+
+    return VerifiedOperatorCredential(
+        AzureCliCredential(tenant_id=config["tenant"]),
+        packet["analysis_identity"],
+    )
+
+
 def execute(work, config, packet, authorization):
     require(not (work / "ford-preparation-console-attempt.json").exists(),
             "Existing preparation console attempt; inspect state, never retry")
@@ -659,8 +669,10 @@ def execute(work, config, packet, authorization):
     identity_evidence = verify_existing_di_access(config, packet)
     content = Path(packet["local_pdf"]["path"]).read_bytes()
     require(sha(content) == SOURCE_SHA256 and len(content) == packet["local_pdf"]["bytes"], "Local PDF changed")
-    from azure.identity import AzureCliCredential
-    from backend.analysis_provenance import RecordedPreparationParser, VerifiedOperatorCredential
+    from backend.analysis_provenance import COGNITIVE_SCOPE, RecordedPreparationParser
+
+    credential = operator_credential(config, packet)
+    credential.get_token(COGNITIVE_SCOPE)
 
     def storage_phase(phase, value=None):
         code, marker = remote_program(packet, authorization, config, phase=phase, value=value)
@@ -687,10 +699,6 @@ def execute(work, config, packet, authorization):
             and claim["source_sha256"] == SOURCE_SHA256
             and claim["analysis_identity"] == packet["analysis_identity"], "Claim acknowledgement mismatch")
     release.save_once(work / "ford-preparation-claim.json", claim)
-    credential = VerifiedOperatorCredential(
-        AzureCliCredential(tenant_id=config["tenant"], subscription=config["subscription"]),
-        packet["analysis_identity"],
-    )
     payload = analyze_local(
         content, packet, authorization, claim,
         parser_factory=lambda submitted: RecordedPreparationParser(

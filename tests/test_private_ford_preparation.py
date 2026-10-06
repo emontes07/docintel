@@ -109,7 +109,7 @@ def test_latest_private_preparation_gate(monkeypatch):
     monkeypatch.setattr(prep.release, "azure", readonly_fake)
 
     def local_credential(**options):
-        assert options == {"tenant_id": config["tenant"], "subscription": config["subscription"]}
+        assert options == {"tenant_id": config["tenant"]}
         wrapper = fake_credential(packet)
         sdk_tokens.append(wrapper._credential.get_token().token)
         return wrapper._credential
