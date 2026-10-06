@@ -27,6 +27,7 @@ from backend.models.enrichment import Evidence, ExtractionResponse, LiveBundle, 
 from backend.pilot import PARSER_VERSION, QUALIFICATIONS
 from backend.multisource import OptionalTierSkipped, WEB_TIERS, attribute_resolved, run_cascade
 from backend.pdf_presentation import pdf_items
+from backend.telemetry import ItemTelemetry, milliseconds, record_accounting
 from backend.real_pilot import BUDGET_KEY, RealPilotBudgetExceeded, RealPilotGuard, binding_digest
 from backend.response_validation import (
     CitationReferences, ResponseValidationError, map_citations, parsed_content, response_diagnostic, schema_issues,
@@ -315,6 +316,8 @@ class RealBatchProcessor(BatchProcessor):
         self.guard = guard
         self.downloads = {}
         self.inference_provenance = []
+        self.operation_provenance = []
+        self._active_tier = None
         self._last_recovery_inference = None
         self.optional_web_policy = optional_web_policy.model_copy(deep=True) if optional_web_policy else None
         self.optional_attempted = {"search": 0, "web_retrieval": 0, "inference": 0}
@@ -351,6 +354,12 @@ class RealBatchProcessor(BatchProcessor):
                 if delay > 0:
                     sleep(delay)
             reservation = self.guard.reserve(*args, **kwargs)
+            if "reserved_usage" in reservation and "reserved_microdollars" in reservation:
+                self.operation_provenance.append({
+                    "source_tier": self._active_tier, "operation": args[0],
+                    "reserved_usage": dict(reservation["reserved_usage"]),
+                    "reserved_microdollars": reservation["reserved_microdollars"],
+                })
             if paced:
                 self._last_recovery_inference = monotonic()
             return reservation
@@ -718,6 +727,7 @@ class RealBatchProcessor(BatchProcessor):
                 self.cached_diagnostic_context = None
                 groups = json.loads(user)["evidence_groups"]
                 self.source_tier = groups[0]["source_tier"] if groups else None
+                processor._active_tier = self.source_tier
                 optional = processor.optional_web_policy is not None and self.source_tier in WEB_TIERS
                 if optional:
                     processor.optional_guard_state()
@@ -732,6 +742,7 @@ class RealBatchProcessor(BatchProcessor):
                         "method": "compatible_response_cache", "key": key, "new_model_call": False,
                         "request_parameters": request_parameters,
                         "prompt_format": COMPACT_PROMPT_FORMAT,
+                        "source_tier": self.source_tier,
                     })
                     self.reservation_id = stored["reservation_id"]
                     self.last_response_sha256 = stored.get("raw_response_sha256")
@@ -782,9 +793,13 @@ class RealBatchProcessor(BatchProcessor):
                             "source_tier": self.source_tier, "accounting": request.accounting,
                         })
                     raise
+                model_started = monotonic()
                 try:
                     try:
-                        response = client.complete_structured(system, user, schema, max_retries=1, **request_parameters)
+                        try:
+                            response = client.complete_structured(system, user, schema, max_retries=1, **request_parameters)
+                        finally:
+                            model_ms = milliseconds(model_started, monotonic())
                         self.response_payload = response.model_dump(mode="json")
                         response = map_citations(schema.model_validate(self.response_payload), references)
                     except (LLMSchemaValidationError, ValidationError, ResponseValidationError) as error:
@@ -815,6 +830,7 @@ class RealBatchProcessor(BatchProcessor):
                             "prompt_format": COMPACT_PROMPT_FORMAT,
                             "source_tier": self.source_tier,
                             "accounting": request.accounting,
+                            "elapsed_ms": model_ms,
                         })
                     raw_hash = getattr(client, "last_response_sha256", None)
                     self.last_response_sha256 = raw_hash if isinstance(raw_hash, str) else None
@@ -835,6 +851,7 @@ class RealBatchProcessor(BatchProcessor):
         return Completion()
 
     def __call__(self, item, mode):
+        item_started = monotonic()
         if mode != "real_pilot":
             raise ValueError("Real processor cannot execute another mode")
         try:
@@ -843,6 +860,8 @@ class RealBatchProcessor(BatchProcessor):
             raise ExecutionConfigurationError("Recovery excludes this product") from error
         manifest = Manifest.model_validate(item["manifest"])
         self.inference_provenance = []
+        self.operation_provenance = []
+        self._active_tier = None
         provenance = []
         internal_only = self.guard.execution_scope == "internal_only"
         if internal_only:
@@ -855,6 +874,7 @@ class RealBatchProcessor(BatchProcessor):
             } for binding in item["sources"] if not self.internal_copy(binding)]
 
         def load(tier, pending):
+            self._active_tier = tier
             sources = []
             for binding in item["sources"]:
                 if binding["source_tier"] != tier:
@@ -896,6 +916,12 @@ class RealBatchProcessor(BatchProcessor):
             return sources
 
         result = run_cascade(manifest, load, self.completion(item))
+        if result.telemetry is not None:
+            record_accounting(
+                result.telemetry, self.inference_provenance, self.operation_provenance,
+                unit_prices=getattr(self.guard, "_approval", {}).get("unit_prices_usd"),
+            )
+            result.telemetry.elapsed_ms = milliseconds(item_started, monotonic())
         unresolved = result.extraction_error or any(
             not attribute_resolved(attribute) for attribute in result.attributes
         ) or any(entry.get("error") or entry.get("page_errors") or entry.get("skip_reason") for entry in provenance)
@@ -1002,6 +1028,7 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                         raise Conflict("Recovery status disappeared; no automatic resubmission")
 
             def execute(item):
+                item_started = monotonic()
                 key = f"items/{batch_id}/{item['item_key']}.json"
                 fence()
                 if guard is not None and guard.recovery is not None:
@@ -1014,6 +1041,8 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                 item_version = write_json(store, key, state, item_version)
                 try:
                     result, outcome = process(item, record["mode"])
+                    if result.telemetry is None:
+                        result.telemetry = ItemTelemetry(elapsed_ms=milliseconds(item_started, monotonic()))
                     fence()
                     result_key = guard.result_key(item["item_key"]) if guard else f"results/{batch_id}/{item['item_key']}.json"
                     write_json(store, result_key, result.model_dump(mode="json"))
@@ -1034,6 +1063,7 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                     state.update(state="failed", error="Item execution failed; provider details withheld. No automatic retry")
                 fence()
                 state["finished_at"] = now()
+                state["elapsed_ms"] = milliseconds(item_started, monotonic())
                 write_json(store, key, state, item_version)
 
             if record["mode"] == "real_pilot":

@@ -70,7 +70,22 @@ def prepare(output):
 
 def verify_export(content, batch_id, owner, machine_hashes):
     workbook = read_workbook(content)
-    assert set(workbook) == {"Batch", "Inputs", "Definitions", "Results", "Evidence", "Provenance", "Errors", "Reviews"}
+    required = {"Batch", "Inputs", "Definitions", "Results", "Evidence", "Provenance", "Errors", "Reviews"}
+    assert required <= set(workbook)
+    assert set(workbook) - required in (set(), {"Telemetry", "Telemetry Summary"})
+    if "Telemetry" in workbook:
+        assert [row["Row"] for row in workbook["Telemetry"]] == ["2", "3"]
+        assert all(row["Accounting status"] == "not_instrumented" for row in workbook["Telemetry"])
+        assert all(float(row["Item elapsed ms"]) >= 0 for row in workbook["Telemetry"])
+        assert all(not row[name] for row in workbook["Telemetry"] for name in (
+            "Measured input tokens", "Measured output tokens", "Estimated model cost USD (not billing)",
+        ))
+        summary = {row["Metric"]: row["Value"] for row in workbook["Telemetry Summary"]}
+        assert summary["items"] == summary["items_with_result"] == "2"
+        assert summary["accounting_complete"] == "False"
+        assert summary["known_model_requests"] == "0"
+        assert not summary["measured_input_tokens"] and not summary["measured_output_tokens"]
+        assert not summary["estimated_model_cost_usd"]
     metadata = {row["Key"]: row["Value"] for row in workbook["Batch"]}
     assert metadata["Batch ID"] == batch_id and metadata["Batch state"] == "completed"
     assert metadata["Attribute reference"] == "definitions.xlsx"

@@ -15,6 +15,7 @@ from backend.core.vendor_tables import VendorTableConfig
 from backend.extract import apply_reviews
 from backend.models.enrichment import AttributeDefinition, EnrichmentResult, Manifest, ProductKey, ResponseValidationDiagnostic, ReviewDecision
 from backend.workbooks import WorkbookError, read_workbook, write_workbook
+from backend.telemetry import TECHNICAL_COLUMNS, summary_report, technical_rows
 
 
 class SourceApplicability(BaseModel):
@@ -432,6 +433,8 @@ class BatchService:
         attempts_sheet = [["Row", "Attempt", "State", "Result key", "Machine SHA256", "Error", "Started at", "Finished at", "Proposals", "Extraction error"]]
         attempt_records = [["Row", "Attempt", "Part", "Parts", "Attempt record JSON"]]
         provenance = [["Row", "Execution method", "Machine SHA256", "Source provenance", "Consumption reservations and usage", "Attribute coverage", "Inference provenance"]]
+        telemetry_sheet = [list(TECHNICAL_COLUMNS)]
+        telemetry_results = []
         for item in record["items"]:
             try:
                 detail = self.detail(batch_id, item["item_key"], actor)
@@ -478,8 +481,12 @@ class BatchService:
             provenance.append([item["row"], record.get("mode", "not_submitted"), detail.get("machine_sha256", ""), json.dumps(detail.get("provenance", [])), json.dumps(detail.get("consumption")), json.dumps(detail.get("coverage")), json.dumps(detail.get("inference_provenance"))])
             machine = detail.get("reviewed_result")
             if not machine:
+                telemetry_sheet.extend(technical_rows(None, row=item["row"]))
                 results.append([item["row"], item["original"]["PIMITEM Number"], item["original"]["Vendor Name"], item["original"]["MPN"], "", detail["state"], "", "", "", "", "", "pending", "", "", "", "", "", detail.get("error", "")])
                 continue
+            parsed = EnrichmentResult.model_validate(machine)
+            telemetry_results.append(parsed)
+            telemetry_sheet.extend(technical_rows(parsed.telemetry, row=item["row"]))
             for evidence in machine["evidence"]:
                 evidence_rows.append([item["row"], *[evidence.get(key) for key in ["evidence_id", "source_id", "source_locator", "source_version", "text", "observed_at", "source_tier", "qualification"]], json.dumps(evidence.get("attribute_ids")), evidence.get("discovery_method")])
             for attribute in machine["attributes"]:
@@ -508,6 +515,10 @@ class BatchService:
                 reviews_sheet.append([item["row"], review["attribute_id"], review["decision"], review["candidate_index"], review["corrected_value"], review["corrected_unit"], review["reviewer"], "development_unverified" if actor.startswith("development:") else "verified_entra", review["reviewed_at"], review["reason"]])
         metadata = [["Key", "Value"], ["Batch ID", batch_id], ["Export started at", exported_at], ["Batch state", record["state"]], ["Input hashes", json.dumps(record["input_hashes"])], ["Attribute reference", record["attribute_reference"]], ["Consistency", "Per-item snapshot; reviews or processing may advance during export"], ["Qualification", "Machine proposals are not approved master data; inspect every exception and review"]]
         sheets = {"Batch": metadata, "Inputs": inputs, "Definitions": [definition_columns, *[[row.get(column, "") for column in definition_columns] for row in record["original_definitions"]]], "Results": results, "Evidence": evidence_rows, "Provenance": provenance, "Errors": errors, "Reviews": reviews_sheet}
+        sheets["Telemetry"] = telemetry_sheet
+        report = summary_report(telemetry_results, expected_items=len(record["items"]))
+        report["batch_items_without_result"] = len(record["items"]) - len(telemetry_results)
+        sheets["Telemetry Summary"] = [["Metric", "Value"], *[[key, value] for key, value in report.items()]]
         if len(diagnostics_sheet) > 1:
             sheets["Diagnostics"] = diagnostics_sheet
         if len(attempts_sheet) > 1:
