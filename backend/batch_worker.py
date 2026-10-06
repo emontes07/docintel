@@ -7,6 +7,7 @@ import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import monotonic, sleep
 from urllib.parse import quote, urlsplit
@@ -19,13 +20,14 @@ from backend.batch import digest, now
 from backend.batch_store import Conflict, Missing, configured_store, read_json, write_json
 from backend.core.docintel import DocumentIntelligenceError, DocumentIntelligenceService, ParsedDocument
 from backend.core.llm import LLMClient, LLMSchemaValidationError, COGNITIVE_SERVICES_SCOPE
-from backend.core.websearch import WebSearchError
+from backend.core.websearch import WebSearchError, validate_original_url
+from backend.core.websearch_policy import OptionalWebPolicy, configured_optional_web_policy
 from backend.extract import ExecutionConfigurationError, run_enrichment
 from backend.models.enrichment import Evidence, ExtractionResponse, LiveBundle, Manifest, OfflineBundle, OfflineSource, ProductKey, ReviewAnnotation
 from backend.pilot import PARSER_VERSION, QUALIFICATIONS
-from backend.multisource import run_cascade
+from backend.multisource import OptionalTierSkipped, WEB_TIERS, attribute_resolved, run_cascade
 from backend.pdf_presentation import pdf_items
-from backend.real_pilot import RealPilotBudgetExceeded, RealPilotGuard
+from backend.real_pilot import BUDGET_KEY, RealPilotBudgetExceeded, RealPilotGuard, binding_digest
 from backend.response_validation import (
     CitationReferences, ResponseValidationError, map_citations, parsed_content, response_diagnostic, schema_issues,
 )
@@ -95,6 +97,50 @@ def compact_inference_prompt(user: str) -> tuple[str, CitationReferences]:
         prompt_format=COMPACT_PROMPT_FORMAT,
     )
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")), references
+
+
+@dataclass(frozen=True)
+class PreparedInferenceRequest:
+    system: str
+    user: str
+    references: CitationReferences
+    request_parameters: dict
+    version: str
+    accounting: dict[str, int]
+
+    @property
+    def input_bound(self) -> int:
+        return self.accounting["max_input_tokens"]
+
+
+def prepare_inference_request(system: str, user: str, schema, *, deployment: str) -> PreparedInferenceRequest:
+    """Pure complete-payload reservation API, shared by readiness and execution.
+
+    UTF-8 byte lengths conservatively upper-bound tokens; this is not a tokenizer.
+    No evidence, definitions, metadata, instructions or schema are truncated.
+    """
+    compact, references = compact_inference_prompt(user)
+    system += COMPACT_PROMPT_INSTRUCTIONS
+    parameters = {"max_completion_tokens": 2048}
+    if deployment == "gpt-5":
+        parameters["reasoning_effort"] = "minimal"
+    response_schema = schema.model_json_schema()
+    version_input = system + compact + response_schema.__repr__()
+    if "reasoning_effort" in parameters:
+        version_input += "\n" + json.dumps({"deployment": deployment, **parameters}, sort_keys=True)
+    accounting = {
+        "system_utf8_bytes": len(system.encode()),
+        "user_utf8_bytes": len(compact.encode()),
+        "response_schema_utf8_bytes": len(json.dumps(response_schema).encode()),
+        "framing_allowance": 4096,
+        "max_output_tokens": 2048,
+    }
+    accounting["max_input_tokens"] = sum(accounting[name] for name in (
+        "system_utf8_bytes", "user_utf8_bytes", "response_schema_utf8_bytes", "framing_allowance",
+    ))
+    return PreparedInferenceRequest(
+        system, compact, references, parameters, digest(version_input.encode()), accounting,
+    )
 
 
 class ManagedCompletion:
@@ -263,13 +309,29 @@ def identity_matches(text, terms):
 class RealBatchProcessor(BatchProcessor):
     """Explicit approved real pilot; the legacy synthetic path remains unchanged."""
 
-    def __init__(self, store, record, guard):
+    def __init__(self, store, record, guard, *, optional_web_policy: OptionalWebPolicy | None = None):
         super().__init__(store)
         self.record = record
         self.guard = guard
         self.downloads = {}
         self.inference_provenance = []
         self._last_recovery_inference = None
+        self.optional_web_policy = optional_web_policy.model_copy(deep=True) if optional_web_policy else None
+        self.optional_attempted = {"search": 0, "web_retrieval": 0, "inference": 0}
+        self.optional_item_attempted = {}
+        self.optional_cost = 0
+        if self.optional_web_policy:
+            if (guard.execution_scope != "full" or guard.recovery is not None
+                    or self.optional_web_policy.batch_sha256 != binding_digest(record)):
+                raise ExecutionConfigurationError("Optional web requires a separately authorized full, exact-batch scope")
+            selected = {entry["item_key"]: entry for entry in record["items"]}
+            for item_key, public in self.optional_web_policy.items.items():
+                if item_key not in selected or public.mpn != selected[item_key]["manifest"]["product"]["mpn"]:
+                    raise ExecutionConfigurationError("Public web scope does not match the selected product")
+                item = selected[item_key]
+                if (not set(public.attribute_terms) <= {entry["attribute_id"] for entry in item["manifest"]["attributes"]}
+                        or not set(public.source_ids) <= {entry["source_id"] for entry in item["sources"] if entry["kind"] == "web"}):
+                    raise ExecutionConfigurationError("Public web scope contains unapproved attributes or sources")
 
     def cached(self, key, binding, location):
         document, origin = super().cached(key, binding, location)
@@ -291,7 +353,9 @@ class RealBatchProcessor(BatchProcessor):
             if paced:
                 self._last_recovery_inference = monotonic()
             return reservation
-        except RealPilotBudgetExceeded:
+        except RealPilotBudgetExceeded as error:
+            if self.optional_web_policy is not None:
+                raise ExecutionConfigurationError("Global reservation guard stopped optional web execution") from error
             raise
         except (ValueError, Missing) as error:
             raise ExecutionConfigurationError("Real-pilot authorization or consumption guard stopped execution") from error
@@ -300,6 +364,49 @@ class RealBatchProcessor(BatchProcessor):
         return self.guard.operation_key(
             item, tier=purpose, source_version=version, prompt_version=REAL_PROMPT_VERSION,
         )
+
+    def optional_guard_state(self):
+        """Revalidate authority even when a local optional cap will skip the call."""
+        try:
+            with self.guard._mutex, self.store.lease(BUDGET_KEY):
+                approval, ledger, _ = self.guard._fresh_ledger()
+                if self.guard._execution_id not in ledger["executions"]:
+                    raise ValueError("Optional web requires a reserved worker execution")
+                return approval
+        except (ValueError, Missing) as error:
+            raise ExecutionConfigurationError("Optional web execution guard stopped execution") from error
+
+    def reserve_optional(self, operation, key, *, item_key, max_input_tokens=0, max_output_tokens=0):
+        policy = self.optional_web_policy
+        if policy is None:
+            raise ExecutionConfigurationError("Optional web policy was not supplied")
+        approval = self.optional_guard_state()
+        limits = {
+            "search": (policy.max_search_calls, 1),
+            "web_retrieval": (policy.max_direct_page_attempts, 2),
+            "inference": (policy.max_inference_calls, 1),
+        }
+        total_limit, item_limit = limits[operation]
+        if (self.optional_attempted[operation] >= total_limit
+                or self.optional_item_attempted.get((item_key, operation), 0) >= item_limit):
+            raise OptionalTierSkipped("optional_operation_capacity")
+        if operation == "inference" and max_input_tokens > policy.max_input_tokens:
+            raise OptionalTierSkipped("optional_complete_input_capacity")
+        cost = self.guard._cost(approval, operation, max_input_tokens, max_output_tokens, 0)
+        if self.optional_cost + cost > policy.max_cost_microdollars:
+            raise OptionalTierSkipped("optional_cost_capacity")
+        try:
+            reservation = self.reserve_real(
+                operation, key, item_key=item_key,
+                max_input_tokens=max_input_tokens, max_output_tokens=max_output_tokens,
+            )
+        except RealPilotBudgetExceeded as error:
+            # These are cumulative/global guard denials, not the local optional budget.
+            raise ExecutionConfigurationError("Global reservation guard stopped optional web execution") from error
+        self.optional_attempted[operation] += 1
+        self.optional_item_attempted[(item_key, operation)] = self.optional_item_attempted.get((item_key, operation), 0) + 1
+        self.optional_cost += cost
+        return reservation
 
     def internal_copy(self, binding):
         return (binding["kind"], binding.get("format"), binding.get("source_tier")) in {
@@ -455,14 +562,38 @@ class RealBatchProcessor(BatchProcessor):
         host = urlsplit(binding["url"]).hostname
         if not host:
             raise ValueError("Approved web host is missing")
-        query = " ".join([*scope["identity_terms"], product.mpn, *pending])
+        optional = self.optional_web_policy is not None
+        public = None
+        if optional:
+            self.optional_guard_state()
+            public = self.optional_web_policy.items.get(item["item_key"])
+            if public is None or binding["source_id"] not in public.source_ids:
+                provenance.update(retrieval="not_attempted", skip_reason="optional_public_scope_not_selected")
+                return []
+            validate_original_url(binding["url"], public.allowed_hosts)
+            pending = [name for name in pending if name in public.attribute_terms]
+            if not pending:
+                provenance.update(retrieval="not_attempted", skip_reason="optional_no_public_pending_attributes")
+                return []
+        query = public.query(pending) if public else " ".join([*scope["identity_terms"], product.mpn, *pending])
         key = self.key(item, "search", binding["url"] + ":" + digest(query.encode()))
-        self.reserve_real("search", key, item_key=item["item_key"])
         try:
-            discovered = WebIQSearchClient().search(query, allowed_domains=[host], authorized=True)
+            client = WebIQSearchClient()
+            if optional:
+                client.validate_configuration()
+                self.reserve_optional("search", key, item_key=item["item_key"])
+            else:
+                self.reserve_real("search", key, item_key=item["item_key"])
+            discovered = client.search(query, allowed_domains=[host], authorized=True)
+        except OptionalTierSkipped as error:
+            provenance.update(retrieval="not_attempted", skip_reason=error.code)
+            return []
         except WebSearchError as error:
             discovered = []
             provenance.update(error="web_discovery_failed", discovery_error=error.code)
+            if optional:
+                provenance.update(retrieval="failed", skip_reason="optional_provider_unavailable")
+                return []
         provenance.update(
             retrieval="discovery_failed" if provenance.get("discovery_error") else "discovery_succeeded", discovery_count=len(discovered),
             discovery_limitations="WebIQ content is unverified discovery only, never attribute evidence.",
@@ -473,17 +604,24 @@ class RealBatchProcessor(BatchProcessor):
             } for result in discovered],
         )
         # The supplied reference is attempted first; discovered pages stay on its approved host.
-        urls = list(dict.fromkeys([binding["url"], *[result.url for result in discovered]]))[:3]
+        urls = list(dict.fromkeys([binding["url"], *[result.url for result in discovered]]))[:2 if optional else 3]
         sources = []
         for url in urls:
             source_id = binding["source_id"] + "-" + digest(url.encode())[:12]
             try:
-                self.reserve_real(
+                reserve = self.reserve_optional if optional else self.reserve_real
+                reserve(
                     "web_retrieval", self.key(item, "web_retrieval", url),
                     item_key=item["item_key"],
                 )
                 original = fetch_original_page(url, allowed_hosts=[host], authorized=True)
-                if not identity_matches(original.text, scope["identity_terms"]) or not identity_matches(original.text, [product.mpn]):
+                provenance.setdefault("original_pages", []).append({
+                    "source_id": source_id, "url": original.final_url,
+                    "retrieved_at": original.retrieved_at.isoformat(),
+                    "content_sha256": original.content_hash, "media_type": original.media_type,
+                })
+                identity = [public.manufacturer, public.mpn] if public else scope["identity_terms"] + [product.mpn]
+                if not identity_matches(original.text, identity):
                     raise ValueError("Original web source does not establish exact product identity")
                 excerpt = Evidence(
                     evidence_id=source_id + ":" + original.content_hash,
@@ -492,7 +630,7 @@ class RealBatchProcessor(BatchProcessor):
                     source_tier=binding["source_tier"], content_kind="source_excerpt",
                     text=original.text, observed_at=datetime.now(timezone.utc),
                     provider_retrieved_at=original.retrieved_at,
-                    attribute_ids=scope["attribute_ids"], qualification=scope["qualification"]
+                    attribute_ids=pending if optional else scope["attribute_ids"], qualification=scope["qualification"]
                     + " Independently retrieved normalized web text; WebIQ discovery passage was not used as product evidence.",
                     discovery_method="supplied_reference" if url == binding["url"] else "webiq",
                 )
@@ -500,6 +638,11 @@ class RealBatchProcessor(BatchProcessor):
                     source_id=source_id, product=product, source_tier=binding["source_tier"],
                     excerpts=[excerpt],
                 ))
+            except OptionalTierSkipped as error:
+                provenance.setdefault("page_errors", []).append({
+                    "source_id": source_id, "error": error.code, "retrieval": "not_attempted",
+                })
+                break
             except ExecutionConfigurationError:
                 raise
             except (WebSearchError, ValueError, OSError) as error:
@@ -565,7 +708,8 @@ class RealBatchProcessor(BatchProcessor):
 
                 if os.environ.get("AOAI_API_VERSION") != LLM_API_VERSION:
                     raise ValueError("Approved model API version differs from the installed client")
-                user, references = compact_inference_prompt(user)
+                request = prepare_inference_request(system, user, schema, deployment=settings.LLM_DEPLOYMENT)
+                system, user, references = request.system, request.user, request.references
                 self.references = references
                 self.response_payload = None
                 self.last_response_sha256 = None
@@ -573,17 +717,11 @@ class RealBatchProcessor(BatchProcessor):
                 self.cached_diagnostic_context = None
                 groups = json.loads(user)["evidence_groups"]
                 self.source_tier = groups[0]["source_tier"] if groups else None
-                system += COMPACT_PROMPT_INSTRUCTIONS
-                request_parameters = {"max_completion_tokens": 2048}
-                if settings.LLM_DEPLOYMENT == "gpt-5":
-                    request_parameters["reasoning_effort"] = "minimal"
-                version_input = system + user + schema.model_json_schema().__repr__()
-                if "reasoning_effort" in request_parameters:
-                    version_input += "\n" + json.dumps({
-                        "deployment": settings.LLM_DEPLOYMENT, **request_parameters,
-                    }, sort_keys=True)
-                version = digest(version_input.encode())
-                key = processor.key(item, "inference", version)
+                optional = processor.optional_web_policy is not None and self.source_tier in WEB_TIERS
+                if optional:
+                    processor.optional_guard_state()
+                request_parameters = request.request_parameters
+                key = processor.key(item, "inference", request.version)
                 cache_key = "real-inferences/" + key + ".json"
                 self.cache_key = cache_key
                 self.request_parameters = request_parameters
@@ -602,12 +740,22 @@ class RealBatchProcessor(BatchProcessor):
                     return schema.model_validate(stored["response"])
                 except Missing:
                     pass
-                input_bound = len(system.encode()) + len(user.encode()) + len(json.dumps(schema.model_json_schema()).encode()) + 4096
+                input_bound = request.input_bound
                 try:
-                    reservation = processor.reserve_real(
+                    reserve = processor.reserve_optional if optional else processor.reserve_real
+                    reservation = reserve(
                         "inference", key, item_key=item["item_key"],
                         max_input_tokens=input_bound, max_output_tokens=2048,
                     )
+                except OptionalTierSkipped as error:
+                    processor.inference_provenance.append({
+                        "method": "optional_skipped", "skip_reason": error.code,
+                        "new_model_call": False, "source_tier": self.source_tier,
+                        "prompt_format": COMPACT_PROMPT_FORMAT,
+                        "input_bound": input_bound, "accounting": request.accounting,
+                        "evidence_truncated": False,
+                    })
+                    raise
                 except RealPilotBudgetExceeded as error:
                     processor.inference_provenance.append({
                         "method": "budget_blocked", "new_model_call": False,
@@ -615,15 +763,24 @@ class RealBatchProcessor(BatchProcessor):
                         "budget": error.dimension, "requested": error.requested, "remaining": error.remaining,
                     })
                     raise
-                client = LLMClient(
-                    endpoint=settings.LLM_ENDPOINT or settings.AI_FOUNDRY_ENDPOINT,
-                    token_provider=get_bearer_token_provider(
-                        ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None),
-                        COGNITIVE_SERVICES_SCOPE,
-                    ),
-                )
-                client.sync_client = client.sync_client.with_options(max_retries=0)
                 self.reservation_id = reservation["reservation_id"]
+                try:
+                    client = LLMClient(
+                        endpoint=settings.LLM_ENDPOINT or settings.AI_FOUNDRY_ENDPOINT,
+                        token_provider=get_bearer_token_provider(
+                            ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None),
+                            COGNITIVE_SERVICES_SCOPE,
+                        ),
+                    )
+                    client.sync_client = client.sync_client.with_options(max_retries=0)
+                except Exception:
+                    if optional:
+                        processor.inference_provenance.append({
+                            "method": "optional_failed", "skip_reason": "optional_model_unavailable",
+                            "reservation_id": self.reservation_id, "new_model_call": False,
+                            "source_tier": self.source_tier, "accounting": request.accounting,
+                        })
+                    raise
                 try:
                     try:
                         response = client.complete_structured(system, user, schema, max_retries=1, **request_parameters)
@@ -655,10 +812,22 @@ class RealBatchProcessor(BatchProcessor):
                             "usage": client.last_usage, "new_model_call": True,
                             "request_parameters": request_parameters,
                             "prompt_format": COMPACT_PROMPT_FORMAT,
+                            "source_tier": self.source_tier,
+                            "accounting": request.accounting,
                         })
                     raw_hash = getattr(client, "last_response_sha256", None)
                     self.last_response_sha256 = raw_hash if isinstance(raw_hash, str) else None
                     return response
+                except (ExecutionConfigurationError, Conflict):
+                    raise
+                except Exception:
+                    if optional:
+                        processor.inference_provenance.append({
+                            "method": "optional_failed", "skip_reason": "optional_model_failed",
+                            "reservation_id": self.reservation_id, "new_model_call": True,
+                            "source_tier": self.source_tier, "accounting": request.accounting,
+                        })
+                    raise
                 finally:
                     client.sync_client.close()
 
@@ -727,10 +896,14 @@ class RealBatchProcessor(BatchProcessor):
 
         result = run_cascade(manifest, load, self.completion(item))
         unresolved = result.extraction_error or any(
-            attribute.status not in {"existing", "proposed"} for attribute in result.attributes
-        ) or any(entry.get("error") or entry.get("page_errors") for entry in provenance)
+            not attribute_resolved(attribute) for attribute in result.attributes
+        ) or any(entry.get("error") or entry.get("page_errors") or entry.get("skip_reason") for entry in provenance)
         coverage = {state: [attribute.attribute_id for attribute in result.attributes if attribute.status == state]
                     for state in ("existing", "proposed", "conflict", "missing_evidence", "retrieval_failed", "extraction_failed", "definition_clarification_needed")}
+        coverage["inferred_review_required"] = [
+            attribute.attribute_id for attribute in result.attributes
+            if any(candidate.evidence_basis == "inferred_from_description" for candidate in attribute.candidates)
+        ]
         cited = {evidence.evidence_id: evidence for evidence in result.evidence}
         for name, predicate in [
             ("internally_supported", lambda evidence: evidence.source_tier in {"internal_pdf", "vendor_table"}),
@@ -740,7 +913,8 @@ class RealBatchProcessor(BatchProcessor):
             coverage[name] = [
                 attribute.attribute_id for attribute in result.attributes
                 if attribute.status == "proposed" and any(
-                    predicate(cited[key]) for candidate in attribute.candidates for key in candidate.evidence_ids
+                    predicate(cited[key]) for candidate in attribute.candidates
+                    if candidate.evidence_basis == "literal" for key in candidate.evidence_ids
                 )
             ]
         return result, {
@@ -789,9 +963,17 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                 guard = RealPilotGuard(store, record)
                 if guard.recovery is not None and item_limit != 2:
                     raise ValueError("Recovery requires an exact two-item worker slice")
+                if processor is None:
+                    try:
+                        policy = configured_optional_web_policy()
+                    except ValueError as error:
+                        raise ExecutionConfigurationError("Invalid optional web runtime policy") from error
+                    process = (
+                        RealBatchProcessor(store, record, guard, optional_web_policy=policy)
+                        if policy is not None else RealBatchProcessor(store, record, guard)
+                    )
                 guard.before_execution(str(uuid.uuid4()))
                 guard.prepare_recovery(fence)
-                process = processor or RealBatchProcessor(store, record, guard)
             record["state"] = "running"
             version = write_json(store, path, record, version)
             pending = []

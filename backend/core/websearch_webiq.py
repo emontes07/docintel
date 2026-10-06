@@ -97,6 +97,10 @@ class WebIQSearchClient:
         ):
             raise NotConfiguredError("WebIQ request limits are invalid.", code="invalid_limits")
 
+    def validate_configuration(self) -> None:
+        """Offline preflight only; never authenticates, sends a query or reserves cost."""
+        self._require_config()
+
     def search(
         self, query: str, allowed_domains: Optional[List[str]] = None,
         *, authorized: bool = False,

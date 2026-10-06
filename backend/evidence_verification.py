@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from fractions import Fraction
 from urllib.parse import parse_qs, urldefrag
@@ -253,4 +254,117 @@ def match_text(text: str, spans: list[list[Fragment]]) -> EvidenceMatch | None:
                 cells=[part.cell for part in matched if part.cell],
                 normalized_sha256=hashlib.sha256(" ".join(target).encode()).hexdigest(),
             )
+    return None
+
+
+_QUOTE_FILLERS = frozenset({"a", "an", "the", "is", "are", "of", "for", "with"})
+_QUOTE_QUALIFIERS = frozenset({
+    "not", "no", "without", "never", "except", "only", "or", "and", "all",
+    "maximum", "max", "minimum", "min", "working", "inlet", "outlet",
+})
+_COMPONENT_ROLES = frozenset({"body", "stem", "seat", "seal", "ring", "ball", "pin", "washer", "cap"})
+_QUOTE_UNITS = frozenset({"in", "inch", "inches", '"', "'", "mm", "cm", "m", "ft", "psi", "bar", "kpa", "mpa"})
+
+
+def _bound_tokens(tokens: list[str]) -> Counter[tuple[str, ...]]:
+    bindings: Counter[tuple[str, ...]] = Counter()
+    for index, token in enumerate(tokens):
+        if token in {"not", "no", "without", "never", "except", "only", "all"}:
+            bindings[(token, *tokens[index + 1:index + 2])] += 1
+        elif token in {"and", "or"}:
+            bindings[tuple(tokens[max(0, index - 1):index + 2])] += 1
+        elif token in _QUOTE_UNITS and index:
+            bindings[(tokens[index - 1], token)] += 1
+    return bindings
+
+
+def _quote_scopes(evidence: list[Evidence], cited: set[str]) -> list[list[Fragment]]:
+    scopes = []
+    for item in pdf_items(evidence):
+        if item.context_only or not {entry.evidence_id for entry in item.originals} <= cited:
+            continue
+        if item.component_materials:
+            by_id = {entry.evidence_id: entry for entry in item.values}
+            for material_id, component in item.component_materials:
+                scopes.append([Fragment(
+                    item.anchor, "DESCRIPTION " + component + " MATERIAL " + by_id[material_id].text,
+                    originals=item.originals,
+                )])
+        elif item.kind == "table_row":
+            for field in item.text.split(": ", 1)[1].split(" | "):
+                scopes.append([Fragment(item.anchor, field.replace("=", " "), originals=item.originals)])
+        else:
+            scopes.append([Fragment(item.anchor, item.text, originals=item.originals)])
+    for entry in evidence:
+        if entry.content_kind != "source_excerpt" or entry.evidence_id not in cited:
+            continue
+        if entry.source_tier == "vendor_table":
+            scopes.append(fragments(entry))
+        elif entry.source_tier != "internal_pdf":
+            scopes.append([Fragment(entry, entry.text)])
+    return scopes
+
+
+def _contained_quote(text: str, part: Fragment) -> tuple[list[str], list[str]] | None:
+    target, target_rules = normalized(text, vendor=part.vendor)
+    source, source_rules = normalized(part.text, vendor=part.vendor)
+    target = [token for token in target if token not in _QUOTE_FILLERS]
+    source = [token for token in source if token not in _QUOTE_FILLERS]
+    if len(target) < 3:
+        return None
+    requested, available = Counter(target), Counter(source)
+    overlap = sum((requested & available).values()) / len(target)
+    if overlap < 0.95 or requested - available:
+        return None
+    if Counter(token for token in target if token in _QUOTE_QUALIFIERS) != Counter(
+        token for token in source if token in _QUOTE_QUALIFIERS
+    ):
+        return None
+    if _bound_tokens(target) - _bound_tokens(source):
+        return None
+    # A token bag cannot bind two roles or rating limits to their respective values.
+    for roles in ({"inlet", "outlet"}, {"minimum", "min", "maximum", "max", "working"}, _COMPONENT_ROLES):
+        source_roles = set(source) & roles
+        if len(source_roles) > 1 or set(target) & roles != source_roles:
+            return None
+    return target, sorted(set(target_rules + source_rules + [
+        "order_tolerant_multiset", "closed_filler_words", "overlap_screen_0.95",
+        "no_unsupported_content_tokens",
+    ]))
+
+
+def match_quote(text: str, evidence: list[Evidence], cited: set[str]) -> EvidenceMatch | None:
+    """Keep literal matching; constrain syntactic paraphrases to a single logical scope."""
+    exact = match_text(text, reconstructed_rows(evidence, cited) + windows(evidence, cited))
+    if exact is not None:
+        return exact
+    clauses = [clause.strip() for clause in text.split(";") if clause.strip()]
+    if not clauses:
+        return None
+    for scope in _quote_scopes(evidence, cited):
+        matches: list[tuple[Fragment, list[str], list[str]]] = []
+        for clause in clauses:
+            found = next(
+                ((part, *result) for part in scope if (result := _contained_quote(clause, part)) is not None),
+                None,
+            )
+            if found is None:
+                break
+            matches.append(found)
+        if len(matches) != len(clauses):
+            continue
+        originals = [
+            entry for part, _, _ in matches for entry in (part.originals or (part.evidence,))
+        ]
+        tokens = [token for _, target, _ in matches for token in target]
+        rules = [rule for _, _, applied in matches for rule in applied]
+        vendor = all(part.vendor for part, _, _ in matches)
+        return EvidenceMatch(
+            method="vendor_cells" if vendor else "normalized",
+            normalization=sorted(set(rules + (["clause_to_cell"] if vendor else []))),
+            evidence_ids=list(dict.fromkeys(entry.evidence_id for entry in originals)),
+            source_locations=list(dict.fromkeys(entry.source_locator for entry in originals)),
+            cells=list(dict.fromkeys(part.cell for part, _, _ in matches if part.cell)),
+            normalized_sha256=hashlib.sha256(" ".join(tokens).encode()).hexdigest(),
+        )
     return None

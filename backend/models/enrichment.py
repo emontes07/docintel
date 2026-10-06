@@ -1,5 +1,7 @@
 """Provider-neutral contracts for one-product enrichment from supplied evidence."""
 
+import re
+import unicodedata
 from typing import Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -8,6 +10,15 @@ from backend.core.docintel import ParsedDocument
 
 AttributeValue = str | int | float | bool
 SourceTier = Literal["internal_pdf", "vendor_table", "manufacturer_web", "approved_web"]
+EvidenceBasis = Literal["literal", "inferred_from_description"]
+DescriptiveBooleanRule = Literal["lead_free_description_v1"]
+DESCRIPTIVE_BOOLEAN_FLAG = "inferred_from_description — requires review"
+LEAD_FREE_DESCRIPTION_RULE: DescriptiveBooleanRule = "lead_free_description_v1"
+
+
+def is_lead_free_attribute(attribute_id: str) -> bool:
+    tokens = re.findall(r"\w+", unicodedata.normalize("NFKC", attribute_id).casefold())
+    return tokens in (["lead", "free"], ["lead", "free", "no", "lead"])
 
 
 class Contract(BaseModel):
@@ -116,6 +127,28 @@ class Candidate(Contract):
     supporting_quote: str | None = None
     qualification: str | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
+    evidence_basis: EvidenceBasis = "literal"
+    inference_rule: DescriptiveBooleanRule | None = None
+
+    @model_validator(mode="after")
+    def validate_inference_metadata(self) -> Self:
+        if self.evidence_basis == "literal":
+            if self.inference_rule is not None:
+                raise ValueError("Literal candidates cannot carry a descriptive inference rule")
+        elif (
+            not is_lead_free_attribute(self.attribute_id) or self.value is not True
+            or self.unit is not None or not self.supporting_quote or not self.supporting_quote.strip()
+            or self.inference_rule != LEAD_FREE_DESCRIPTION_RULE
+        ):
+            raise ValueError("Descriptive inference is limited to quoted, unitless Lead-Free True proposals")
+        else:
+            flag = (
+                f"{DESCRIPTIVE_BOOLEAN_FLAG}. Rule: {self.inference_rule}. "
+                "Descriptive wording only; not literal Boolean evidence or certification."
+            )
+            if not self.qualification or not self.qualification.startswith(flag):
+                self.qualification = flag + (f" {self.qualification}" if self.qualification else "")
+        return self
 
 
 class ExtractionResponse(Contract):
@@ -178,10 +211,26 @@ class EvidenceMatch(Contract):
 
 
 class EvidenceVerification(Contract):
-    version: Literal["grounded-normalization-v1", "grounded-normalization-v2"] = "grounded-normalization-v2"
+    version: Literal[
+        "grounded-normalization-v1", "grounded-normalization-v2", "grounded-normalization-v3",
+    ] = "grounded-normalization-v3"
     quote: EvidenceMatch | None = None
-    value: EvidenceMatch
+    value: EvidenceMatch | None
     unit: EvidenceMatch | None = None
+    evidence_basis: EvidenceBasis = "literal"
+    inference_rule: DescriptiveBooleanRule | None = None
+
+    @model_validator(mode="after")
+    def validate_inference_metadata(self) -> Self:
+        if self.evidence_basis == "literal":
+            if self.value is None or self.inference_rule is not None:
+                raise ValueError("Literal verification requires value evidence, not an inference rule")
+        elif (
+            self.value is not None or self.unit is not None or self.quote is None
+            or self.inference_rule != LEAD_FREE_DESCRIPTION_RULE
+        ):
+            raise ValueError("Descriptive inference verifies only its quote, never a literal Boolean value")
+        return self
 
 
 class AttributeResult(Contract):
@@ -197,6 +246,11 @@ class AttributeResult(Contract):
     def validate_annotation_targets(self) -> Self:
         if self.verification and len(self.verification) != len(self.candidates):
             raise ValueError("Verification records must correspond to the candidate order")
+        if any(
+            candidate.evidence_basis != check.evidence_basis or candidate.inference_rule != check.inference_rule
+            for candidate, check in zip(self.candidates, self.verification)
+        ):
+            raise ValueError("Candidate and verification inference metadata must agree")
         if any(annotation.candidate_index >= len(self.candidates) for annotation in self.review_annotations):
             raise ValueError("Review annotation must reference an existing candidate")
         return self
