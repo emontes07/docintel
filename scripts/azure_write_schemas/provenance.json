@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "api_version": "2024-03-01",
+  "repository": "https://github.com/Azure/azure-rest-api-specs",
+  "commit": "1249f8e2b407b339083c5125a245bdd3057f6cd5",
+  "source_url_prefix": "https://raw.githubusercontent.com/Azure/azure-rest-api-specs/1249f8e2b407b339083c5125a245bdd3057f6cd5/",
+  "license": "MIT",
+  "files": {
+    "LICENSE": "b37363bf2295aa0acde60ce78a60034a71a0955075fc01aa09cc23eadff44436",
+    "specification/common-types/resource-management/v3/managedidentity.json": "c1134487d1594ccbd463bbaab5c8d3563c3972797c3d65a481cc447ce89a6b64",
+    "specification/common-types/resource-management/v3/types.json": "8f69ddbcdd8f3df61a156a129e70db08b3a03f2ec710de07f30273ec27492de3",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2024-03-01/CommonDefinitions.json": "0eefb1f26172d0b260d300c13a09b4e1a753f81cb2c239acef07a4a6ad21a1d1",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2024-03-01/ContainerApps.json": "ceba053265c534e15d862291148adc6a933b71387a8eba392bd958c9f24f9542",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2024-03-01/Jobs.json": "c384931f7f6d0f38adc21bb94f0accc60fb9c1c8d03f01f2e9d07a9aa17dffd7",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2024-03-01/examples/ContainerApps_CreateOrUpdate.json": "84d88e380d4926e69b016796fd459c6543965f523b5b53a37f677f0ae04c92bf",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2024-03-01/examples/ContainerApps_Patch.json": "de4b8777423ab2253329ae9674fa7eb1ce75e050208eb22b11ce5dc0d621d85c",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2024-03-01/examples/Job_CreateorUpdate.json": "57db594d1dbd35326ba26644786a4b3e816a96ddb0a035eb35a16f2d6eec2141",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2024-03-01/examples/Job_Patch.json": "d1272e8dce0084e5763a38afc9b71e1a6745acf18c491c3b381c820f77133c02"
+  }
+}

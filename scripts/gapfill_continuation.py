@@ -134,7 +134,10 @@ def web_configuration(records, public_attribute_terms):
         batch_sha256=approval["batch_sha256"], items=items, max_cost_microdollars=optional_cost,
     )
     return {
-        "public_web_policy": policy.model_dump(mode="json"),
+        # Preserve the original two-item approval format as newer scopes add defaults.
+        "public_web_policy": policy.model_dump(
+            mode="json", exclude={"items": {"__all__": {"max_direct_page_attempts"}}},
+        ),
         "web_environment": {"WEBSEARCH_PROVIDER": "webiq", "WEBIQ_ENDPOINT": ENDPOINT},
         "web_prices": {"search": "0.0125", "web_retrieval": "0"},
         "fixed_cost_microdollars": 198000,
@@ -535,17 +538,14 @@ def current_config(work, config, decision):
 
 
 def writable_job_configuration(configuration):
-    """Project GET metadata to the existing Microsoft.App/jobs@2024-03-01 contract."""
-    supported = {
-        "secrets", "triggerType", "replicaTimeout", "replicaRetryLimit", "registries",
-        "manualTriggerConfig", "scheduleTriggerConfig", "eventTriggerConfig",
-    }
-    require(isinstance(configuration, dict)
-            and set(configuration) <= supported | {"identitySettings", "dapr"},
-            "Unknown job configuration fields; review API 2024-03-01 write compatibility")
+    """Remove two captured GET-only defaults, then use the pinned write schema."""
+    require(isinstance(configuration, dict), "Job configuration must be an object")
     require(configuration.get("identitySettings") in (None, []) and configuration.get("dapr") is None,
             "Nonempty GET-only job settings cannot be preserved by API 2024-03-01")
-    return {name: copy.deepcopy(value) for name, value in configuration.items() if name in supported}
+    projected = copy.deepcopy(configuration)
+    projected.pop("identitySettings", None)
+    projected.pop("dapr", None)
+    return release.write_schema().project_component("jobs", "PATCH", ("properties", "configuration"), projected)
 
 
 class WorkerPatchFailure(ValueError):
@@ -576,14 +576,16 @@ def patch(work, config, decision, label, resource, containers, *, job=False, bin
         fresh, active = release.active_executions(config) if job else (release.app(config, config["backend"]), [])
         require(not active and fresh == resource, "Resource drift; never overwrite")
         candidate = path(work, label + "-patch")
-        payload = {"properties": {"template": {"containers": release.writable_containers(containers)}}}
+        configuration = release.UNCHANGED_INGRESS
         if bind_existing_secret is not None:
             require(job and label == "deploy-worker" and decision["credential_source"] == "owner_env_file"
                     and bind_existing_secret == decision["webiq_secret_ref"]
                     and not resource["properties"]["configuration"].get("secrets"),
                     "Only the approved owner key may bind to the existing empty job secret store")
-            payload["properties"]["configuration"] = writable_job_configuration(resource["properties"]["configuration"])
-            payload["properties"]["configuration"]["secrets"] = [{"name": bind_existing_secret}]
+            configuration = writable_job_configuration(resource["properties"]["configuration"])
+            configuration["secrets"] = [{"name": bind_existing_secret}]
+        payload = release.build_update_payload(resource, containers, job=job, configuration=configuration)
+        if bind_existing_secret is not None:
             release.save_once(path(work, "credential-binding"), {
                 **binding(decision), "secret_ref": bind_existing_secret, "resource_id": resource["id"],
                 "credential_origin": "GBBdemo", "source": "owner_env_file",
@@ -624,20 +626,34 @@ def patch(work, config, decision, label, resource, containers, *, job=False, bin
             sleep(5)
 
 
-def secure_worker_patch(work, config, decision, resource, redacted_payload):
-    """Existing owner key and ARM token travel over stdin, never argv or files."""
+def secure_worker_patch(work, config, decision, resource, redacted_payload, *, check_window=None):
+    """Compatibility wrapper retaining the original gapfill clock by default."""
+    if check_window is None:
+        check_window = lambda: window(work, decision, "overall", 600)
+    return send_existing_secret_patch(
+        config, resource, redacted_payload,
+        secret_ref=decision.get("webiq_secret_ref"), check_window=check_window,
+    )
+
+
+def send_existing_secret_patch(config, resource, redacted_payload, *, secret_ref, check_window):
+    """Namespace-independent transport; the only key source is the existing owner file."""
     expected_id = (f"/subscriptions/{config['subscription']}/resourceGroups/{config['group']}"
                    f"/providers/Microsoft.App/jobs/{config['job']}")
     require(resource["id"].lower() == expected_id.lower(), "Credential binding must target the existing manual job")
-    window(work, decision, "overall", 600)
+    url = "https://management.azure.com" + resource["id"] + "?api-version=2024-03-01"
+    release.write_schema().validate_request("PATCH", url, redacted_payload)
+    require(callable(check_window), "A bounded operation clock check is required")
+    check_window()
     phase = "configuration"
     status, returncode = None, None
     try:
         payload = copy.deepcopy(redacted_payload)
         secrets = payload["properties"]["configuration"]["secrets"]
-        require(secrets == [{"name": decision["webiq_secret_ref"]}], "Exact owner-key reference required")
+        require(secrets == [{"name": secret_ref}], "Exact owner-key reference required")
         phase = "credential"
         secrets[0]["value"] = existing_webiq_key()
+        release.write_schema().validate_request("PATCH", url, payload)
         phase = "management_token"
         token = release.azure("account", "get-access-token", "--subscription", config["subscription"],
                               "--resource", "https://management.azure.com/", timeout=30)
@@ -652,12 +668,12 @@ def secure_worker_patch(work, config, decision, resource, redacted_payload):
             transport += "header = " + json.dumps("If-Match: " + resource["etag"]) + "\n"
         transport += "data = " + json.dumps(json.dumps(payload, separators=(",", ":"))) + "\n"
         phase = "worker_patch"
-        window(work, decision, "overall", 600)
+        check_window()
         result = subprocess.run([
             "curl", "--disable", "--silent", "--show-error", "--fail",
             "--proto", "=https", "--retry", "0", "--max-redirs", "0", "--noproxy", "*",
             "--request", "PATCH", "--header", "Content-Type: application/json",
-            "--url", "https://management.azure.com" + resource["id"] + "?api-version=2024-03-01",
+            "--url", url,
             "--max-time", "60", "--output", "/dev/null", "--write-out", "%{http_code}", "--config", "-",
         ], input=transport.encode(), capture_output=True, timeout=60,
             env={key: value for key, value in os.environ.items()
@@ -945,7 +961,9 @@ def close(work, config, decision):
                 containers[0]["env"] = list(entries.values())
                 patch(work, config, decision, "close", backend, containers)
         release.require_real_pilot_off(prior.ready(config, "backend"))
-        require(prior.shape(prior.ready(config, "frontend")) == receipt(work, "deploy-attempt", decision)["frontend"],
+        frontend = receipt(work, "deploy-attempt", decision)["frontend"]
+        frontend["template"]["containers"] = release.writable_containers(frontend["template"]["containers"])
+        require(prior.shape(prior.ready(config, "frontend")) == frontend,
                 "Frontend drift detected at closure")
         if not path(work, "closed").exists():
             release.save_once(path(work, "closed"), binding(decision))

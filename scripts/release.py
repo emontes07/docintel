@@ -61,8 +61,34 @@ def command(arguments, *, cwd=None, env=None, timeout=None):
 
 
 def azure(*arguments, timeout=None):
+    write_schema().validate_azure_arguments(arguments)
     output = command(["az", *arguments, "--only-show-errors", "-o", "json"], timeout=timeout)
     return json.loads(output) if output.strip() else None
+
+
+def write_schema():
+    # Staging runs before dependency installation, including direct-script mode.
+    try:
+        from scripts import azure_write_schema
+    except ModuleNotFoundError:
+        import azure_write_schema
+    return azure_write_schema
+
+
+def build_update_payload(resource, containers, *, job=False, configuration=UNCHANGED_INGRESS):
+    kind = "jobs" if job else "containerApps"
+    projected = write_schema().project_component(
+        kind, "PATCH", ("properties", "template", "containers"), writable_containers(containers),
+    )
+    properties = {"template": {"containers": projected}}
+    if configuration is not UNCHANGED_INGRESS:
+        properties["configuration"] = copy.deepcopy(configuration)
+    members = {"properties": properties}
+    if not job:
+        require(isinstance(resource, dict) and isinstance(resource.get("location"), str) and resource["location"],
+                "The pinned Container Apps PATCH contract requires the observed resource location")
+        members["location"] = resource["location"]
+    return write_schema().build_payload(kind, "PATCH", **members)
 
 
 def private_path(path):
@@ -528,7 +554,7 @@ def verify_pilot_seed(config, approval):
 def patch_pilot_backend(config, expected, containers, work):
     require(app(config, config["backend"]) == expected, "Backend changed during pilot activation; refusing to overwrite drift")
     body = work / "pilot-backend-patch.json"
-    save(body, {"properties": {"template": {"containers": writable_containers(containers)}}})
+    save(body, build_update_payload(expected, containers))
     resource = expected["id"]
     arguments = ["rest", "--method", "PATCH", "--url", "https://management.azure.com" + resource + "?api-version=2024-03-01", "--body", "@" + str(body)]
     if expected.get("etag"):
@@ -732,26 +758,21 @@ def desired_containers(config, kind, baseline, *, runtime=True):
 
 
 def writable_containers(containers):
-    supported = {"name", "image", "command", "args", "env", "resources", "probes", "volumeMounts"}
-    result = []
-    for container in containers:
-        require(not (set(container) - supported - {"imageType"}), "Unknown container fields; review compatibility with API 2024-03-01")
+    result = copy.deepcopy(containers)
+    for container in result:
+        # A newer GET-only discriminator has no 2024-03-01 wire equivalent.
         require(container.get("imageType") in (None, "ContainerImage"), "Unsupported image type for API 2024-03-01")
-        projected = {name: copy.deepcopy(value) for name, value in container.items() if name in supported}
-        if projected.get("resources") is not None:
-            resources = projected["resources"]
-            require(not (set(resources) - {"cpu", "memory", "ephemeralStorage"}), "Unknown container resource fields; review write compatibility")
-            resources.pop("ephemeralStorage", None)
-        result.append(projected)
-    return result
+        container.pop("imageType", None)
+    return write_schema().project_component("containerApps", "PATCH", ("properties", "template", "containers"), result)
 
 
 def writable_ingress(ingress):
     if ingress is None:
         return None
-    supported = {"additionalPortMappings", "allowInsecure", "clientCertificateMode", "corsPolicy", "customDomains", "exposedPort", "external", "ipSecurityRestrictions", "stickySessions", "targetPort", "traffic", "transport"}
-    require(isinstance(ingress, dict) and not (set(ingress) - supported - {"fqdn", "targetPortHttpScheme"}), "Unknown ingress fields; review write compatibility")
-    return {name: copy.deepcopy(value) for name, value in ingress.items() if name in supported}
+    require(isinstance(ingress, dict), "Ingress must be an object")
+    projected = copy.deepcopy(ingress)
+    projected.pop("targetPortHttpScheme", None)
+    return write_schema().project_component("containerApps", "PATCH", ("properties", "configuration", "ingress"), projected)
 
 
 def desired_ingress(kind, baseline):
@@ -841,9 +862,13 @@ def runtime_targets(config, baseline, snapshot, resources, *, allow_isolated=Fal
 
 
 def patch_app(config, kind, containers, work, *, ingress=UNCHANGED_INGRESS):
-    payload = {"properties": {"template": {"containers": writable_containers(containers)}}}
-    if ingress is not UNCHANGED_INGRESS:
-        payload["properties"]["configuration"] = {"ingress": writable_ingress(ingress)}
+    observed = app(config, config[kind])
+    if ingress is not UNCHANGED_INGRESS and ingress is not None:
+        ingress = write_schema().project_component(
+            "containerApps", "PATCH", ("properties", "configuration", "ingress"), writable_ingress(ingress),
+        )
+    configuration = UNCHANGED_INGRESS if ingress is UNCHANGED_INGRESS else {"ingress": writable_ingress(ingress)}
+    payload = build_update_payload(observed, containers, configuration=configuration)
     body = work / (kind + "-patch-" + fingerprint(payload) + ".json")
     preserve_json(body, payload)
     resource = f"/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.App/containerApps/{config[kind]}"
@@ -1217,6 +1242,8 @@ def validate_publication_upload(upload, *, now=None, valid_until=None):
 
 def upload_publication_context(upload, archive, timeout):
     source = validate_publication_upload(upload)
+    require(Path(archive).is_file() and type(timeout) in (int, float) and 0 < timeout < float("inf"),
+            "Binary Blob PUT requires an existing archive and a finite positive timeout")
     url = upload["uploadUrl"]
     # The SAS travels only over stdin, never argv, receipts, or diagnostic output.
     try:
@@ -1412,7 +1439,7 @@ def update_worker_image(config, work):
     containers[0]["image"] = image(config, "backend")
     body = work / "worker-image-patch.json"
     require(not body.exists(), "Worker image update already attempted; inspect state before proceeding")
-    save(body, {"properties": {"template": {"containers": writable_containers(containers)}}})
+    save(body, build_update_payload(job, containers, job=True))
     azure("rest", "--method", "PATCH", "--url", "https://management.azure.com" + resource_id + "?api-version=2024-03-01", "--body", "@" + str(body))
 
 
