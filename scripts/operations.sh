@@ -55,8 +55,10 @@ docintel_start() {
   if [[ -n "${QUALITY_WEB_ENABLED:-}" ]]; then environment+=("QUALITY_WEB_ENABLED=$QUALITY_WEB_ENABLED"); fi
   if [[ -n "${QUALITY_FORD_IMAGE_BLOB:-}" ]]; then environment+=("QUALITY_FORD_IMAGE_BLOB=$QUALITY_FORD_IMAGE_BLOB"); fi
   if [[ -n "${QUALITY_SMOKE_ONLY:-}" ]]; then environment+=("QUALITY_SMOKE_ONLY=$QUALITY_SMOKE_ONLY"); fi
+  az containerapp job update --subscription "$subscription" --resource-group "$group" --name "$job" \
+    --set-env-vars "${environment[@]}" --only-show-errors --output none
   az containerapp job start --subscription "$subscription" --resource-group "$group" --name "$job" \
-    --container-name "$job" --env-vars "${environment[@]}" --query name --output tsv
+    --query name --output tsv
 }
 
 docintel_get() {

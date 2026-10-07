@@ -165,12 +165,14 @@ def test_start_runs_exactly_one_new_worker_execution(invoke):
     })
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "caj-quality-execution"
-    assert len(calls) == 1 and calls[0].startswith("az <containerapp> <job> <start>")
-    assert "<--container-name> <caj-docintel-batch-dev-erik3>" in calls[0]
-    assert "<--env-vars> <QUALITY_RUN_ID=quality-001> <QUALITY_BATCH_ID=batch-001> <QUALITY_OWNER=tenant/owner>" in calls[0]
+    assert len(calls) == 2 and calls[0].startswith("az <containerapp> <job> <update>")
+    assert calls[1].startswith("az <containerapp> <job> <start>")
+    assert "<--set-env-vars> <QUALITY_RUN_ID=quality-001> <QUALITY_BATCH_ID=batch-001> <QUALITY_OWNER=tenant/owner>" in calls[0]
     assert "<QUALITY_WEB_ENABLED=false> <QUALITY_FORD_IMAGE_BLOB=rendered/ford.png>" in calls[0]
     assert "<QUALITY_SMOKE_ONLY=true>" in calls[0]
-    assert "<--query> <name> <--output> <tsv>" in calls[0]
+    assert "<--output> <none>" in calls[0]
+    assert "<--query> <name> <--output> <tsv>" in calls[1]
+    assert "<--env-vars>" not in calls[1]
 
 
 @pytest.mark.parametrize("operation", ["start", "export", "cost"])
