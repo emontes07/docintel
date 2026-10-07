@@ -22,12 +22,12 @@ from backend import quality_tool_loop as loop
 from backend.batch_store import Missing
 from backend.core.docintel import ParsedDocument
 from backend.core.quality_model import QualityModelResponseError, ResponsesCompletion
-from backend.core.websearch import OriginalPageEvidence
+from backend.core.websearch import ExternalEvidenceError, OriginalPageEvidence
 from backend.models.enrichment import AttributeDefinition, Evidence, Manifest, ProductKey
 from backend.quality_cost import CostLimitExceeded
-from backend.quality_pdf import CachedPDFOCR
+from backend.quality_pdf import CachedPDFOCR, PDFPageError
 from backend.quality_pipeline import ground_candidate
-from backend.quality_web import QualityWeb
+from backend.quality_web import BrowseUnavailable, QualityWeb
 
 NOW = datetime(2026, 10, 7, tzinfo=timezone.utc)
 URL = "https://fordmeterbox.com/synthetic-product"
@@ -238,11 +238,13 @@ def test_plain_text_commands_are_never_executed():
 
 def test_step_cap_includes_cached_tools_and_model_requests():
     adapter = completion([response(tool(call_id=str(i))) for i in range(20)])
-    result = run(adapter)
-    assert result.status == "budget_stopped" and result.steps == 15
-    assert adapter.client.responses.create.call_count == 8
-    assert result.stop_reason.startswith("Step cap")
-    assert sum(d["step"] is not None for d in result.diagnostics) == 15
+    with pytest.raises(QualityModelResponseError, match="closeout") as caught:
+        run(adapter)
+    result = caught.value.tool_loop_result
+    assert result.status == "failed" and result.steps == 12
+    assert adapter.client.responses.create.call_count == 7
+    assert sum(d["step"] is not None for d in result.diagnostics) == 12
+    assert sum(d["operation"] == "read_pdf_page" and d["step"] is not None for d in result.diagnostics) == 5
 
 
 def test_cost_admission_uses_actual_usage_not_reserved_maxima():
@@ -396,10 +398,15 @@ def test_parent_judge_shares_action_and_cost_gate():
     result = run(adapter, judge_candidates=paid_judge)
     assert result.steps == 4 and result.cost_usd == Decimal(".0314")
     assert result.diagnostics[-1]["phase"] == "judge"
+    def excessive_judge(candidates, evidence, actions):
+        for _ in range(4):
+            judged = paid_judge(candidates, evidence, actions)
+        return judged
     adapter = completion([response(tool()), response(message([proposal()]))])
-    result = run(adapter, judge_candidates=paid_judge, max_steps=3)
+    result = run(adapter, judge_candidates=excessive_judge, max_steps=6)
     assert result.status == "budget_stopped" and result.submissions[0].status == "pending_review"
     assert result.submissions[0].candidate.judge_status == "not_judged"
+    assert result.steps == 6
 
 
 class Store:
@@ -465,13 +472,17 @@ def test_text_pdf_never_calls_di(monkeypatch):
 
 
 def test_di_admission_checks_remaining_money_and_steps_before_ocr(monkeypatch):
-    for options in ({"max_steps": 2}, {"initial_cost_usd": ".98", "maximum_cost": lambda context: ".006" if context["operation"] == "model" else maximum(context)}):
+    for options in ({"max_steps": 6}, {"initial_cost_usd": ".98", "maximum_cost": lambda context: ".006" if context["operation"] == "model" else maximum(context)}):
         infrastructure, parser, _ = pdf_web(monkeypatch)
-        adapter = completion([response(tool("fetch_pdf", url=PDF_URL, attribute_id="Material"))])
+        adapter = completion([response(tool("fetch_pdf", url=PDF_URL, attribute_id="Material")), response(message())])
         result = run(adapter, web=infrastructure, **options)
-        assert result.status == "budget_stopped" and not result.evidence
+        assert not result.evidence
         parser.extract_pdf_bytes.assert_not_called()
-        assert result.steps == 2
+        if "max_steps" in options:
+            assert result.status == "completed" and result.steps == 3
+            assert adapter.client.responses.create.call_args.kwargs["tool_choice"] == "none"
+        else:
+            assert result.status == "budget_stopped" and result.steps == 2
 
 
 def test_di_callback_errors_are_not_sanitized_into_success_or_retry(monkeypatch):
@@ -518,9 +529,11 @@ def test_dollar_cap_cannot_be_relaxed_or_unknown():
 
 def test_multi_call_response_counts_each_call_without_parallel_execution():
     adapter = completion([response(tool(call_id="one"), tool(call_id="two")), response(message())])
-    result = run(adapter, max_steps=3)
-    assert result.steps == 3 and result.status == "budget_stopped"
-    assert adapter.client.responses.create.call_count == 1
+    result = run(adapter, max_steps=7)
+    assert result.steps == 4 and result.status == "completed"
+    assert adapter.client.responses.create.call_count == 2
+    assert [d["step"] for d in result.diagnostics if d["operation"] == "read_pdf_page"] == [2, 3]
+    assert adapter.client.responses.create.call_args.kwargs["tool_choice"] == "none"
 
 
 def test_repeated_call_id_never_replays_a_paid_tool():
@@ -600,10 +613,12 @@ def test_search_cache_and_missing_hosts_do_not_charge_phantom_web_calls():
 
 def test_browse_extra_get_consumes_its_own_step_and_never_falls_back_to_discovery():
     infrastructure = web()
-    adapter = completion([response(tool("browse", url=URL, attribute_id="Material"))])
-    result = run(adapter, web=infrastructure, max_steps=2)
-    assert result.status == "budget_stopped" and not result.evidence
-    assert result.cost_usd == Decimal(".0182") and result.steps == 2
+    adapter = completion([response(tool("browse", url=URL, attribute_id="Material")), response(message())])
+    result = run(adapter, web=infrastructure, max_steps=6)
+    assert result.status == "completed" and not result.evidence
+    assert result.cost_usd == Decimal(".0239") and result.steps == 3
+    assert any(d["operation"] == "direct_page" and d["status"] == "stopped" and d["step"] is None
+               for d in result.diagnostics)
     infrastructure.browse.assert_called_once()
     infrastructure.page_fetch.assert_not_called()
 
@@ -755,12 +770,16 @@ def test_real_parent_cached_judge_is_reused_and_preserves_cache_metadata(votes):
     assert any(entry["operation"] == "judge_cache" and entry["status"] == "hit" for entry in reused.diagnostics)
 
 
-def test_parent_cache_extra_dispute_votes_obey_same_step_gate():
+def test_parent_cache_extra_dispute_votes_obey_same_budget_gate():
     from backend.quality_judge import JudgeCache
     cache = JudgeCache(namespace="synthetic-owner", policy="same-parent-policy")
     callback, observed = parent_cached_judge(cache, ["judge_disputed", "accepted", "accepted"])
     adapter = completion([response(tool()), response(message([proposal()]))])
-    result = run(adapter, judge_candidates=callback, max_steps=4)
+    result = run(
+        adapter, judge_candidates=callback, max_steps=6, initial_cost_usd=".96",
+        maximum_cost=lambda context: (".021" if context["phase"] == "judge" else ".006")
+        if context["operation"] == "model" else maximum(context),
+    )
     assert result.status == "budget_stopped" and result.steps == 4
     assert len(observed) == 1 and not cache.memory
     assert result.submissions[0].status == "pending_review"
@@ -1084,8 +1103,9 @@ def test_public_dns_preflight_obeys_step_cap_and_source_cache(monkeypatch):
     infrastructure.search.side_effect = [[], [NEW_PUBLIC_URL]]
     dns = Mock(return_value=[("synthetic-global-address",)])
     monkeypatch.setattr(loop, "_public_addresses", dns)
-    result = run(completion(public_discovery_turns()), scope=public_scope(), web=infrastructure, max_steps=5)
-    assert result.status == "budget_stopped" and result.steps == 5
+    result = run(completion(public_discovery_turns()), scope=public_scope(), web=infrastructure, max_steps=9)
+    assert result.status == "completed" and result.steps == 6
+    assert not result.evidence
     dns.assert_not_called()
     infrastructure.browse.assert_not_called()
     infrastructure.search.side_effect = [[], [NEW_PUBLIC_URL]]
@@ -1116,3 +1136,316 @@ def test_prior_pass_urls_can_be_seeded_for_this_product_only(monkeypatch):
     assert result.status == "completed"
     assert {e.source_locator for e in result.evidence} == {NEW_PUBLIC_URL}
     assert "other.example" not in str(adapter.client.responses.create.call_args_list)
+
+
+@pytest.mark.parametrize("failure", [
+    ValueError("Original page unavailable; redirects and encoded responses are not followed"),
+    ExternalEvidenceError("Source HTML normalization failed.", code="invalid_content"),
+])
+def test_late_source_unavailable_preserves_grounded_local_proposal(failure):
+    infrastructure = web()
+    infrastructure.page_fetch.side_effect = failure
+    adapter = completion([
+        response(tool()),
+        response(tool("browse", call_id="late", url=URL, attribute_id="Material")),
+        response(message([proposal()])),
+    ])
+    meter = Mock(side_effect=price)
+    result = run(adapter, web=infrastructure, usage_callback=meter)
+    assert result.status == "completed" and result.submissions[0].status == "judged"
+    assert result.submissions[0].candidate.value == "brass"
+    assert [e.evidence_id for e in result.evidence] == ["e1"]
+    output = next(
+        item for item in adapter.client.responses.create.call_args.kwargs["input"]
+        if item.get("type") == "function_call_output" and item["call_id"] == "late"
+    )
+    unavailable = json.loads(output["output"])
+    assert unavailable["status"] == "source_unavailable" and unavailable["evidence"] == []
+    assert unavailable["source_url"] == URL and unavailable["retry_allowed"] is False
+    failed = next(entry for entry in result.diagnostics if entry["operation"] == "direct_page")
+    assert failed["status"] == "failed" and failed["error_type"] == type(failure).__name__
+    assert any(call.args[0]["operation"] == "direct_page" and call.args[0]["status"] == "failed"
+               for call in meter.call_args_list)
+    assert result.cost_usd == Decimal(".0296")
+    infrastructure.browse.assert_called_once()
+    infrastructure.page_fetch.assert_called_once()
+
+
+def test_forced_closeout_reserves_three_parent_judge_votes():
+    from backend.quality_judge import JudgeCache
+    callback, votes = parent_cached_judge(
+        JudgeCache(namespace="closeout", policy="same-parent-policy"), ["judge_disputed", "accepted", "accepted"],
+    )
+    adapter = completion([
+        *[response(tool(call_id=str(i))) for i in range(6)],
+        response(message([proposal()])),
+    ])
+    result = run(adapter, judge_candidates=callback)
+    assert result.status == "completed" and result.steps == 15 and len(votes) == 3
+    assert result.submissions[0].candidate.judge_status == "accepted"
+    final_request = adapter.client.responses.create.call_args.kwargs
+    assert final_request["tools"] == [] and final_request["tool_choice"] == "none"
+    closeout = next(entry for entry in result.diagnostics
+                    if entry["operation"] == "model" and entry.get("mode") == "terminal_closeout")
+    assert closeout["remaining_steps"] == 4 and closeout["step"] == 12
+    blocked = [json.loads(item["output"]) for item in final_request["input"]
+               if item.get("type") == "function_call_output"]
+    assert blocked[-1]["status"] == "closeout_required"
+
+
+def test_forced_closeout_rejects_tool_calls_before_any_execution():
+    adapter = completion([response(tool())])
+    with pytest.raises(QualityModelResponseError, match="closeout") as caught:
+        run(adapter, max_steps=4)
+    result = caught.value.tool_loop_result
+    assert result.steps == 1 and not result.evidence
+    assert result.diagnostics[-1]["mode"] == "terminal_closeout"
+    assert result.diagnostics[-1]["status"] == "response_invalid"
+    adapter.client.responses.create.assert_called_once()
+
+
+@pytest.mark.parametrize("stage,failure", [
+    ("browse", BrowseUnavailable("WebIQ Browse live crawl is pending; no automatic retry or verified page evidence.", status_code=202)),
+    ("browse", BrowseUnavailable("WebIQ Browse returned no usable bounded content.", status_code=503)),
+    ("browse", httpx.HTTPStatusError("Service unavailable", request=httpx.Request("POST", URL), response=httpx.Response(503))),
+    ("page_fetch", ValueError("Original page empty or exceeds its byte bound")),
+    ("page_fetch", ExternalEvidenceError("Source retrieval timed out.", code="timeout")),
+    ("page_fetch", httpx.ReadTimeout("Source timed out")),
+    ("page_fetch", httpx.ReadError("Source disconnected")),
+    ("page_fetch", TimeoutError("Source timed out")),
+    ("page_fetch", ConnectionResetError("Source disconnected")),
+    ("page_fetch", socket.gaierror("Source name unavailable")),
+    ("page_fetch", UnicodeDecodeError("utf-8", b"\xff", 0, 1, "Invalid source text")),
+])
+def test_known_source_failures_are_cached_across_tools_without_retry_or_recharge(stage, failure):
+    infrastructure = web()
+    getattr(infrastructure, stage).side_effect = failure
+    adapter = completion([
+        response(tool()),
+        response(tool("browse", call_id="first", url=URL, attribute_id="Material")),
+        response(tool("fetch_pdf", call_id="cached", url=URL, attribute_id="Material")),
+        response(message([proposal()])),
+    ])
+    meter = Mock(side_effect=price)
+    result = run(adapter, web=infrastructure, usage_callback=meter)
+    assert result.status == "completed" and result.submissions[0].status == "judged"
+    assert result.cost_usd == Decimal(".0353")
+    infrastructure.browse.assert_called_once()
+    assert infrastructure.page_fetch.call_count == (0 if stage == "browse" else 1)
+    cached = next(d for d in result.diagnostics if d.get("cache_hit") and d["operation"] == "fetch_pdf")
+    assert cached["status"] == "failed" and cached["cost_usd"] == 0
+    assert cached["recovery"] == "source_unavailable"
+    assert sum(call.args[0]["operation"] == "web_browse" for call in meter.call_args_list) == 1
+    tool_outputs = {
+        item["call_id"]: json.loads(item["output"])
+        for item in adapter.client.responses.create.call_args.kwargs["input"]
+        if item.get("type") == "function_call_output"
+    }
+    assert tool_outputs["first"]["status"] == tool_outputs["cached"]["status"] == "source_unavailable"
+    assert tool_outputs["cached"]["cache_hit"] and not tool_outputs["cached"]["retry_allowed"]
+    assert tool_outputs["cached"]["evidence"] == []
+
+
+@pytest.mark.parametrize("page_error", sorted(loop._PAGE_UNAVAILABLE_MESSAGES))
+def test_only_known_plain_page_value_errors_are_recoverable(page_error):
+    infrastructure = web()
+    infrastructure.page_fetch.side_effect = ValueError(page_error)
+    result = run(completion([
+        response(tool("browse", url=URL, attribute_id="Material")), response(message()),
+    ]), web=infrastructure)
+    assert result.status == "completed" and not result.evidence
+    assert any(d["status"] == "failed" and d.get("recovery") == "source_unavailable" for d in result.diagnostics)
+
+
+@pytest.mark.parametrize("failure", [
+    ValueError("Unrecognized reader validation failure"),
+    ValueError("PDF sources require an approved manufacturer domain"),
+    TypeError("Programming error"),
+    KeyError("Programming error"),
+    AssertionError("Programming error"),
+    FileNotFoundError("Persistence file missing"),
+    QualityModelResponseError("Wrong response schema"),
+    loop.ToolAccountingError("Unknown provider cost"),
+    CostLimitExceeded("Parent monetary stop"),
+    PDFPageError({"stage": "cache_write"}, "ValueError"),
+    ExternalEvidenceError("Private address", code="unsafe_address"),
+    ExternalEvidenceError("Invalid source URL", code="unsafe_url"),
+    ExternalEvidenceError("Unknown classified failure", code="new_unknown_code"),
+])
+def test_scope_programming_pdf_and_budget_errors_never_become_source_unavailable(failure):
+    infrastructure = web()
+    infrastructure.page_fetch.side_effect = failure
+    adapter = completion([response(tool("browse", url=URL, attribute_id="Material"))])
+    with pytest.raises(type(failure)) as caught:
+        run(adapter, web=infrastructure)
+    assert caught.value is failure and failure.tool_loop_result.status == "failed"
+    assert all(d.get("recovery") != "source_unavailable" for d in failure.tool_loop_result.diagnostics)
+    assert adapter.client.responses.create.call_count == 1
+
+
+@pytest.mark.parametrize("failure", [
+    BrowseUnavailable("WebIQ Browse returned no usable bounded content.", status_code=200),
+    BrowseUnavailable("WebIQ Browse response URL does not match the requested page.", status_code=503),
+    ValueError("WebIQ response must be JSON"),
+    httpx.HTTPStatusError("Bad schema", request=httpx.Request("POST", URL), response=httpx.Response(400)),
+    httpx.HTTPStatusError("Bad credentials", request=httpx.Request("POST", URL), response=httpx.Response(401)),
+    httpx.HTTPStatusError("API not authorized", request=httpx.Request("POST", URL), response=httpx.Response(403)),
+])
+def test_browse_protocol_schema_and_configuration_errors_remain_fatal(failure):
+    infrastructure = web()
+    infrastructure.browse.side_effect = failure
+    adapter = completion([response(tool("browse", url=URL, attribute_id="Material"))])
+    with pytest.raises(type(failure)) as caught:
+        run(adapter, web=infrastructure)
+    assert caught.value is failure
+    infrastructure.page_fetch.assert_not_called()
+    assert adapter.client.responses.create.call_count == 1
+
+
+@pytest.mark.parametrize("stage", ["before", "usage"])
+def test_source_availability_recovery_never_catches_action_hook_errors(stage):
+    infrastructure = web()
+    infrastructure.page_fetch.side_effect = ValueError("Original page contains no usable text")
+    failure = ValueError("Original page unavailable; redirects and encoded responses are not followed")
+    def hook(entry):
+        if entry["operation"] == "direct_page":
+            raise failure
+        return price(entry)
+    options = {"before_call": hook} if stage == "before" else {"usage_callback": hook}
+    adapter = completion([response(tool("browse", url=URL, attribute_id="Material"))])
+    with pytest.raises(ValueError) as caught:
+        run(adapter, web=infrastructure, **options)
+    assert caught.value is failure and failure.tool_loop_result.status == "failed"
+    assert adapter.client.responses.create.call_count == 1
+    assert infrastructure.page_fetch.call_count == (0 if stage == "before" else 1)
+
+
+def test_pdf_persistence_value_error_cannot_masquerade_as_page_availability(monkeypatch):
+    infrastructure, parser, _ = pdf_web(monkeypatch)
+    failure = ValueError("Original page contains no usable text")
+    infrastructure.pdf_ocr.store.write_bytes = Mock(side_effect=failure)
+    adapter = completion([response(tool("fetch_pdf", url=PDF_URL, attribute_id="Material"))])
+    with pytest.raises(PDFPageError) as caught:
+        run(adapter, web=infrastructure)
+    assert caught.value.tool_loop_result.status == "failed"
+    assert all(d.get("recovery") != "source_unavailable" for d in caught.value.tool_loop_result.diagnostics)
+    parser.extract_pdf_bytes.assert_called_once()
+    adapter.client.responses.create.assert_called_once()
+
+
+def test_di_usage_value_error_cannot_masquerade_as_page_availability(monkeypatch):
+    infrastructure, parser, _ = pdf_web(monkeypatch)
+    failure = ValueError("Original page contains no usable text")
+    def failed_meter(entry):
+        if entry["operation"] == "document_intelligence":
+            raise failure
+        return price(entry)
+    adapter = completion([response(tool("fetch_pdf", url=PDF_URL, attribute_id="Material"))])
+    with pytest.raises(ValueError) as caught:
+        run(adapter, web=infrastructure, usage_callback=failed_meter)
+    assert caught.value is failure and failure.tool_loop_result.status == "failed"
+    assert failure.tool_loop_result.cost_complete is False
+    parser.extract_pdf_bytes.assert_called_once()
+
+
+def test_unavailable_cache_is_exact_url_not_host_wide():
+    second_url = URL + "/different"
+    scope = loop.ProductSourceScope(
+        PRODUCT, frozenset({"e1"}), ("fordmeterbox.com",), approved_urls=frozenset({URL, second_url}),
+    )
+    infrastructure = web()
+    infrastructure.page_fetch.side_effect = [
+        ValueError("Original page contains no usable text"), page(second_url),
+    ]
+    result = run(completion([
+        response(tool("browse", url=URL, attribute_id="Material")),
+        response(tool("browse", call_id="other", url=second_url, attribute_id="Material")),
+        response(message()),
+    ]), scope=scope, web=infrastructure)
+    assert result.status == "completed" and infrastructure.page_fetch.call_count == 2
+    assert [e.source_locator for e in result.evidence] == [second_url]
+
+
+def test_source_availability_classification_never_applies_to_search():
+    infrastructure = web()
+    infrastructure.search.side_effect = ValueError("Original page contains no usable text")
+    adapter = completion([response(tool("web_search", scope="manufacturer", attribute_id="Material"))])
+    with pytest.raises(ValueError):
+        run(adapter, web=infrastructure)
+    adapter.client.responses.create.assert_called_once()
+
+
+def test_late_page_failure_then_forced_terminal_and_three_judge_votes():
+    from backend.quality_judge import JudgeCache
+    callback, votes = parent_cached_judge(
+        JudgeCache(namespace="late-page-closeout", policy="same-parent-policy"),
+        ["judge_disputed", "accepted", "accepted"],
+    )
+    infrastructure = web()
+    infrastructure.page_fetch.side_effect = ValueError("Original page contains no usable text")
+    adapter = completion([
+        *[response(tool(call_id=str(i))) for i in range(4)],
+        response(tool("browse", call_id="late", url=URL, attribute_id="Material")),
+        response(message([proposal()])),
+    ])
+    result = run(adapter, web=infrastructure, judge_candidates=callback)
+    assert result.status == "completed" and result.steps == 15 and len(votes) == 3
+    assert result.submissions[0].candidate.judge_status == "accepted"
+    assert result.cost_usd == Decimal(".1067")
+    assert adapter.client.responses.create.call_args.kwargs["tool_choice"] == "none"
+    assert any(d["operation"] == "direct_page" and d["status"] == "failed" for d in result.diagnostics)
+    infrastructure.page_fetch.assert_called_once()
+
+
+def test_closeout_model_admission_still_requires_remaining_money():
+    adapter = completion()
+    result = run(adapter, max_steps=4, initial_cost_usd=".95")
+    assert result.status == "budget_stopped" and result.steps == 0
+    assert result.diagnostics[-1]["mode"] == "terminal_closeout"
+    adapter.client.responses.create.assert_not_called()
+
+
+def test_known_page_failure_does_not_hide_later_terminal_monetary_stop():
+    infrastructure = web()
+    infrastructure.page_fetch.side_effect = ValueError("Original page contains no usable text")
+    adapter = completion([response(tool()), response(tool("browse", call_id="late", url=URL, attribute_id="Material"))])
+    result = run(adapter, web=infrastructure, initial_cost_usd=".88")
+    assert result.status == "budget_stopped" and result.cost_usd == Decimal(".9039")
+    assert [e.evidence_id for e in result.evidence] == ["e1"] and not result.submissions
+    assert adapter.client.responses.create.call_count == 2
+
+
+def test_tool_reserve_does_not_recover_invalid_arguments():
+    adapter = completion([response(tool(page=1, source_id="pdf", attribute_id="Resolved"))])
+    with pytest.raises(loop.ToolLoopError, match="resolved or unknown"):
+        run(adapter, max_steps=5)
+    adapter.client.responses.create.assert_called_once()
+
+
+def test_budget_flag_overrides_otherwise_recoverable_page_error():
+    infrastructure = web()
+    failure = ValueError("Original page contains no usable text")
+    failure.quality_budget_stop = True
+    infrastructure.page_fetch.side_effect = failure
+    adapter = completion([response(tool("browse", url=URL, attribute_id="Material"))])
+    with pytest.raises(ValueError) as caught:
+        run(adapter, web=infrastructure)
+    assert caught.value is failure and failure.tool_loop_result.status == "failed"
+    assert all(d.get("recovery") != "source_unavailable" for d in failure.tool_loop_result.diagnostics)
+    adapter.client.responses.create.assert_called_once()
+
+
+@pytest.mark.parametrize("stage", ["before", "usage"])
+def test_even_internal_availability_markers_from_hooks_are_fatal(stage):
+    infrastructure = web()
+    failure = loop._SourceUnavailable(TimeoutError("Hook IO failed"), "direct_page")
+    def hook(entry):
+        if entry["operation"] == "direct_page":
+            raise failure
+        return price(entry)
+    adapter = completion([response(tool("browse", url=URL, attribute_id="Material"))])
+    options = {"before_call": hook} if stage == "before" else {"usage_callback": hook}
+    with pytest.raises(loop._SourceUnavailable) as caught:
+        run(adapter, web=infrastructure, **options)
+    assert caught.value is failure and failure.tool_loop_result.status == "failed"
+    adapter.client.responses.create.assert_called_once()

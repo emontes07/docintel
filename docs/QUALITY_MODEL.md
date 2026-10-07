@@ -91,6 +91,13 @@ and maximum output; they never assume a cache hit. Actual usage is charged once.
 Missing prices/unknown usage stop further requests, not a success-shaped result.
 Every action and an explicit completion/budget/error summary appear in Diagnostics.
 Already grounded first-pass candidates survive a stopped or failed tool pass.
+Ordinary, recognized unavailable-source errors return explicit tool errors while
+retaining failed diagnostics and actual charges; the same failed URL is not
+retried. Unsafe inputs, unknown programming errors and accounting failures remain
+fatal. With four steps left, the model must conclude without tools, leaving room
+for majority judging. Search/Browse share the first pass's 12/6 per-product limits.
+Tool-produced candidates are labeled in technical grounding metadata; rechecking
+an identical candidate does not duplicate it.
 
 Tool proposals use the same structured grounder, applicability map, persistent
 judge cache and low-effort majority judging. Disputes and partial submissions stay

@@ -30,6 +30,8 @@ from backend.quality_pdf import (
 ENDPOINT = "https://api.microsoft.ai/v3/search/web"
 BROWSE_ENDPOINT = "https://api.microsoft.ai/v3/browse"
 BROWSE_MAX_LENGTH = 10000
+MAX_SEARCHES_PER_PRODUCT = 12
+MAX_BROWSES_PER_PRODUCT = 6
 MANUFACTURERS = {
     "ford": ("fordmeterbox.com", "www.fordmeterbox.com"),
     "mueller": ("muellercompany.com", "www.muellercompany.com", "muellerwaterproducts.com", "www.muellerwaterproducts.com"),
@@ -268,13 +270,13 @@ class QualityWeb:
         evidence = []
         tier_browse = 0
         for query in queries[:6]:
-            if counts["search"] >= 12 or counts["browse"] >= 6:
+            if counts["search"] >= MAX_SEARCHES_PER_PRODUCT or counts["browse"] >= MAX_BROWSES_PER_PRODUCT:
                 break
             counts["search"] += 1
             urls = self._perform("web_search", manifest, tier, self.search, query) or []
             urls = sorted(urls, key=lambda url: urlsplit(url).hostname not in hosts)
             for url in urls:
-                if counts["browse"] >= 6 or tier_browse >= 3:
+                if counts["browse"] >= MAX_BROWSES_PER_PRODUCT or tier_browse >= 3:
                     break
                 host = urlsplit(url).hostname
                 if url in seen or tier == "manufacturer_web" and host not in hosts or tier == "approved_web" and host in hosts:

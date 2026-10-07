@@ -5,8 +5,14 @@ existing cached judge. Every paid judge request uses ProductActions too. Model
 requests, tool dispatches, independent GETs, public-DNS checks and new OCR analyses
 each count once toward 15 steps; actual priced usage counts toward one dollar.
 Only the local step/dollar stop returns budget_stopped. Other errors retain a
-partial tool_loop_result and propagate. Discovery never becomes evidence without
-independent retrieval, grounding, applicability classification and judging.
+partial tool_loop_result and propagate, except narrowly classified source
+availability failures: those return source_unavailable, keep failed diagnostics
+and actual charges, and cache the exact URL against retries. No model/schema,
+unsafe-source, accounting or persistence failures are recovered.
+At four remaining steps, tools stop and terminal structured output is required,
+reserving up to three requests for the parent's cached/majority judge.
+Discovery never becomes evidence without independent retrieval, grounding,
+applicability classification and judging.
 """
 
 from __future__ import annotations
@@ -18,21 +24,25 @@ from decimal import Decimal
 import hashlib
 import json
 import re
+import socket
 from typing import Any, Literal, Protocol, TypeVar
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 from openai.lib._pydantic import to_strict_json_schema
 from pydantic import ConfigDict, Field
 
 from backend.core.quality_model import QualityModelResponseError, ResponsesCompletion
-from backend.core.websearch import OriginalPageEvidence, _public_addresses, validate_original_url
+from backend.core.websearch import ExternalEvidenceError, OriginalPageEvidence, _public_addresses, validate_original_url
 from backend.models.enrichment import AttributeDefinition, Candidate, Contract, Evidence, Manifest, ProductKey
 from backend.quality_cost import CostAmount, CostLimitExceeded
 from backend.quality_definitions import StructuredDefinition, derive_definition, model_instruction
 from backend.quality_pdf import CachedPDFOCR, PDFPageEvidence, TEXT_MAX_BYTES
 from backend.quality_pipeline import QualityProposal, product_packet
 from backend.quality_tool_model import ResponsesToolModel, parse_turn, strict_json
-from backend.quality_web import QualityWeb, original_page
+from backend.quality_web import (
+    MAX_BROWSES_PER_PRODUCT, MAX_SEARCHES_PER_PRODUCT, BrowseUnavailable, QualityWeb, original_page,
+)
 
 T = TypeVar("T")
 Status = Literal["resolved", "unresolved", "disputed"]
@@ -40,6 +50,18 @@ UsageCallback = Callable[[dict[str, Any]], dict[str, Any] | None]
 MaximumCost = Callable[[dict[str, Any]], CostAmount]
 GroundCandidate = Callable[[QualityProposal, AttributeDefinition, list[Evidence]], Candidate]
 PAID_OPERATIONS = frozenset({"model", "web_search", "web_browse", "direct_page", "document_intelligence"})
+CLOSEOUT_STEPS = 4
+_PAGE_UNAVAILABLE_MESSAGES = frozenset({
+    "Original page unavailable; redirects and encoded responses are not followed",
+    "Original page is not HTML/text or a manufacturer PDF",
+    "Original page empty or exceeds its byte bound",
+    "Unsupported original-page encoding",
+    "Original page contains no usable text",
+})
+_EXTERNAL_UNAVAILABLE_CODES = frozenset({
+    "http_error", "redirect_not_followed", "unsupported_content_encoding", "unsupported_content_type",
+    "response_too_large", "invalid_content", "timeout", "transport_error",
+})
 
 
 class ToolLoopError(RuntimeError):
@@ -60,6 +82,51 @@ class _CallbackStop(CostLimitExceeded):
 
 class _LocalStop(CostLimitExceeded):
     pass
+
+
+class _ToolCloseout(CostLimitExceeded):
+    """Stop tool work without poisoning the terminal/judge action gate."""
+
+
+class _SourceUnavailable(RuntimeError):
+    def __init__(self, error: Exception, operation: str):
+        super().__init__(str(error))
+        self.error, self.operation = error, operation
+
+
+def _availability_status(status: int | None) -> bool:
+    return status in {202, 404, 408, 410, 429, 430} or status is not None and 500 <= status <= 599
+
+
+def _source_read(operation: str, read: Callable[[], T]) -> T:
+    """Classify only errors from source IO, never action hooks or result parsing."""
+    try:
+        return read()
+    except (
+        ValueError, ExternalEvidenceError, httpx.HTTPStatusError, httpx.TimeoutException,
+        httpx.NetworkError, TimeoutError, ConnectionError, socket.gaierror,
+    ) as error:
+        if getattr(error, "quality_budget_stop", False):
+            raise
+        if isinstance(error, BrowseUnavailable):
+            recoverable = (
+                operation == "web_browse" and _availability_status(error.status_code)
+                and error.reason != "WebIQ Browse response URL does not match the requested page."
+            )
+        elif isinstance(error, ExternalEvidenceError):
+            recoverable = error.code in _EXTERNAL_UNAVAILABLE_CODES
+        elif isinstance(error, httpx.HTTPStatusError):
+            recoverable = _availability_status(error.response.status_code)
+        elif isinstance(error, ValueError):
+            recoverable = operation == "direct_page" and (
+                type(error) is ValueError and str(error) in _PAGE_UNAVAILABLE_MESSAGES
+                or type(error) is UnicodeDecodeError
+            )
+        else:
+            recoverable = True  # Only the explicit transport classes above reach here.
+        if not recoverable:
+            raise
+        raise _SourceUnavailable(error, operation) from error
 
 
 def amount(value: CostAmount) -> Decimal:
@@ -119,6 +186,7 @@ class ProductActions:
         self.max_steps, self.max_cost = max_steps, amount(max_cost_usd)
         self.maximum_cost, self.usage_callback, self.before_call = maximum_cost, usage_callback, before_call
         self.failure: Exception | None = None
+        self.tool_mode = False
 
     def begin(self, operation: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
         context = {**self.context, **(context or {}), "operation": operation}
@@ -136,6 +204,8 @@ class ProductActions:
                 raise _CallbackStop(self.failure) from self.failure
             if self.result.steps >= self.max_steps:
                 raise _LocalStop(f"Step cap reached ({self.max_steps}); no next action was sent")
+            if self.tool_mode and operation != "invalid_tool" and self.max_steps - self.result.steps <= CLOSEOUT_STEPS:
+                raise _ToolCloseout("Tool not executed: remaining steps are reserved for terminal output and judging")
             maximum = amount(self.maximum_cost(context)) if operation in PAID_OPERATIONS else Decimal(0)
             entry["maximum_cost_usd"] = float(maximum)
             if self.result.cost_usd + maximum > self.max_cost:
@@ -145,6 +215,10 @@ class ProductActions:
                 )
             if self.before_call and operation in PAID_OPERATIONS:
                 self.before_call({**context, "maximum_cost_usd": float(maximum)})
+        except _ToolCloseout as error:
+            entry.update(status="stopped", error_type=type(error).__name__, reason=str(error),
+                         mode="terminal_closeout", remaining_steps=self.max_steps - self.result.steps)
+            raise
         except Exception as error:
             if self.failure is None:
                 self.failure = error
@@ -194,6 +268,15 @@ class ProductActions:
             result = invoke()
             entry["status"] = "succeeded"
             return result
+        except _SourceUnavailable as error:
+            failure = error
+            entry.update(status="failed", error_type=type(error.error).__name__, reason=str(error),
+                         recovery="source_unavailable")
+            raise
+        except _ToolCloseout as error:
+            failure = error
+            entry.update(status="stopped", error_type=type(error).__name__, reason=str(error), mode="terminal_closeout")
+            raise
         except Exception as error:
             failure = error
             self.failure = error
@@ -274,6 +357,11 @@ Search targets are unresolved attribute names from definitions, not expected
 answers or user/reference hints. Find values only in approved retrieved evidence.
 Keep conflicts explicit. Stop without guessing if tools/budget cannot resolve it."""
 
+CLOSEOUT_INSTRUCTION = """Finalize now using the terminal structured-output schema.
+Tools are disabled to reserve the remaining actions for grounding and judging.
+Use only evidence already delivered. Do not request tools, retry unavailable
+sources, invent values, or cite discovery. Explain any remaining evidence gaps."""
+
 
 def _approved_definitions(
     manifest: Manifest, supplied: Mapping[str, StructuredDefinition] | None,
@@ -352,6 +440,9 @@ class _Sources:
         if scope.allow_public_web_discovery and not scope.manufacturer_hosts:
             raise ToolLoopError("Public web discovery requires configured manufacturer domains to search first")
         self.manifest, self.scope, self.pending, self.web, self.actions = manifest, scope, pending, web, actions
+        self.web_counts = web.counts.setdefault(
+            manifest.product.item_id, {"search": 0, "browse": 0, "direct_page": 0},
+        ) if web is not None else {}
         self.local = []
         seen = set()
         for item in evidence:
@@ -374,6 +465,7 @@ class _Sources:
         self.delivered: dict[str, Evidence] = {}
         self.cache: dict[tuple[str, str], Any] = {}
         self.pages: dict[str, OriginalPageEvidence] = {}
+        self.unavailable: dict[str, _SourceUnavailable] = {}
         self.approvals: dict[str, bool] = {}
         self.discovered_urls: set[str] = set()
         self.manufacturer_checked = not scope.manufacturer_hosts
@@ -444,7 +536,7 @@ class _Sources:
                     raise ToolLoopError("PDF OCR must use the existing CachedPDFOCR adapter")
                 ocr = CachedPDFOCR(ocr.store, ocr.parser, before_call=self.before_di, usage_callback=self.record_di)
             try:
-                page = original_page(url, pdf_ocr=ocr)
+                page = _source_read("direct_page", lambda: original_page(url, pdf_ocr=ocr))
             finally:
                 # CachedPDFOCR annotates (rather than rethrows) secondary usage
                 # failures when parsing already failed. They must still stop us.
@@ -452,7 +544,7 @@ class _Sources:
                     error, self.di_failure = self.di_failure, None
                     raise error
         else:
-            page = self.web.page_fetch(url)
+            page = _source_read("direct_page", lambda: self.web.page_fetch(url))
         if (not isinstance(page, OriginalPageEvidence) or page.final_url != url
                 or not page.text.strip() or "\x00" in page.text
                 or len(page.text.encode()) > TEXT_MAX_BYTES
@@ -522,29 +614,60 @@ class _Sources:
                 raise error
             return self.actions.call("invalid_tool", reject_url, context=context)
         context["source_url"] = url
+        try:
+            return self.load_source(name, url, args.attribute_id, context)
+        except _SourceUnavailable as error:
+            if self.actions.failure is not None:
+                raise
+            cache_hit = url in self.unavailable
+            self.unavailable[url] = error
+            if urlsplit(url).hostname in self.scope.manufacturer_hosts:
+                self.manufacturer_checked = True
+            return {
+                "status": "source_unavailable", "source_url": url, "operation": error.operation,
+                "error_type": type(error.error).__name__, "cache_hit": cache_hit, "retry_allowed": False,
+                "reason": "This source could not be retrieved. Do not retry this URL; use other approved evidence.",
+                "evidence": [],
+            }
+
+    def load_source(self, name: str, url: str, attribute_id: str, context: dict[str, Any]) -> dict[str, Any]:
+        if url in self.unavailable:
+            def cached_failure() -> Any:
+                raise self.unavailable[url]
+            return self.actions.call(name, cached_failure, context={**context, "cache_hit": True})
         if url in self.pages:
             def cached() -> dict[str, Any]:
                 page = self.pages[url]
                 self.require_pdf(name, page)
-                return self.page_evidence(page, args.attribute_id)
+                return self.page_evidence(page, attribute_id)
             return self.actions.call(name, cached, context={**context, "cache_hit": True})
         if name == "browse":
+            if self.web_counts["browse"] >= MAX_BROWSES_PER_PRODUCT:
+                return self.actions.call("web_browse_cap", lambda: {
+                    "status": "limit_reached", "reason": "Per-product Browse cap already used by this run",
+                    "evidence": [],
+                }, context=context)
             if self.scope.allow_public_web_discovery and urlsplit(url).hostname not in self.scope.manufacturer_hosts:
                 host = urlsplit(url).hostname
                 assert host is not None
-                self.actions.call("public_url_validation", lambda: _public_addresses(host), context=context)
+                self.actions.call(
+                    "public_url_validation",
+                    lambda: _source_read("public_url_validation", lambda: _public_addresses(host)), context=context,
+                )
             def browse() -> dict[str, Any]:
                 assert self.web is not None
-                value = self.web.browse(url)
+                self.web_counts["browse"] += 1
+                value = _source_read("web_browse", lambda: self.web.browse(url))
                 if (not isinstance(value, dict) or value.get("url") != url
                         or not isinstance(value.get("content"), str) or not value["content"].strip()):
                     raise ToolLoopError("Invalid Browse discovery response; not source evidence")
                 return {"status": "discovered", "url": url, "evidence": []}
             self.actions.call("web_browse", browse, context=context)
         def fetch() -> dict[str, Any]:
+            self.web_counts["direct_page"] += 1
             page = self.retrieve(url)
             self.require_pdf(name, page)
-            return self.page_evidence(page, args.attribute_id)
+            return self.page_evidence(page, attribute_id)
         return self.actions.call("direct_page", fetch, context=context)
 
     @staticmethod
@@ -576,9 +699,15 @@ class _Sources:
         key = ("search", query)
         if key in self.cache:
             return self.actions.call("web_search_cache", lambda: self.cache[key], context={**context, "cache_hit": True})
+        if self.web_counts["search"] >= MAX_SEARCHES_PER_PRODUCT:
+            return self.actions.call("web_search_cap", lambda: {
+                "status": "limit_reached", "reason": "Per-product search cap already used by this run",
+                "evidence": [],
+            }, context=context)
 
         def perform() -> dict[str, Any]:
             assert self.web is not None
+            self.web_counts["search"] += 1
             urls = self.web.search(query)
             if not isinstance(urls, list) or len(urls) > 3 or any(not isinstance(url, str) for url in urls):
                 raise ToolLoopError("Web search must return at most three discovery URLs, not passages")
@@ -650,15 +779,27 @@ def run_tool_loop(
     call_ids: set[str] = set()
     try:
         while True:
+            remaining = actions.max_steps - result.steps
+            closeout = remaining <= CLOSEOUT_STEPS
             request = model.build_request(
-                SYSTEM, history, TOOLS, ToolConclusion, prompt_cache_key=prompt_cache_key, cache_prefix=cache_prefix,
+                SYSTEM + ("\n" + CLOSEOUT_INSTRUCTION if closeout else ""), history,
+                [] if closeout else TOOLS, ToolConclusion, prompt_cache_key=prompt_cache_key, cache_prefix=cache_prefix,
             )
+            if closeout:
+                request["tool_choice"] = "none"
             def invoke_model() -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any]:
                 response = model.request(request)
                 items = model.output_items(response)
                 calls, conclusion = parse_turn(items, ToolConclusion)
+                if closeout and calls:
+                    raise QualityModelResponseError("Terminal closeout forbids further tool calls")
                 return items, calls, conclusion
-            items, calls, conclusion = actions.call("model", invoke_model, context={"request": request}, usage=lambda: model.last_usage)
+            items, calls, conclusion = actions.call(
+                "model", invoke_model,
+                context={"request": request, "mode": "terminal_closeout" if closeout else "tool_loop",
+                         "remaining_steps": remaining},
+                usage=lambda: model.last_usage,
+            )
             # Preserve complete reasoning output (including encrypted_content) as
             # required for stateless Responses continuation; not just call IDs.
             history.extend(items)
@@ -669,7 +810,13 @@ def run_tool_loop(
                             raise ToolLoopError("Duplicate function call_id; refusing replay")
                         actions.call("invalid_tool", replay, context={"tool": call["name"], "call_id": call["call_id"]})
                     call_ids.add(call["call_id"])
-                    output = sources.execute(call["name"], call["arguments"])
+                    actions.tool_mode = True
+                    try:
+                        output = sources.execute(call["name"], call["arguments"])
+                    except _ToolCloseout as error:
+                        output = {"status": "closeout_required", "reason": str(error), "evidence": [], "retry_allowed": False}
+                    finally:
+                        actions.tool_mode = False
                     history.append({"type": "function_call_output", "call_id": call["call_id"],
                                     "output": json.dumps(output, ensure_ascii=False)})
                 continue

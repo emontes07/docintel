@@ -784,6 +784,7 @@ def run_product(
             mapping = build_applicability_map(manifest, combined)
             candidate.grounding = {
                 **(candidate.grounding or {}),
+                "quality_pass": "tool_loop",
                 "applicability": candidate_applicability(candidate, mapping, combined).model_dump(mode="json"),
             }
             return candidate
@@ -866,7 +867,11 @@ def run_product(
                 })
                 continue
             candidate = submission.candidate
-            if any(candidate.model_dump() == previous.model_dump() for previous in target.candidates):
+            identity = judge_cache.identity(definitions[candidate.attribute_id], candidate, evidence)
+            previous = next((entry for entry in target.candidates
+                             if judge_cache.identity(definitions[candidate.attribute_id], entry, evidence) == identity), None)
+            if previous is not None:
+                previous.grounding = {**(previous.grounding or {}), "tool_rechecked": True}
                 continue
             target.candidates.append(candidate)
             if definitions[candidate.attribute_id].unit_resolved:
