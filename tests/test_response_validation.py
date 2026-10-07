@@ -110,7 +110,10 @@ def test_client_hashes_exact_provider_content_before_schema_validation(valid):
     content = '{"candidates": []}\n' if valid else '{"candidates": "PRIVATE"}\n'
     client = LLMClient.__new__(LLMClient)
     client.deployment = "synthetic"
-    client.sync_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+    client.endpoint = "https://synthetic.example"
+    client.api_version = "2025-01-01-preview"
+    client.timeout = 60
+    client.sync_client = SimpleNamespace(max_retries=0, chat=SimpleNamespace(completions=SimpleNamespace(
         create=Mock(return_value=SimpleNamespace(
             usage=SimpleNamespace(prompt_tokens=12, completion_tokens=8),
             choices=[SimpleNamespace(message=SimpleNamespace(content=content))],

@@ -7,12 +7,14 @@ This adapter performs no extraction, persistence, instrumentation or fallback.
 
 from datetime import datetime, timezone
 import json
+import hashlib
 from typing import List, Optional
 from urllib.parse import quote, urlsplit
 
 import httpx
 
 from backend.core.config import settings
+from backend.sdk_preflight import SDKPreflightError, preflight_httpx_request
 from backend.core.websearch import (
     ExternalEvidenceError,
     NotConfiguredError,
@@ -78,6 +80,7 @@ class WebIQSearchClient:
         self.timeout = timeout
         self.max_results = max_results
         self.max_length = max_length
+        self.last_sdk_preflight = None
 
     def _require_config(self) -> None:
         if not self.endpoint or not self.api_key or not self.api_key.strip():
@@ -98,20 +101,10 @@ class WebIQSearchClient:
             raise NotConfiguredError("WebIQ request limits are invalid.", code="invalid_limits")
 
     def validate_configuration(self) -> None:
-        """Offline preflight only; never authenticates, sends a query or reserves cost."""
+        """Configuration check only; ``preflight_search`` also serializes the query."""
         self._require_config()
 
-    def search(
-        self, query: str, allowed_domains: Optional[List[str]] = None,
-        *, authorized: bool = False,
-    ) -> List[SearchResult]:
-        """Discover sources using caller-approved public vendor/MPN/attribute terms.
-
-        The caller owns public-term selection, unresolved-only orchestration and
-        budget reservation. Authorization is required on every call, even when
-        environment configuration is present. Approved domains are exact hosts;
-        subdomains must be listed explicitly. No source page is followed here.
-        """
+    def _request(self, query, allowed_domains, *, authorized):
         if authorized is not True:
             raise WebSearchError("Explicit WebIQ query authorization is required.", code="authorization_required")
         self._require_config()
@@ -122,21 +115,67 @@ class WebIQSearchClient:
             or self.api_key in query
         ):
             raise WebSearchError("Supply only authorized public search terms.", code="invalid_query")
+        return hosts, {
+            "method": "POST", "url": self.endpoint,
+            "headers": {"x-apikey": self.api_key, "Accept-Encoding": "identity"},
+            "json": {
+                "query": query, "maxResults": self.max_results,
+                "contentFormat": "passage", "maxLength": self.max_length,
+            },
+        }
+
+    def _client_options(self):
+        return {
+            "timeout": httpx.Timeout(self.timeout),
+            "follow_redirects": False, "trust_env": False,
+        }
+
+    def _preflight_request(self, hosts, request):
+        self.last_sdk_preflight = None
+        receipt = preflight_httpx_request(
+            client_options=self._client_options(), request_arguments=request,
+        )
+        # Domains are an exact-host result filter, not part of the provider API.
+        receipt["allowed_domains_sha256"] = hashlib.sha256(
+            json.dumps(sorted(hosts), separators=(",", ":")).encode(),
+        ).hexdigest()
+        receipt["allowed_domains_count"] = len(hosts)
+        receipt["discovery_only_not_evidence"] = True
+        self.last_sdk_preflight = receipt
+        return receipt
+
+    def preflight_search(
+        self, query: str, allowed_domains: Optional[List[str]] = None,
+        *, authorized: bool = False,
+    ) -> dict:
+        """Validate exact public query and host filter before reserving search cost."""
+        self.last_sdk_preflight = None
+        try:
+            hosts, request = self._request(query, allowed_domains, authorized=authorized)
+            return self._preflight_request(hosts, request)
+        except SDKPreflightError:
+            raise
+        except Exception as error:
+            raise SDKPreflightError("webiq", type(error).__name__) from None
+
+    def search(
+        self, query: str, allowed_domains: Optional[List[str]] = None,
+        *, authorized: bool = False,
+    ) -> List[SearchResult]:
+        """Discover public sources; caller must preflight before reserving budget.
+
+        Authorization and exact-host filtering remain mandatory. Provider
+        passages are unverified discovery only and never attribute evidence.
+        """
+        self.last_sdk_preflight = None
+        hosts, request = self._request(query, allowed_domains, authorized=authorized)
+        self._preflight_request(hosts, request)
         try:
             with httpx.Client(
-                timeout=httpx.Timeout(self.timeout),
-                follow_redirects=False,
-                trust_env=False,
+                **self._client_options(),
                 transport=httpx.HTTPTransport(retries=0, trust_env=False),
             ) as client:
-                with client.stream(
-                    "POST", ENDPOINT,
-                    headers={"x-apikey": self.api_key, "Accept-Encoding": "identity"},
-                    json={
-                        "query": query, "maxResults": self.max_results,
-                        "contentFormat": "passage", "maxLength": self.max_length,
-                    },
-                ) as response:
+                with client.stream(**request) as response:
                     code = response.status_code
                     status = {
                         401: "authentication_failed", 403: "permission_denied",

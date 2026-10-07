@@ -16,6 +16,7 @@ from openai import AsyncAzureOpenAI, AzureOpenAI
 from pydantic import BaseModel, ValidationError
 
 from backend.core.config import settings
+from backend.sdk_preflight import SDKPreflightError, apreflight_openai_request, preflight_openai_request
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,52 @@ def _build_messages(system: str, user: UserContent) -> List[Dict[str, Any]]:
     ]
 
 
+def _client_options(*, endpoint, token_provider, api_version, timeout, max_retries=2):
+    return {
+        "azure_endpoint": endpoint,
+        "azure_ad_token_provider": token_provider,
+        "api_version": api_version,
+        "timeout": timeout,
+        "max_retries": max_retries,
+    }
+
+
+def _request_arguments(system, user, schema, *, deployment, strict, **kwargs):
+    return dict(
+        model=deployment, messages=_build_messages(system, user),
+        response_format=_response_format(schema, strict), **kwargs,
+    )
+
+
+def preflight_structured_request(
+    system: str, user: UserContent, schema: Type[BaseModel], *,
+    endpoint: Optional[str] = None, deployment: Optional[str] = None,
+    api_version: str = LLM_API_VERSION, timeout: float = DEFAULT_TIMEOUT,
+    strict: bool = True, sdk_max_retries: int = 0, **kwargs: Any,
+) -> dict:
+    """Before budget reservation: validate the complete actual prompt and schema.
+
+    No real credential is constructed, consulted, or included in the receipt.
+    Call this with the output of ``prepare_inference_request``, not a sample.
+    """
+    try:
+        return preflight_openai_request(
+            client_options=_client_options(
+                endpoint=endpoint or settings.LLM_ENDPOINT or settings.AI_FOUNDRY_ENDPOINT,
+                token_provider=None, api_version=api_version, timeout=timeout,
+                max_retries=sdk_max_retries,
+            ),
+            request_arguments=_request_arguments(
+                system, user, schema, deployment=deployment or settings.LLM_DEPLOYMENT,
+                strict=strict, **kwargs,
+            ),
+        )
+    except SDKPreflightError:
+        raise
+    except Exception as error:
+        raise SDKPreflightError("model", type(error).__name__) from None
+
+
 def _parse(
     schema: Type[ModelT], content: Optional[str]
 ) -> Union[ModelT, ValidationError, ValueError]:
@@ -122,27 +169,23 @@ class LLMClient:
     ):
         self.endpoint = endpoint or settings.LLM_ENDPOINT or settings.AI_FOUNDRY_ENDPOINT
         self.deployment = deployment or settings.LLM_DEPLOYMENT
+        self.api_version = api_version
         self.timeout = timeout
         self.last_usage: dict[str, int] | None = None
         self.last_response_sha256: str | None = None
+        self.last_sdk_preflight: dict | None = None
 
         if token_provider is None:
             token_provider = get_bearer_token_provider(
                 DefaultAzureCredential(), COGNITIVE_SERVICES_SCOPE
             )
 
-        self.sync_client = AzureOpenAI(
-            azure_endpoint=self.endpoint,
-            azure_ad_token_provider=token_provider,
-            api_version=api_version,
-            timeout=timeout,
+        options = _client_options(
+            endpoint=self.endpoint, token_provider=token_provider,
+            api_version=api_version, timeout=timeout,
         )
-        self.async_client = AsyncAzureOpenAI(
-            azure_endpoint=self.endpoint,
-            azure_ad_token_provider=token_provider,
-            api_version=api_version,
-            timeout=timeout,
-        )
+        self.sync_client = AzureOpenAI(**options)
+        self.async_client = AsyncAzureOpenAI(**options)
         logger.info(
             "Initialized LLM client with managed identity (deployment: %s)",
             self.deployment,
@@ -160,8 +203,10 @@ class LLMClient:
         **kwargs: Any,
     ) -> ModelT:
         """Call the deployment and return a validated ``schema`` instance."""
-        messages = _build_messages(system, user)
-        response_format = _response_format(schema, strict)
+        self.last_sdk_preflight = None
+        request_arguments = _request_arguments(
+            system, user, schema, deployment=self.deployment, strict=strict, **kwargs,
+        )
         last_content: Optional[str] = None
         last_error: Any = None
         self.last_usage = None
@@ -174,12 +219,14 @@ class LLMClient:
                 )
                 time.sleep(retry_delay)
 
-            response = self.sync_client.chat.completions.create(
-                model=self.deployment,
-                messages=messages,
-                response_format=response_format,
-                **kwargs,
+            self.last_sdk_preflight = preflight_openai_request(
+                client_options=_client_options(
+                    endpoint=self.endpoint, token_provider=None, api_version=self.api_version,
+                    timeout=self.timeout, max_retries=self.sync_client.max_retries,
+                ),
+                request_arguments=request_arguments,
             )
+            response = self.sync_client.chat.completions.create(**request_arguments)
             if response.usage is not None:
                 self.last_usage = {
                     "input_tokens": response.usage.prompt_tokens,
@@ -212,8 +259,10 @@ class LLMClient:
         **kwargs: Any,
     ) -> ModelT:
         """Async counterpart of :meth:`complete_structured`."""
-        messages = _build_messages(system, user)
-        response_format = _response_format(schema, strict)
+        self.last_sdk_preflight = None
+        request_arguments = _request_arguments(
+            system, user, schema, deployment=self.deployment, strict=strict, **kwargs,
+        )
         last_content: Optional[str] = None
         last_error: Any = None
 
@@ -224,12 +273,14 @@ class LLMClient:
                 )
                 await asyncio.sleep(retry_delay)
 
-            response = await self.async_client.chat.completions.create(
-                model=self.deployment,
-                messages=messages,
-                response_format=response_format,
-                **kwargs,
+            self.last_sdk_preflight = await apreflight_openai_request(
+                client_options=_client_options(
+                    endpoint=self.endpoint, token_provider=None, api_version=self.api_version,
+                    timeout=self.timeout, max_retries=self.async_client.max_retries,
+                ),
+                request_arguments=request_arguments,
             )
+            response = await self.async_client.chat.completions.create(**request_arguments)
             last_content = response.choices[0].message.content
             result = _parse(schema, last_content)
             if isinstance(result, BaseModel):
