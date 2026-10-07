@@ -264,7 +264,7 @@ def image_input(store, blob: str | None) -> tuple[list[str] | None, dict]:
 
 
 def run_model_smoke(record, loader, completion, *, run_id, usage_callback=None, before_call=None) -> dict:
-    """One real extraction assertion; never changes product proposals."""
+    """One model observation; ambiguous or unsupported answers do not gate work."""
     item = next((item for item in record["items"]
                  if item["manifest"]["product"]["item_id"].removeprefix("PIMITEM-") == "213030"), None)
     if item is None:
@@ -298,39 +298,51 @@ def run_model_smoke(record, loader, completion, *, run_id, usage_callback=None, 
         usage_callback=usage_callback, before_call=before_call,
     )
     candidates = [proposal for proposal in response.candidates if proposal.attribute_id == SMOKE_ATTRIBUTE]
-    if len(candidates) != 1:
-        raise QualitySmokeError("Model smoke failed: return exactly one Operating Head Style candidate from T1096.",
-                                candidates=response.candidates)
-    try:
-        candidate = ground_candidate(expand_citations(candidates[0], packet), definition, vendor)
-    except (ValueError, TypeError) as error:
-        raise QualitySmokeError("Model smoke failed grounding: " + str(error), candidates=candidates) from error
-    cell_match = match_text(candidate.supporting_quote or "", [[
-        Fragment(target, cell_value, cell="T1096", vendor=True),
-    ]])
-    matches_expectation = (
-        str(candidate.value).strip().casefold() == "lockwing"
-        and target.evidence_id in candidate.evidence_ids and cell_match is not None
-    )
-    if matches_expectation and cell_match is not None and candidate.grounding is not None:
-        candidate.grounding["quote"] = cell_match.model_dump(mode="json")
-    if not matches_expectation:
-        candidate.qualification = (
-            (candidate.qualification + " ") if candidate.qualification else ""
-        ) + (
-            "Canary expected Lockwing at T1096; the grounded model interpretation differs. "
-            "Review head style versus locking feature."
+    grounded, rejected = [], []
+    matches_expectation = False
+    for proposal in candidates:
+        try:
+            candidate = ground_candidate(expand_citations(proposal, packet), definition, vendor)
+        except (ValueError, TypeError) as error:
+            rejected.append({"proposal": proposal.model_dump(mode="json"), "reason": str(error)})
+            continue
+        cell_match = match_text(candidate.supporting_quote or "", [[
+            Fragment(target, cell_value, cell="T1096", vendor=True),
+        ]])
+        expected = (
+            str(candidate.value).strip().casefold() == "lockwing"
+            and target.evidence_id in candidate.evidence_ids and cell_match is not None
         )
-    grounding = (candidate.grounding or {}).get("quote", {})
-    return {"status": "passed" if matches_expectation else "disagreed_with_expectation",
+        matches_expectation = matches_expectation or expected
+        if expected and cell_match is not None and candidate.grounding is not None:
+            candidate.grounding["quote"] = cell_match.model_dump(mode="json")
+        if not expected:
+            candidate.qualification = (
+                (candidate.qualification + " ") if candidate.qualification else ""
+            ) + (
+                "Canary expected Lockwing at T1096; the grounded model interpretation differs. "
+                "Review head style versus locking feature."
+            )
+        grounded.append(candidate)
+    first = grounded[0] if grounded else None
+    grounding = ((first.grounding or {}).get("quote", {})) if first else {}
+    status = (
+        "no_grounded_candidate" if not grounded else
+        "multiple_grounded_interpretations" if len(grounded) > 1 else
+        "passed" if matches_expectation and not rejected else "disagreed_with_expectation"
+    )
+    return {"status": status,
             "item_id": manifest.product.item_id, "mpn": manifest.product.mpn,
-            "attribute_id": SMOKE_ATTRIBUTE, "value": candidate.value, "source_row": 1096,
-            "source_cells": grounding.get("cells", []), "supporting_quote": candidate.supporting_quote,
+            "attribute_id": SMOKE_ATTRIBUTE, "value": first.value if first else None, "source_row": 1096,
+            "source_cells": grounding.get("cells", []), "supporting_quote": first.supporting_quote if first else None,
             "grounding": grounding, "model_calls": 1,
             "expected_source": {"value": cell_value, "source_cells": ["T1096"],
                                 "evidence_ids": [target.evidence_id], "supporting_quote": cell_value},
-            "candidate": candidate.model_dump(mode="json"),
-            "qualification": "Canary observation, not an approval or readiness gate; grounded disagreements continue to the full extraction and judge."}
+            "candidate": first.model_dump(mode="json") if first else None,
+            "candidates": [candidate.model_dump(mode="json") for candidate in grounded],
+            "observed_candidates": [candidate.model_dump(mode="json") for candidate in response.candidates],
+            "rejected_candidates": rejected,
+            "qualification": "Canary observation, not an approval or readiness gate; retain grounded interpretations, reject unsupported answers, and continue to full extraction and judging."}
 
 
 def run_quality_batch(
@@ -451,7 +463,9 @@ def run_quality_batch(
                 manifest, evidence, completion, run_id=run_id, item_key=item_key, web=web,
                 images=image if ford else None, usage_callback=persist_usage,
                 before_call=before_usage, retrieval=retrieval,
-                initial_candidates={"vendor_table": [Candidate.model_validate(smoke["candidate"])]} if reuse_smoke else None,
+                initial_candidates={"vendor_table": [
+                    Candidate.model_validate(candidate) for candidate in smoke["candidates"]
+                ]} if reuse_smoke else None,
                 initial_diagnostics=[entry for entry in usage_records if entry.get("phase") == "smoke"
                                      and entry.get("item_id") == manifest.product.item_id] if reuse_smoke else None,
             )
