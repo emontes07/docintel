@@ -238,6 +238,24 @@ and attempt-history export. Completions, discoveries and pages are always
 
 ## Selected two-slice timing fallback
 
+### Pre-write deployment correction
+
+Native Container Apps/Jobs GET responses can include the read-only
+`imageType: ContainerImage` discriminator. Deployment uses the same
+`release.writable_containers` projection as readiness before validating the
+exact target write schema. Raw read objects are never sent.
+
+If projection rejected the original deployment before any PATCH receipt,
+native-write preflight or credential binding existed, `continue-deploy` can
+finish that **same** attempt once. It requires unchanged captured resources and
+an append-only `four-product-operator-source.json` binding the original decision,
+published digest receipt, deployment attempt, and a reviewed/merged-CI operator
+revision. Only this operator, its tests and this document may differ from the
+published application. The image, private gate, allowances, readiness clock and
+original source receipts stay unchanged. The continuation records its own
+create-once receipt; submitted, outcome-unknown or repeated operations remain
+ineligible. This is not authority for another publication or worker execution.
+
 The later owner capture `four-product-capacity-owner-approval-v1.json` approved
 **+7 requests / +303,895 input reservation units / +14,336 output tokens** and,
 only if needed for timing, one additional 600-second execution. The unchanged
