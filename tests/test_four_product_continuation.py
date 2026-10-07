@@ -1304,9 +1304,11 @@ def test_deploy_projects_native_container_discriminator_and_only_continues_befor
     def patch(work, config, supplied, label, resource, containers, *, job, bind_existing_secret):
         assert supplied == decision and bind_existing_secret is None
         assert resource["properties"]["template"]["containers"][0]["imageType"] == "ContainerImage"
-        assert "imageType" not in containers[0] and containers[0]["image"] == current["backend_image"]
+        assert containers[0]["image"] == current["backend_image"]
+        projected = helper.release.writable_containers(containers)
+        assert "imageType" not in projected[0]
         kind = "jobs" if job else "containerApps"
-        azure_write_schema.build_payload(kind, "PATCH", properties={"template": {"containers": containers}},
+        azure_write_schema.build_payload(kind, "PATCH", properties={"template": {"containers": projected}},
                                          **({} if job else {"location": "eastus"}))
         calls.append(label)
         resource["properties"]["template"]["containers"][0]["image"] = current["backend_image"]
@@ -1366,7 +1368,9 @@ def test_operator_source_review_cannot_change_published_application_or_authority
         assert helper.operator_revision(tmp_path, decision) == "b" * 40
 
 
-def test_operator_write_reuses_authoritative_schema_before_transport(tmp_path, monkeypatch):
+@pytest.mark.parametrize("label", ["deploy-backend", "enable", "close"])
+@pytest.mark.parametrize("discriminator", [False, True])
+def test_operator_write_reuses_authoritative_schema_before_transport(tmp_path, monkeypatch, label, discriminator):
     from contextlib import nullcontext
     from scripts import azure_write_schema
 
@@ -1384,23 +1388,29 @@ def test_operator_write_reuses_authoritative_schema_before_transport(tmp_path, m
     containers = copy.deepcopy(resource["properties"]["template"]["containers"])
     containers[0]["image"] = "synthetic@sha256:" + "b" * 64
     updated = copy.deepcopy(resource)
-    updated["properties"]["template"]["containers"] = containers
+    updated["properties"]["template"]["containers"] = copy.deepcopy(containers)
+    if discriminator:
+        resource["properties"]["template"]["containers"][0]["imageType"] = "ContainerImage"
+        containers[0]["imageType"] = "ContainerImage"
     values = iter([resource, updated])
     sent = []
     monkeypatch.setattr(helper, "live", lambda *a, **k: nullcontext())
     monkeypatch.setattr(helper.release, "app", lambda *a, **k: next(values))
-    monkeypatch.setattr(helper.prior, "shape", lambda value: copy.deepcopy(value["properties"]))
+    monkeypatch.setattr(helper.prior, "shape", lambda value: {
+        "template": {"containers": helper.release.writable_containers(value["properties"]["template"]["containers"])},
+    })
     def send(*args, on_preflight, **kwargs):
         on_preflight(deployment_proof("azure_write"))
         sent.append(args)
 
     monkeypatch.setattr(helper.release, "azure", send)
-    helper.patch(tmp_path, {"backend": "backend"}, decision, "deploy-backend", resource, containers)
-    payload = helper.release.private_json(helper.path(tmp_path, "deploy-backend-patch"))
+    helper.patch(tmp_path, {"backend": "backend"}, decision, label, resource, containers)
+    payload = helper.release.private_json(helper.path(tmp_path, label + "-patch"))
     assert payload == azure_write_schema.build_payload(
-        "containerApps", location="eastus", properties={"template": {"containers": containers}})
+        "containerApps", location="eastus",
+        properties={"template": {"containers": helper.release.writable_containers(containers)}})
     assert len(sent) == 1 and sent[0][:3] == ("rest", "--method", "PATCH")
-    native = helper.receipt(tmp_path, "deploy-backend-azure_write-preflight", decision)
+    native = helper.receipt(tmp_path, label + "-azure_write-preflight", decision)
     assert native["request_binding"] == {"resource_sha256": helper.sha(resource), "payload_sha256": helper.sha(payload)}
     assert native["native_no_send"]["provider_response_fabricated"] is True
 
