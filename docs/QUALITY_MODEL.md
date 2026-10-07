@@ -1,0 +1,123 @@
+# Quality model adapter
+
+`backend.core.quality_model.ResponsesCompletion` sends one synchronous Azure
+Responses API request per `complete_structured` call. It uses worker managed
+identity (`ManagedIdentityCredential`, optionally selected by `AZURE_CLIENT_ID`)
+and the Cognitive Services scope; an injected bearer-token provider is also
+supported. Construction does not request a token. There is no deployment probe,
+custom preflight, reservation, ledger, fallback model, or application retry.
+SDK retries are disabled, and Responses storage is disabled.
+`AZURE_OPENAI_AD_TOKEN` must be unset: the SDK would otherwise prioritize that
+ambient static token over the worker's token provider.
+
+## Configuration
+
+| Setting | Default / behavior |
+| --- | --- |
+| `QUALITY_MODEL_DEPLOYMENT` | Falls back to existing `LLM_DEPLOYMENT`; otherwise required. |
+| `LLM_ENDPOINT` | Azure resource root or `/openai/v1/` endpoint; falls back to `AI_FOUNDRY_ENDPOINT`. |
+| `QUALITY_MODEL_EFFORT` | `medium` for extraction. |
+| `QUALITY_MODEL_MAX_OUTPUT_TOKENS` | `16000`, including reasoning tokens. |
+| `QUALITY_MODEL_INPUT_USD_PER_MILLION` | Uncached input price; unset means unknown. |
+| `QUALITY_MODEL_CACHED_INPUT_USD_PER_MILLION` | Cached input price; unset means unknown. |
+| `QUALITY_MODEL_CACHE_WRITE_USD_PER_MILLION` | Cache-write input price; needed when the service reports positive cache-write tokens. |
+| `QUALITY_MODEL_OUTPUT_USD_PER_MILLION` | Output price, including reasoning; unset means unknown. |
+| `QUALITY_MODEL_PRICE_BASIS` | Record label; defaults to `OpenAI public pricing estimate; not final Azure billing`. |
+
+Constructor arguments override environment defaults. `reasoning_effort` overrides
+effort for an individual call (for example a judge's configured `low`) without
+changing subsequent extraction calls. A deployment's supported effort values are
+determined by Azure, not guessed from its name. Existing `gpt-5` deployments remain
+supported; no newer deployment or pricing is assumed to exist. Select a
+Responses-compatible deployment/region and disclose the configured price basis.
+Unknown cost does not block execution.
+For the requested GPT-6 Sol run, the disclosed basis is
+[OpenAI public pricing](https://developers.openai.com/api/docs/pricing), not final
+Azure billing: short-context input/cached/cache-write/output prices are
+`2 / 0.20 / 2.50 / 10` USD per million; long-context prices are
+`4 / 0.40 / 5 / 15`. These are explicitly configured estimates, **not code
+defaults**, and the appropriate context-tier rates must be selected by the caller.
+
+## Usage
+
+```python
+from pydantic import BaseModel
+from backend.core.quality_model import ResponsesCompletion
+
+class Extraction(BaseModel):
+    material: str | None
+
+class Judgment(BaseModel):
+    supported: bool
+
+usage = []
+model = ResponsesCompletion(usage_callback=usage.append)
+answer = model.complete_structured(
+    "Extract only attributes supported by the evidence.",
+    "Exact product evidence: body material is brass.",
+    Extraction,
+)
+judgment = model.complete_structured(
+    "Judge whether the extracted value is supported by the evidence.",
+    f"Evidence: body material is brass. Extracted: {answer.material}",
+    Judgment,
+    reasoning_effort="low",
+)
+# Optional page images: images=["data:image/png;base64,..."]
+```
+
+Text uses Responses `input_text` blocks. Image data URLs use `input_image` with
+`image_url` as a string, not the Chat Completions nested image shape. The adapter
+uses `responses.create(text={"format": ...})` and the OpenAI SDK's strict
+Pydantic-schema conversion, verified against locked OpenAI **1.91.0**. Requests
+target `/openai/v1/responses`, with no legacy `api-version` query parameter.
+`AzureOpenAI` retains native refreshing bearer-token support in this SDK version;
+the SDK-required constructor version is omitted from each request using its public
+`Omit` marker. `AOAI_API_VERSION` does not change this v1 adapter.
+Offline native-SDK tests cover both `gpt-5` and `gpt-6-sol` deployment names and
+resource-root/full-v1 endpoint configuration; these tests do not make live calls.
+JSON is
+validated into the requested Pydantic model only after the response is available,
+so a validation failure cannot hide its actual token usage. There is no JSON
+repair, Markdown stripping, partial-output acceptance, or Chat Completions fallback.
+
+## Usage records and errors
+
+`last_usage` starts as `{}` and describes the latest attempted provider request.
+`call_records` retains independent copies of every record. A synchronous optional
+callback receives another JSON-serializable copy. Records contain actual model
+and deployment, response ID/status, schema name as `call_purpose`, effort, input,
+cached-input, cache-write, reasoning, output and total tokens, prices, price basis, estimated cost, and
+failure type. They do not contain prompts, output text, images, or credentials.
+The instance is intended for sequential calls, not concurrent sharing.
+
+Cost is `(ordinary_input * input_price + cached_input * cached_price +
+cache_write * cache_write_price + output * output_price) / 1_000_000`.
+Ordinary input excludes both cache-read and reported cache-write input. Reasoning
+tokens are a subset of output tokens and are **not charged twice**. The service's
+`usage.input_tokens_details.cache_write_tokens` is recorded if present, including
+when the older SDK receives this newer field. If absent, `cache_write_tokens`
+remains `None` and the estimate does not invent cache-write usage or surcharges.
+Positive reported writes without a configured write price produce an unknown
+estimate; zero or absent writes need no write price. Missing input/cached/output
+usage or prices also produces an unknown (`None`) estimate, never a misleading
+zero. This does not block execution. Partial usage fields remain unknown rather
+than borrowing usage from a previous call. Estimates are not Azure invoices.
+
+Refusal, truncation, failed status, empty output, and invalid schema output raise
+`QualityModelResponseError`, retaining usage and invoking the callback. SDK
+failures raise `QualityModelError` with the original cause; when Azure supplies no
+usage, counts remain unknown. Invalid local configuration raises
+`QualityModelConfigurationError` before sending. A callback failure is surfaced
+after records are retained; if the response already failed, that original error
+remains primary and receives a callback-failure note.
+
+For offline tests, replace the public `model.client` with an object implementing
+`responses.create(**kwargs)`, or patch the module's `AzureOpenAI` constructor.
+Fake responses should expose the usual `status`, `output`, and `usage` fields
+(objects or dictionaries). The focused tests additionally use the real SDK with
+`httpx.MockTransport`, while denying sockets and credential acquisition.
+
+```sh
+.venv/bin/python -m pytest tests/test_quality_model.py -q
+```
