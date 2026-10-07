@@ -18,6 +18,8 @@ EXECUTION=$(./run.sh start "$RUN_ID")
 
 `build TAG` runs plain `az acr build -f backend/Dockerfile` with repository-root
 context, then prints the ACR digest; build logs go to stderr. Use a unique tag.
+Root ignore patterns omit directory trailing slashes so both Docker and the native
+Azure CLI packer exclude local environments, private outputs and credentials.
 `deploy IMAGE` runs `az containerapp update --image` and
 `az containerapp job update --image` with that same immutable digest, overriding
 the job entrypoint to `/app/.venv/bin/python -m backend.quality_worker`.
