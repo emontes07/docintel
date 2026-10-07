@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -20,6 +21,8 @@ from backend.models.enrichment import (
 )
 from backend.quality_applicability import build_applicability_map, candidate_applicability
 
+
+logger = logging.getLogger(__name__)
 
 REVIEW_COLUMNS = [
     "Product ID", "MPN", "Attribute", "Decision", "Correction", "Correction unit", "Reason",
@@ -273,8 +276,14 @@ def _build_package(
             question_rows.extend([
                 product.item_id, product.mpn, attribute.attribute_id, _definition_question(question), "",
             ] for question in sorted(definition_questions))
-            definition = next(d for d in result.manifest.attributes if d.attribute_id == attribute.attribute_id)
-            separator = "; " if definition.type_guidance == "Multi-Select" else "\n"
+            definition = next((d for d in result.manifest.attributes if d.attribute_id == attribute.attribute_id), None)
+            if definition is None:
+                logger.warning("Reviewer result omits the definition for attribute %s", attribute.attribute_id)
+                question_rows.append([
+                    product.item_id, product.mpn, attribute.attribute_id,
+                    "Confirm the expected data type and allowed values; this result does not include an attribute definition.", "",
+                ])
+            separator = "; " if definition is not None and definition.type_guidance == "Multi-Select" else "\n"
             rows.append([
                 product.item_id, product.mpn, attribute.attribute_id,
                 review.decision.capitalize() if review else "", _display(review.corrected_value) if review else "",
