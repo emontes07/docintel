@@ -124,12 +124,18 @@ class Candidate(Contract):
     value: AttributeValue
     unit: str | None = None
     evidence_ids: list[str] = Field(min_length=1)
-    origin: Literal["model_generated"] = "model_generated"
+    origin: Literal["model_generated", "literal", "derived", "inferred"] = "model_generated"
     supporting_quote: str | None = None
     qualification: str | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
     evidence_basis: EvidenceBasis = "literal"
     inference_rule: DescriptiveBooleanRule | None = None
+    normalization_rule: str | None = None
+    justification: str | None = None
+    judge_status: Literal["not_judged", "accepted", "judge_disputed"] = "not_judged"
+    judge_reason: str | None = None
+    reviewer_explanation: str | None = None
+    grounding: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
     def validate_inference_metadata(self) -> Self:
@@ -154,6 +160,26 @@ class Candidate(Contract):
 
 class ExtractionResponse(Contract):
     candidates: list[Candidate]
+
+    @classmethod
+    def model_json_schema(cls, *args, **kwargs):
+        # Legacy extraction must not request quality-worker annotations (or an
+        # unconstrained JSON grounding object) from its structured-output model.
+        schema = super().model_json_schema(*args, **kwargs)
+        candidate = schema.get("$defs", {}).get("Candidate", {})
+        annotations = {
+            "normalization_rule", "justification", "judge_status", "judge_reason",
+            "reviewer_explanation", "grounding",
+        }
+        for name in annotations:
+            candidate.get("properties", {}).pop(name, None)
+        candidate["required"] = [name for name in candidate.get("required", []) if name not in annotations]
+        if "origin" in candidate.get("properties", {}):
+            candidate["properties"]["origin"] = {
+                "const": "model_generated", "default": "model_generated", "title": "Origin", "type": "string",
+            }
+        schema.get("$defs", {}).pop("JsonValue", None)
+        return schema
 
 
 class EvidenceBundle(Contract):
@@ -242,6 +268,8 @@ class AttributeResult(Contract):
     verification: list[EvidenceVerification] = Field(default_factory=list)
     review: ReviewDecision | None = None
     review_annotations: list[ReviewAnnotation] = Field(default_factory=list)
+    reviewer_explanation: str | None = None
+    rejected_candidates: list[dict[str, JsonValue]] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_annotation_targets(self) -> Self:
@@ -307,3 +335,6 @@ class EnrichmentResult(Contract):
     failure: InferenceFailure | None = None
     validation_diagnostics: list[ResponseValidationDiagnostic] = Field(default_factory=list)
     telemetry: ItemTelemetry | None = None
+    quality_diagnostics: list[dict[str, JsonValue]] = Field(default_factory=list)
+    input_diagnostics: list[dict[str, JsonValue]] = Field(default_factory=list)
+    quality_run_id: str | None = None
