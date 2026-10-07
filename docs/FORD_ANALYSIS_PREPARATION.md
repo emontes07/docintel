@@ -5,6 +5,15 @@
 clock**. No deployment, worker, extraction/LLM, WebIQ, grant, identity attachment
 or additional credential is authorized by this helper.
 
+**Current state:** the original v4 attempt claimed and reserved successfully, but
+the SDK could not authenticate because the CLI rejected simultaneous tenant and
+subscription selectors. Its operation ID is `null`; no DI analysis, completed
+receipt or cache is claimed. The actual ledger remains **analysis 2 / pages 10**,
+including the existing $0.05 reservation. **Do not rerun `execute`.**
+The owner has separately authorized one continuation of that same reservation
+after focused CI and native no-send validation; see the continuation procedure
+below. This is not a refund, reset, second claim, new reservation or readiness.
+
 ## Existing permissions — do not grant anything
 
 The retained private evidence is
@@ -101,7 +110,7 @@ create-once. **Never rerun the entire helper after an unknown outcome, refund
 the reservation, overwrite a receipt, or request another analysis automatically.**
 The original ledger archive and locally retained parse enable read-only diagnosis.
 
-## Parent invocation
+## Original parent invocation — historical, do not rerun
 
 ```sh
 PY=/Users/erikmontes/Desktop/repo/docintel/.venv/bin/python
@@ -217,3 +226,155 @@ charge-before-SDK, both identity roles, no bearer transfer, local retention
 before cache, no retry/refund, canonical preservation and both cache checks.
 Its new mode-0700 `SYNTHETIC-local` directory contains only mode-0600 reproduction
 artifacts. These are **not** actual Ford analysis or live cache/authority records.
+
+## Once-only continuation of the consumed reservation
+
+The parent is the only live executor. The retained
+`ford-preparation-stopped-outcome.json` contains 35 records: the original 29,
+including the already-updated ledger, and six immutable preparation records.
+`ford-preparation-stopped-verification.json` records preservation of the 12 prior
+reservations, four execution records and prior measured usage. The original
+failure at `ford-preparation-local-failure.json` must remain untouched.
+
+The continuation binds:
+
+- Original v4 packet, authorization, acknowledged claim and failed local attempt.
+- Every canonical stopped-state record, the unchanged $0.05 reservation and
+  original immutable API storage-program hash.
+- The newly captured owner continuation approval and the existing identity/role
+  evidence; these are private JSON evidence pins, not new IAM authority.
+- The corrected implementation/test hashes, successful identified focused CI
+  checks and their exact source revision.
+- A deterministic native DI no-send proof of the actual client/request builders,
+  installed SDK/transport versions, source bytes/hash, model, API, page range,
+  normalized path, query and binary content type.
+
+`make_preparation_client()` and `preparation_analyze_kwargs()` are shared by the
+real parser and native no-send check. The installed SDK produces
+`application/octet-stream` from the binary body. The shared factory removes an
+endpoint's trailing slash to avoid a double-slash request path. The operator
+credential is **tenant-only**; subscription is checked separately against the
+already selected account. Permanent tests use the actual `AzureCliCredential`
+and verification wrapper, with CLI subprocess execution intercepted.
+
+Native preflight uses an inert credential and in-memory transport. It neither
+authenticates nor sends or fabricates a provider response. It runs during plan
+creation, again before the live continuation, and inside the real parser before
+SDK submission. A mismatch is a release blocker, not a warning. The broader
+native-preflight requirement for model/WebIQ/deployment calls remains separate;
+this command never enables those operations.
+
+### CI receipt and plan
+
+After the parent commits the corrected files and the focused CI succeeds, record
+a create-once mode-0600 JSON receipt in `$WORK` with exactly:
+
+```text
+schema_version: 1
+status: passed
+source_revision: <full tested Git commit SHA>
+code_sha256: <exact mapping returned by continuation_code_hashes()>
+checks:
+  - name: <successful focused/backend check name>
+    run_id: <actual positive GitHub Actions run ID>
+    conclusion: success
+```
+
+`continuation_code_hashes()` is exported by
+`scripts.ford_analysis_preparation`. Its seven-file mapping includes the
+production helper, provenance, shared SDK preflight, core parser and three Ford
+test files. The planner checks both current bytes and `git show` at the tested
+revision. A synthetic offline test receipt is **not** passing CI authority.
+
+The parent recorded the new explicit owner continuation approval capture as
+`ford-continuation-owner-authorization-20261006T233051Z.json`, mode `0600`,
+in `$WORK`. That capture is not the narrow packet-bound envelope.
+Then create the new immutable plan, without contacting any service:
+
+```sh
+"$PY" -B -m scripts.ford_analysis_preparation continuation-plan \
+  --work "$WORK" \
+  --ci "$WORK/<actual-focused-CI-receipt>.json" \
+  --owner-approval "$WORK/ford-continuation-owner-authorization-20261006T233051Z.json" \
+  --plan-name ford-preparation-continuation-plan-v1.json
+```
+
+This does not alter v4. If reviewed code/evidence changes, preserve this plan and
+create a new version; never overwrite an existing plan or attempt.
+
+### New narrow authorization
+
+Record exactly these fields, based on the already-granted continuation:
+
+```text
+schema_version: 1
+approved: true
+approved_by: original v4 plan.approved_by
+approved_at: actual timezone-qualified continuation approval timestamp
+continuation_plan_sha256: canonical SHA-256 of the new continuation plan
+original_packet_sha256: continuation plan.original_packet_sha256
+reservation_id: continuation plan.reservation_id
+one_continuation_only: true
+no_new_reservation: true
+no_retry_or_refund: true
+parent_live_executor_only: true
+```
+
+The original narrow v4 approval is not accepted as continuation approval.
+The current reservation is
+`e832fabf2978a6d95718e5bfeb4f33d1cc0e9bb8210d0ab1cc2e67dc8f706eae`.
+
+**Parent-only, once, after those gates:**
+
+```sh
+"$PY" -B -m scripts.ford_analysis_preparation continue \
+  --work "$WORK" --plan-name ford-preparation-continuation-plan-v1.json \
+  --authorization "$WORK/<new-narrow-continuation-approval>.json"
+```
+
+### Storage and failure semantics
+
+The start phase re-verifies the approved Blob hash/length/ETag, stopped history,
+absence of any submitted operation/parse/cache/completion, and the exact already
+charged ledger under the existing leases. It appends a single deterministic
+`continuation/attempt.json` under the original preparation prefix. It **does not
+write the budget or reserve anything**. Original reservations and execution
+records remain unchanged.
+
+New immutable records are `continuation/attempt.json`, `authorization.json`,
+`plan.json`, `failure-before.json` and `program.json`; the latter is reviewed,
+hash-bound storage-only continuation code. The original `storage-program.json`
+is loaded and verified unchanged, never overwritten. Its existing submission
+and completion functions write the previously absent original submitted record,
+mapped parse, analysis receipt, bounded cache and completion. Measured usage is
+reported against the **same reservation** without refunding reserved pages/cost.
+The original receipt schema is unchanged; it retains the original claim's input
+verification, while the continuation attempt records fresh Blob re-verification.
+
+Successful finalization additionally appends `continuation/completed.json`,
+binding the new authority, original failure, reservation, operation, original
+completion and canonical cache/ledger hashes. A later four-product gate must
+consume this actual continuation audit, not merely a synthetic gate result.
+
+New local files start with `ford-preparation-continuation-`; the original local
+failure, claim and console attempt are preserved. The mapped parse and receipt
+are retained locally before cache finalization. The local attempt is persisted
+before real credential acquisition. Unknown authentication, submission or
+storage outcomes stop processing permanently: **no further retry, rearming,
+refund or whole-helper rerun**. Partial audits are evidence, not completion.
+
+The opt-in stopped-state reproduction uses all 35 real records and the approved
+PDF in an isolated store, actual native no-send serialization, an actual CLI
+credential with intercepted subprocess, synthetic analysis results and the
+exact compiled original/new API storage programs:
+
+```sh
+DOCINTEL_TEST_FORD_CONTINUATION_WORK="$WORK" \
+DOCINTEL_TEST_FORD_CONTINUATION_OUTPUT="<new-unused-continuation-gate>.json" \
+"$PY" -B -m pytest tests/test_ford_preparation_continuation.py \
+  tests/test_ford_analysis_preparation.py tests/test_docintel.py \
+  -q -p no:cacheprovider
+```
+
+Real execution still requires the parent's actual CI receipt, new approval
+capture and narrow authorization. Offline evidence never fabricates them.

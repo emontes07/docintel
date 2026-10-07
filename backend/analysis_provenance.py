@@ -20,6 +20,35 @@ def stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
+def make_preparation_client(*, endpoint, credential, transport=None):
+    from azure.ai.documentintelligence import DocumentIntelligenceClient
+
+    options = {"transport": transport} if transport is not None else {}
+    return DocumentIntelligenceClient(
+        endpoint=endpoint.rstrip("/"), credential=credential, api_version=API_VERSION,
+        retry_total=0, retry_connect=0, retry_read=0, retry_status=0,
+        connection_timeout=10, read_timeout=30, **options,
+    )
+
+
+def preparation_analyze_kwargs(source_bytes):
+    if not isinstance(source_bytes, bytes):
+        raise ValueError("Preparation request requires PDF bytes")
+    return {"model_id": LAYOUT_MODEL_ID, "body": BytesIO(source_bytes), **REQUEST_OPTIONS}
+
+
+def preflight_preparation(source_bytes, *, endpoint):
+    from backend.sdk_preflight import preflight_document_intelligence
+
+    return preflight_document_intelligence(
+        source_bytes=source_bytes,
+        client_factory=lambda *, credential, transport: make_preparation_client(
+            endpoint=endpoint, credential=credential, transport=transport,
+        ),
+        analyze_kwargs=preparation_analyze_kwargs(source_bytes),
+    )
+
+
 class VerifiedOperatorCredential:
     """Check only allowlisted identity claims in memory; never export the token."""
 
@@ -61,6 +90,7 @@ class RecordedPreparationParser(DocumentIntelligenceService):
         super().__init__(endpoint=endpoint, credential=credential)
         self.submitted = submitted
         self.analysis_receipt = None
+        self.no_send_receipt = None
 
     def _analyze(self, source_url, *, page_limit=None):
         if not isinstance(source_url, bytes) or page_limit != 5:
@@ -69,7 +99,7 @@ class RecordedPreparationParser(DocumentIntelligenceService):
             raise ValueError("This preparation parser already attempted analysis; no retry")
         if not isinstance(self._credential, VerifiedOperatorCredential):
             raise ValueError("Explicit verified operator credential required")
-        from azure.ai.documentintelligence import DocumentIntelligenceClient
+        self.no_send_receipt = preflight_preparation(source_url, endpoint=self.endpoint)
 
         receipt = {
             "model_requested": LAYOUT_MODEL_ID, "api_version_requested": API_VERSION,
@@ -80,14 +110,8 @@ class RecordedPreparationParser(DocumentIntelligenceService):
         }
         self.analysis_receipt = receipt
         try:
-            with DocumentIntelligenceClient(
-                endpoint=self.endpoint, credential=self._credential, api_version=API_VERSION,
-                retry_total=0, retry_connect=0, retry_read=0, retry_status=0,
-                connection_timeout=10, read_timeout=30,
-            ) as client:
-                poller = client.begin_analyze_document(
-                    LAYOUT_MODEL_ID, body=BytesIO(source_url), **REQUEST_OPTIONS,
-                )
+            with make_preparation_client(endpoint=self.endpoint, credential=self._credential) as client:
+                poller = client.begin_analyze_document(**preparation_analyze_kwargs(source_url))
                 if self._credential.verified_identity is None:
                     raise ValueError("SDK did not establish the actual operator identity")
                 operation_id = str(uuid.UUID(poller.details["operation_id"]))

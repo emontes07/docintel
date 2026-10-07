@@ -638,15 +638,451 @@ def operator_credential(config, packet):
     )
 
 
-def execute(work, config, packet, authorization):
-    require(not (work / "ford-preparation-console-attempt.json").exists(),
-            "Existing preparation console attempt; inspect state, never retry")
-    _, _, records = load_snapshot(work)
-    original = json.loads(records[APPROVAL_KEY])
-    verify_authorization(packet, authorization, original)
+CONTINUATION_FILES = (
+    "scripts/ford_analysis_preparation.py", "backend/analysis_provenance.py",
+    "backend/sdk_preflight.py", "backend/core/docintel.py",
+    "tests/test_ford_analysis_preparation.py", "tests/test_private_ford_preparation.py",
+    "tests/test_ford_preparation_continuation.py",
+)
+CONTINUATION_FUNCTIONS = (
+    "validate_continuation_authorization", "continuation_state", "begin_continuation",
+    "submit_continuation", "complete_continuation",
+)
+
+
+def validate_continuation_authorization(proposal, authorization, packet):
+    require(set(authorization) == {
+        "schema_version", "approved", "approved_by", "approved_at", "continuation_plan_sha256",
+        "original_packet_sha256", "reservation_id", "one_continuation_only",
+        "no_new_reservation", "no_retry_or_refund", "parent_live_executor_only",
+    }, "Exact continuation authorization required")
+    require(authorization["schema_version"] == 1 and authorization["approved"] is True
+            and all(authorization[key] is True for key in (
+                "one_continuation_only", "no_new_reservation", "no_retry_or_refund", "parent_live_executor_only",
+            )), "One existing-reservation continuation only")
+    require(authorization["approved_by"] == packet["approved_by"]
+            and authorization["continuation_plan_sha256"] == sha(canonical(proposal))
+            and authorization["original_packet_sha256"] == proposal["original_packet_sha256"]
+            and authorization["reservation_id"] == proposal["reservation_id"],
+            "Continuation authority binding mismatch")
+    when = datetime.fromisoformat(authorization["approved_at"])
+    require(when.tzinfo is not None and datetime.fromisoformat(proposal["failure"]["recorded_at"]) <= when
+            <= datetime.now(timezone.utc), "Continuation approval must follow the preserved failure")
+    require(proposal["purpose"] == "one_continuation_of_existing_ford_reservation"
+            and proposal["new_reservations"] == 0 and proposal["new_reserved_microdollars"] == 0
+            and proposal["max_submissions"] == 1 and proposal["sdk_retries"] == 0,
+            "Continuation cannot expand the original allowance")
+    proof = proposal["native_no_send_proof"]
+    require(set(proof) == {
+        "status", "provider", "sdk_package", "sdk_version", "transport_package", "transport_version",
+        "method", "api_version", "endpoint_sha256", "body_sha256", "body_bytes", "content_type",
+        "request_sha256", "authentication_performed", "provider_send_performed",
+        "provider_response_fabricated", "source_sha256", "source_bytes",
+        "transport", "transport_real_calls", "network_calls", "credential_real_calls", "captured_requests",
+        "query", "query_is_complete", "query_sha256", "pages", "request_options", "path_sha256", "path", "model_id",
+    }, "Only metadata-only native DI proof is permitted")
+    require(proof["status"] == "validated_no_send" and proof["provider"] == "document_intelligence"
+            and proof["sdk_package"] == "azure-ai-documentintelligence"
+            and proof["transport_package"] == "azure-core" and proof["method"] == "POST"
+            and proof["api_version"] == API_VERSION and proof["content_type"] == "application/octet-stream"
+            and proof["source_sha256"] == proof["body_sha256"] == SOURCE_SHA256
+            and proof["source_bytes"] == proof["body_bytes"] == packet["local_pdf"]["bytes"]
+            and proof["transport"] == "in_memory_no_send" and proof["captured_requests"] == 1
+            and all(proof[key] == 0 for key in ("transport_real_calls", "network_calls", "credential_real_calls"))
+            and proof["request_options"] == REQUEST_OPTIONS and proof["pages"] == "1-5"
+            and proof["model_id"] == "prebuilt-layout"
+            and proof["path"] == "/documentintelligence/documentModels/prebuilt-layout:analyze"
+            and proof["query_is_complete"] is True
+            and proof["query"] == {"api-version": [API_VERSION], "pages": ["1-5"]}
+            and all(proof[key] is False for key in (
+                "authentication_performed", "provider_send_performed", "provider_response_fabricated",
+            )), "An exact native no-send proof is mandatory")
+    for key in ("endpoint_sha256", "request_sha256", "path_sha256", "query_sha256"):
+        require(re.fullmatch(r"[a-f0-9]{64}", proof[key]), "Native request digest required")
+    for key in ("sdk_version", "transport_version"):
+        require(re.fullmatch(r"[0-9.]+[a-z0-9.]{0,20}", proof[key]), "Installed SDK version required")
+    ci = proposal["ci_proof"]
+    require(ci["schema_version"] == 1 and ci["status"] == "passed"
+            and ci["code_sha256"] == proposal["local_code_sha256"]
+            and re.fullmatch(r"[a-f0-9]{40}", ci["source_revision"])
+            and ci["checks"] and all(check["conclusion"] == "success" for check in ci["checks"]),
+            "Corrected implementation must pass focused CI")
+
+
+def continuation_state(store, proposal, authorization, *, started):
+    packet, _ = read_json(store, PREFIX + "packet.json")
+    original_auth, _ = read_json(store, PREFIX + "authorization.json")
+    require(sha(canonical(packet)) == proposal["original_packet_sha256"]
+            and sha(canonical(original_auth)) == proposal["original_authorization_sha256"],
+            "Original preparation authority changed")
+    validate_continuation_authorization(proposal, authorization, packet)
+    _, claim = check_claim(store, packet, original_auth, proposal["claim_sha256"])
+    require(claim["reservation_id"] == proposal["reservation_id"]
+            and claim["reserved_microdollars"] == 50000, "Only the original charged reservation may continue")
+    for key, expected in proposal["history_sha256"].items():
+        require(record_sha(store.read_bytes(key)[0]) == expected, "Stopped history changed")
+    failure = proposal["failure"]
+    metadata = failure["analysis_metadata"]
+    require(failure["status"] == "failed_or_unknown_no_retry" and failure["allowance_refunded"] is False
+            and failure["submitted_transport_errors"] == []
+            and metadata["operation_id"] is None and "accepted_at" not in metadata
+            and metadata["error_type"] == "ClientAuthenticationError"
+            and metadata["source_sha256"] == SOURCE_SHA256
+            and metadata["source_bytes"] == claim["source_bytes"]
+            and metadata["request_options"] == REQUEST_OPTIONS,
+            "Only the evidenced pre-submission credential failure may continue")
+    ledger, _ = read_json(store, BUDGET_KEY)
+    before, _ = read_json(store, PREFIX + "ledger-before.json")
+    reservation = ledger["reservations"][claim["reservation_id"]]
+    expected = json.loads(canonical(before))
+    expected["attempted"]["analysis"] += 1
+    expected["reserved"]["analysis_pages"] += 5
+    expected["reserved"]["microdollars"] += 50000
+    expected["reservations"][claim["reservation_id"]] = reservation
+    require(canonical(expected) == canonical(ledger)
+            and reservation["status"] == "attempt_reserved_completion_unknown"
+            and reservation["actual_usage"] is None and reservation["execution_id"] is None
+            and reservation["reserved_usage"] == {"input_tokens": 0, "output_tokens": 0, "analysis_pages": 5}
+            and reservation["reserved_microdollars"] == 50000,
+            "Original charged ledger, prior reservations or usage changed")
+    for key in (*cache_keys(), PREFIX + "parsed.json", PREFIX + "analysis-receipt.json"):
+        absent(store, key)
+    prefix = PREFIX + "continuation/"
+    absent(store, prefix + "failure.json")
+    absent(store, prefix + "completed.json")
+    if started:
+        attempt, _ = read_json(store, prefix + "attempt.json")
+        require(attempt["plan_sha256"] == sha(canonical(proposal))
+                and attempt["authorization_sha256"] == sha(canonical(authorization))
+                and attempt["reservation_id"] == claim["reservation_id"], "Continuation attempt changed")
+    else:
+        absent(store, PREFIX + "submitted.json")
+        for name in ("attempt.json", "authorization.json", "plan.json", "failure-before.json", "program.json"):
+            absent(store, prefix + name)
+    return packet, original_auth, claim
+
+
+def begin_continuation(store, proposal, authorization, program, *, runtime_check):
+    runtime_check()
+    packet, _, claim = continuation_state(store, proposal, authorization, started=False)
+    require(sha(program.encode()) == proposal["continuation_program_sha256"], "Continuation code changed")
+    content, version = store.read_bytes(SOURCE_KEY, max_bytes=10 * 1024 * 1024)
+    require(sha(content) == SOURCE_SHA256 and len(content) == claim["source_bytes"]
+            and version == claim["source_etag"], "Previously verified Blob changed")
+    with store.lease(packet["batch_id"]), store.lease(BUDGET_KEY):
+        runtime_check()
+        continuation_state(store, proposal, authorization, started=False)
+        attempt = {
+            "state": "one_continuation_claimed_no_retry", "started_at": now(),
+            "plan_sha256": sha(canonical(proposal)), "authorization_sha256": sha(canonical(authorization)),
+            "reservation_id": claim["reservation_id"], "claim_sha256": proposal["claim_sha256"],
+            "ledger_canonical_sha256": claim["reserved_ledger_canonical_sha256"],
+            "blob_reverified_at": now(), "source_sha256": SOURCE_SHA256,
+            "source_etag": version, "source_bytes": len(content),
+            "new_reservations": 0, "new_reserved_microdollars": 0, "readiness_clock_started": False,
+        }
+        prefix = PREFIX + "continuation/"
+        write_json(store, prefix + "attempt.json", attempt)
+        write_json(store, prefix + "authorization.json", authorization)
+        write_json(store, prefix + "plan.json", proposal)
+        write_json(store, prefix + "failure-before.json", proposal["failure"])
+        write_json(store, prefix + "program.json", {"source": program, "sha256": proposal["continuation_program_sha256"]})
+    return attempt
+
+
+def submit_continuation(store, proposal, authorization, payload, *, runtime_check):
+    runtime_check()
+    packet, original_auth, _ = continuation_state(store, proposal, authorization, started=True)
+    require(payload["claim_sha256"] == proposal["claim_sha256"], "Original reservation binding required")
+    attempt, _ = read_json(store, PREFIX + "continuation/attempt.json")
+    require(datetime.fromisoformat(payload["event"]["started_at"])
+            >= datetime.fromisoformat(attempt["started_at"]), "Analysis predates continuation")
+    require(payload["event"]["sdk_version"] == proposal["native_no_send_proof"]["sdk_version"],
+            "Actual SDK differs from the no-send validation")
+    return persist_submitted(store, packet, original_auth, payload, runtime_check=runtime_check)
+
+
+def complete_continuation(store, proposal, authorization, payload, *, runtime_check):
+    runtime_check()
+    packet, original_auth, claim = continuation_state(store, proposal, authorization, started=True)
+    require(payload["claim_sha256"] == proposal["claim_sha256"], "Original reservation binding required")
+    result = complete_preparation(store, packet, original_auth, payload, runtime_check=runtime_check)
+    audit = {
+        "status": "existing_reservation_continuation_completed", "completed_at": now(),
+        "plan_sha256": sha(canonical(proposal)), "authorization_sha256": sha(canonical(authorization)),
+        "reservation_id": claim["reservation_id"], "original_packet_sha256": proposal["original_packet_sha256"],
+        "original_failure_canonical_sha256": sha(canonical(proposal["failure"])),
+        "original_completed_canonical_sha256": record_sha(store.read_bytes(PREFIX + "completed.json")[0]),
+        "cache_canonical_sha256": result["cache_canonical_sha256"],
+        "ledger_after_canonical_sha256": result["ledger_after_canonical_sha256"],
+        "operation_id": result["analysis_receipt"]["operation_id"],
+        "new_reservations": 0, "new_reserved_microdollars": 0, "worker_executions_charged": 0,
+        "readiness_clock_started": False,
+    }
+    write_json(store, PREFIX + "continuation/completed.json", audit)
+    return {"preparation": result, "continuation": audit}
+
+
+def continuation_source():
+    tree = ast.parse(Path(__file__).read_text())
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in CONTINUATION_FUNCTIONS]
+    require({node.name for node in nodes} == set(CONTINUATION_FUNCTIONS), "Continuation code incomplete")
+    return ast.unparse(ast.Module(body=nodes, type_ignores=[]))
+
+
+def continuation_inputs(work):
+    snapshot = release.private_json(work / "ford-preparation-stopped-outcome.json", max_bytes=64 * 1024 * 1024)
+    require(snapshot["status"] == "preparation_stopped_before_service_submission"
+            and snapshot["retry_performed"] is False and snapshot["readiness_clock_started"] is False
+            and snapshot["runtime"]["temporary_processing_closed"] is True
+            and snapshot["runtime"]["active_executions"] == [], "An unchanged, closed stopped snapshot is required")
+    records = {}
+    for key, entry in snapshot["records"].items():
+        raw = base64.b64decode(entry["base64"], validate=True)
+        require(sha(raw) == entry["sha256"], "Stopped snapshot capture changed")
+        records[key] = raw
+    packet = json.loads(records[PREFIX + "packet.json"])
+    original_auth = json.loads(records[PREFIX + "authorization.json"])
+    claim = json.loads(records[PREFIX + "reserved.json"])
+    failure = release.private_json(work / "ford-preparation-local-failure.json")
+    require(canonical(snapshot["local_failure"]) == canonical(failure), "Preserved local failure changed")
+    for filename, expected in (
+        ("ford-preparation-plan-v4.json", packet), ("ford-preparation-approved-v4.json", original_auth),
+        ("ford-preparation-claim.json", claim),
+    ):
+        require(canonical(release.private_json(work / filename)) == canonical(expected),
+                "Original local/API preparation binding changed")
+    program = json.loads(records[PREFIX + "storage-program.json"])
+    require(sha(program["source"].encode()) == program["sha256"] == packet["storage_program_sha256"],
+            "Original immutable API program changed")
+    verify_authorization(packet, original_auth, json.loads(records[APPROVAL_KEY]))
+    require(sha(canonical(packet)) == claim["packet_sha256"]
+            and sha(canonical(original_auth)) == claim["authorization_sha256"]
+            and record_sha(records[BUDGET_KEY]) == claim["reserved_ledger_canonical_sha256"],
+            "Original reservation or stopped ledger changed")
+    for key, expected in packet["history_sha256"].items():
+        if key != BUDGET_KEY:
+            require(record_sha(records[key]) == expected, "Prior history changed")
+    require(all(key not in records for key in (
+        *cache_keys(), PREFIX + "submitted.json", PREFIX + "parsed.json",
+        PREFIX + "analysis-receipt.json", PREFIX + "completed.json", PREFIX + "failure.json",
+    )) and not any(key.startswith(PREFIX + "continuation/") for key in records),
+            "Snapshot is not an uncontinued pre-submission stop")
+    return snapshot, records, packet, original_auth, claim, failure
+
+
+def continuation_code_hashes():
+    root = Path(__file__).resolve().parents[1]
+    return {name: sha((root / name).read_bytes()) for name in CONTINUATION_FILES}
+
+
+def verify_continuation_ci(proof, hashes):
+    require(set(proof) == {"schema_version", "status", "source_revision", "code_sha256", "checks"}
+            and proof["schema_version"] == 1 and proof["status"] == "passed"
+            and proof["code_sha256"] == hashes and re.fullmatch(r"[a-f0-9]{40}", proof["source_revision"]),
+            "Passing focused CI must bind every corrected source/test file")
+    require(isinstance(proof["checks"], list) and proof["checks"] and all(
+        set(check) == {"name", "run_id", "conclusion"} and check["conclusion"] == "success"
+        and isinstance(check["name"], str) and re.fullmatch(r"[\w ./()-]{1,120}", check["name"])
+        and type(check["run_id"]) is int and check["run_id"] > 0
+        for check in proof["checks"]
+    ), "Successful identified CI checks required")
+    root = Path(__file__).resolve().parents[1]
+    for name, expected in hashes.items():
+        require(sha(subprocess.check_output(["git", "show", f"{proof['source_revision']}:{name}"], cwd=root)) == expected,
+                "CI revision does not contain the reviewed corrected files")
+
+
+def continuation_plan(work, config, *, ci_path, owner_approval_path):
+    from backend.analysis_provenance import preflight_preparation
+
+    snapshot, records, packet, original_auth, claim, failure = continuation_inputs(work)
+    require(sha(canonical(config)) == packet["target_sha256"], "Original target changed")
+    hashes = continuation_code_hashes()
+    ci = release.private_json(ci_path)
+    verify_continuation_ci(ci, hashes)
+    local = approved_local_pdf(work)
+    require(local == packet["local_pdf"], "Original approved local bytes/path changed")
+    proof = preflight_preparation(Path(local["path"]).read_bytes(), endpoint=packet["analysis_endpoint"])
+    evidence = {}
+    for path in (
+        owner_approval_path, ci_path, work / "ford-preparation-stopped-verification.json",
+        work / "four-product-preparation-identity-authorization-20261006T221236Z.json",
+        work / "four-product-existing-role-evidence-20261006.json",
+    ):
+        require(path.parent.resolve() == work.resolve() and path.name not in evidence,
+                "Distinct create-once evidence files must be in the private release root")
+        evidence[path.name] = sha(canonical(release.private_json(path)))
+    return {
+        "schema_version": 1, "purpose": "one_continuation_of_existing_ford_reservation",
+        "original_packet_sha256": sha(canonical(packet)),
+        "original_authorization_sha256": sha(canonical(original_auth)), "claim_sha256": sha(canonical(claim)),
+        "reservation_id": claim["reservation_id"], "failure": failure,
+        "stopped_snapshot_sha256": sha(canonical({**snapshot, "records": {
+            key: json.loads(raw) for key, raw in records.items()
+        }})),
+        "history_sha256": {key: record_sha(raw) for key, raw in records.items()},
+        "history_hash_semantics": "sha256_sorted_compact_ascii_json",
+        "local_code_sha256": hashes, "ci_proof": ci, "native_no_send_proof": proof,
+        "local_evidence_sha256": evidence, "ci_filename": ci_path.name,
+        "owner_approval_filename": owner_approval_path.name,
+        "continuation_program_sha256": sha(continuation_source().encode()),
+        "new_reservations": 0, "new_reserved_microdollars": 0, "max_submissions": 1, "sdk_retries": 0,
+    }
+
+
+def continuation_remote_program(proposal, authorization, packet, config, *, phase, value=None):
+    require(phase in {"start", "submitted", "complete"}, "Only bounded continuation phases are permitted")
+    validate_continuation_authorization(proposal, authorization, packet)
+    source = continuation_source()
+    require(proposal["local_code_sha256"] == continuation_code_hashes()
+            and sha(source.encode()) == proposal["continuation_program_sha256"],
+            "Reviewed continuation implementation changed")
+    if phase == "submitted":
+        require(set(value) == {"claim_sha256", "event"}
+                and value["claim_sha256"] == proposal["claim_sha256"], "Continuation submission packet rejected")
+        validate_event(value["event"], packet, {"source_bytes": packet["local_pdf"]["bytes"]})
+    if phase == "complete":
+        require(set(value) == {"claim_sha256", "document", "receipt"}
+                and value["claim_sha256"] == proposal["claim_sha256"], "Continuation completion packet rejected")
+        mapped = ParsedDocument.model_validate(value["document"])
+        require(canonical(mapped.model_dump(mode="json")) == canonical(value["document"]), "Unnormalized parse")
+        validate_wire_receipt(value["receipt"], packet)
+    payload = {
+        "phase": phase, "value": value, "prefix": PREFIX,
+        "plan_sha256": sha(canonical(proposal)), "authorization_sha256": sha(canonical(authorization)),
+        "original_packet_sha256": proposal["original_packet_sha256"],
+        "original_program_sha256": packet["storage_program_sha256"],
+        "continuation_program_sha256": proposal["continuation_program_sha256"],
+        "runtime_code_sha256": packet["runtime_code_sha256"],
+        "storage_url": f"https://{config['storage']}.blob.core.windows.net", "container": config["container"],
+    }
+    if phase == "start":
+        payload.update(proposal=proposal, authorization=authorization, program=source)
+    marker = "DOCINTEL_FORD_CONTINUATION_OK:" + phase + ":" + payload["plan_sha256"]
+    code = f'''import base64, hashlib, json, os
+from pathlib import Path
+p = json.loads({canonical(payload).decode()!r})
+def check(ok):
+    if not ok:
+        raise ValueError("Continuation source/state binding rejected")
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode()).hexdigest()
+for name, expected in p["runtime_code_sha256"].items():
+    check(hashlib.sha256(Path("/app", name).read_bytes()).hexdigest() == expected)
+def closed():
+    check(os.environ.get("DOCINTEL_BATCH_MODE") == "hosted")
+    check(os.environ.get("DOCINTEL_BATCH_LIVE_ENABLED") == "false")
+    for name in ("DOCINTEL_REAL_PILOT_ENABLED", "DOCINTEL_OPTIONAL_WEB_GAPFILL_ENABLED", "DOCINTEL_PILOT_UPLOAD_ENABLED"):
+        check(os.environ.get(name) in (None, "false"))
+    check(os.environ.get("DOCINTEL_BATCH_STORAGE_URL") == p["storage_url"])
+    check(os.environ.get("DOCINTEL_BATCH_CONTAINER") == p["container"])
+    check(not os.environ.get("AZURE_CLIENT_ID"))
+closed()
+from backend.batch_store import configured_store, read_json
+store = configured_store()
+original = read_json(store, p["prefix"] + "packet.json")[0]
+check(digest(original) == p["original_packet_sha256"])
+audit = read_json(store, p["prefix"] + "storage-program.json")[0]
+check(audit["sha256"] == original["storage_program_sha256"] == p["original_program_sha256"])
+check(hashlib.sha256(audit["source"].encode()).hexdigest() == p["original_program_sha256"])
+if p["phase"] != "start":
+    p["proposal"] = read_json(store, p["prefix"] + "continuation/plan.json")[0]
+    p["authorization"] = read_json(store, p["prefix"] + "continuation/authorization.json")[0]
+    program = read_json(store, p["prefix"] + "continuation/program.json")[0]
+    check(program["sha256"] == p["continuation_program_sha256"])
+    p["program"] = program["source"]
+check(digest(p["proposal"]) == p["plan_sha256"])
+check(digest(p["authorization"]) == p["authorization_sha256"])
+check(p["proposal"]["continuation_program_sha256"] == p["continuation_program_sha256"])
+check(hashlib.sha256(p["program"].encode()).hexdigest() == p["continuation_program_sha256"])
+scope = {{"__name__": "ford_continuation_remote"}}
+exec(compile(audit["source"], "<original-storage-only-program>", "exec"), scope)
+exec(compile(p["program"], "<reviewed-continuation-storage-program>", "exec"), scope)
+if p["phase"] == "start":
+    result = scope["begin_continuation"](store, p["proposal"], p["authorization"], p["program"], runtime_check=closed)
+else:
+    function = scope["submit_continuation" if p["phase"] == "submitted" else "complete_continuation"]
+    result = function(store, p["proposal"], p["authorization"], p["value"], runtime_check=closed)
+print("DOCINTEL_FORD_CONTINUATION_RESULT:" + base64.b64encode(json.dumps(result).encode()).decode())
+print({marker!r})
+'''
+    packed = base64.b85encode(zlib.compress(code.encode(), 9)).decode()
+    code = f"exec(__import__('zlib').decompress(__import__('base64').b85decode({packed!r})))"
+    require(len(base64.b64encode(code.encode())) + 80 <= 16384, "Continuation frame exceeds bounded transport")
+    return code, marker
+
+
+def execute_continuation(work, config, proposal, authorization):
+    from backend.analysis_provenance import COGNITIVE_SCOPE, RecordedPreparationParser, preflight_preparation
+
+    attempt_path = work / "ford-preparation-continuation-local-attempt.json"
+    require(not attempt_path.exists(), "Continuation already attempted; never retry")
+    _, _, packet, original_auth, claim, _ = continuation_inputs(work)
+    validate_continuation_authorization(proposal, authorization, packet)
+    expected = continuation_plan(
+        work, config, ci_path=work / proposal["ci_filename"],
+        owner_approval_path=work / proposal["owner_approval_filename"],
+    )
+    require(canonical(expected) == canonical(proposal), "Reviewed continuation plan/proofs changed")
+    identity_evidence = verify_runtime(config, packet, original_auth)
+    content = Path(packet["local_pdf"]["path"]).read_bytes()
+    proof = preflight_preparation(content, endpoint=packet["analysis_endpoint"])
+    require(canonical(proof) == canonical(proposal["native_no_send_proof"]), "Native no-send proof changed")
+    release.save_once(attempt_path, {
+        "state": "continuation_attempted_no_retry", "started_at": now(),
+        "plan_sha256": sha(canonical(proposal)), "authorization_sha256": sha(canonical(authorization)),
+        "reservation_id": claim["reservation_id"], "native_no_send_proof": proof,
+        "existing_operator_identity_evidence": identity_evidence,
+    })
+    credential = operator_credential(config, packet)
+    try:
+        credential.get_token(COGNITIVE_SCOPE)
+
+        def storage_phase(phase, value=None):
+            code, marker = continuation_remote_program(proposal, authorization, packet, config, phase=phase, value=value)
+            release.save_once(work / f"ford-preparation-continuation-{phase}-console-attempt.json", {
+                "status": "outcome_unknown_no_retry", "phase": phase, "code_sha256": sha(code.encode()),
+                "plan_sha256": sha(canonical(proposal)), "started_at": now(),
+            })
+            output = release.console_code([
+                "az", "containerapp", "exec", "--subscription", config["subscription"], "-g", config["group"],
+                "-n", config["backend"], "--revision", packet["runtime"]["backend_revision"],
+                "--command", "/usr/bin/env PYTHON_BASIC_REPL=1 /app/.venv/bin/python -q", "--only-show-errors",
+            ], code, marker, timeout=120)
+            lines = [line.partition(":")[2] for line in output.decode().splitlines()
+                     if line.startswith("DOCINTEL_FORD_CONTINUATION_RESULT:")]
+            require(len(lines) == 1, "Unknown continuation storage outcome; never retry")
+            return json.loads(base64.b64decode(lines[0], validate=True))
+
+        acknowledged = storage_phase("start")
+        require(acknowledged["plan_sha256"] == sha(canonical(proposal))
+                and acknowledged["authorization_sha256"] == sha(canonical(authorization))
+                and acknowledged["reservation_id"] == claim["reservation_id"]
+                and acknowledged["new_reservations"] == acknowledged["new_reserved_microdollars"] == 0,
+                "Continuation acknowledgement changed")
+        release.save_once(work / "ford-preparation-continuation-acknowledgement.json", acknowledged)
+        payload = analyze_local(
+            content, packet, original_auth, claim,
+            parser_factory=lambda submitted: RecordedPreparationParser(
+                endpoint=packet["analysis_endpoint"], credential=credential, submitted=submitted,
+            ),
+            submitted=lambda value: storage_phase("submitted", value),
+            save_local=lambda name, value: release.save_once(work / ("ford-preparation-continuation-local-" + name), value),
+        )
+        result = storage_phase("complete", payload)
+        release.save_once(work / "ford-preparation-continuation-result.json", result)
+        return result
+    except Exception as error:
+        release.save_once(work / "ford-preparation-continuation-stopped.json", {
+            "status": "continuation_failed_or_unknown_no_retry", "error_type": type(error).__name__,
+            "recorded_at": now(), "reservation_id": claim["reservation_id"], "allowance_refunded": False,
+        })
+        raise ValueError("Continuation failed or unknown; preserve evidence, no further retry") from None
+
+
+def verify_runtime(config, packet, authorization):
     release.approved_operator(config, authorization)
-    require(canonical(plan(work, config, packet["api_source_revision"])) == canonical(packet),
-            "Reviewed preparation packet changed")
     account = release.azure("account", "show")
     require(account["id"] == config["subscription"] and account["tenantId"] == config["tenant"],
             "Existing Azure account differs from the approved target")
@@ -666,11 +1102,23 @@ def execute(work, config, packet, authorization):
             "Existing image binding changed")
     release.require_real_pilot_off(backend)
     release.require_real_pilot_off(job)
-    identity_evidence = verify_existing_di_access(config, packet)
+    return verify_existing_di_access(config, packet)
+
+
+def execute(work, config, packet, authorization):
+    require(not (work / "ford-preparation-console-attempt.json").exists(),
+            "Existing preparation console attempt; inspect state, never retry")
+    _, _, records = load_snapshot(work)
+    original = json.loads(records[APPROVAL_KEY])
+    verify_authorization(packet, authorization, original)
+    require(canonical(plan(work, config, packet["api_source_revision"])) == canonical(packet),
+            "Reviewed preparation packet changed")
+    identity_evidence = verify_runtime(config, packet, authorization)
     content = Path(packet["local_pdf"]["path"]).read_bytes()
     require(sha(content) == SOURCE_SHA256 and len(content) == packet["local_pdf"]["bytes"], "Local PDF changed")
-    from backend.analysis_provenance import COGNITIVE_SCOPE, RecordedPreparationParser
+    from backend.analysis_provenance import COGNITIVE_SCOPE, RecordedPreparationParser, preflight_preparation
 
+    preflight_preparation(content, endpoint=packet["analysis_endpoint"])
     credential = operator_credential(config, packet)
     credential.get_token(COGNITIVE_SCOPE)
 
@@ -721,15 +1169,38 @@ def execute(work, config, packet, authorization):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("plan", "execute"))
+    parser.add_argument("action", choices=("plan", "execute", "continuation-plan", "continue"))
     parser.add_argument("--work", type=Path, required=True)
-    parser.add_argument("--api-source", required=True)
+    parser.add_argument("--api-source")
     parser.add_argument("--authorization", type=Path)
-    parser.add_argument("--plan-name", default="ford-preparation-plan-v4.json")
+    parser.add_argument("--ci", type=Path)
+    parser.add_argument("--owner-approval", type=Path)
+    parser.add_argument("--plan-name")
     args = parser.parse_args(argv)
+    continuation = args.action in ("continuation-plan", "continue")
+    args.plan_name = args.plan_name or (
+        "ford-preparation-continuation-plan-v1.json" if continuation else "ford-preparation-plan-v4.json"
+    )
     require(Path(args.plan_name).name == args.plan_name, "Plan name must be a private root basename")
     plan_path = args.work / args.plan_name
     config = release.load_config(args.work / "target.json")
+    if continuation:
+        if args.action == "continuation-plan":
+            require(args.ci is not None and args.owner_approval is not None,
+                    "Focused CI and the new explicit owner approval capture are required")
+            proposal = continuation_plan(args.work, config, ci_path=args.ci, owner_approval_path=args.owner_approval)
+            release.save_once(plan_path, proposal)
+            print(json.dumps({"status": "OFFLINE_CONTINUATION_PLAN_ONLY",
+                              "plan_sha256": sha(canonical(proposal)), "new_reservations": 0}))
+            return 0
+        require(args.authorization is not None, "New narrow continuation authorization required")
+        result = execute_continuation(
+            args.work, config, release.private_json(plan_path), release.private_json(args.authorization),
+        )
+        print(json.dumps({"status": result["continuation"]["status"],
+                          "cache_key": result["preparation"]["cache_key"]}))
+        return 0
+    require(args.api_source is not None, "Exact existing API source revision required")
     packet = plan(args.work, config, args.api_source)
     if args.action == "plan":
         release.save_once(plan_path, packet)

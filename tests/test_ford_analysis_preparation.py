@@ -134,6 +134,10 @@ def synthetic_sdk(monkeypatch, store, *, failure=None, pages=(1,), api_version="
     }
     result = AnalyzeResult(copy.deepcopy(payload))
     calls, options, observations = [], [], []
+    monkeypatch.setattr(analysis_provenance, "preflight_preparation", lambda *args, **kwargs: {
+        "status": "passed", "service": "document_intelligence", "network_calls": 0,
+        "real_credential_calls": 0, "synthetic_fixture_only": True,
+    })
 
     class Client:
         def __init__(self, **kwargs):
@@ -194,8 +198,11 @@ def test_native_sdk_reproduces_conflicting_cli_selectors_before_di_transport(cas
         raise ClientAuthenticationError(message="Please specify only one of subscription and tenant, not both")
 
     monkeypatch.setattr(azure_cli, "_run_command", rejected_command)
-    credential = azure_cli.AzureCliCredential(
-        tenant_id=identity["tenant_id"], subscription=identity["subscription_id"],
+    credential = analysis_provenance.VerifiedOperatorCredential(
+        azure_cli.AzureCliCredential(
+            tenant_id=identity["tenant_id"], subscription=identity["subscription_id"],
+        ),
+        identity,
     )
     transport = MagicMock(spec=HttpTransport)
     client = DocumentIntelligenceClient(
