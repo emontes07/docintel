@@ -104,6 +104,20 @@ def _display(value) -> str:
     return re.sub(r"(?i)extraction failed", "processing needs attention", text)
 
 
+def _proposed_display(value, *, vendor: bool = False) -> str:
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    text = _display(value)
+    text = re.sub(r"\bNSF\s*61\b", "NSF 61", text, flags=re.I)
+    if vendor and text.isupper():
+        text = text.capitalize()
+        text = re.sub(
+            r"\b(?:nsf|ansi|astm|awwa|uns|epdm|fip|mip|fnpt|mnpt|npt|cts|ptfe|pex|pe|llb|nl)\b",
+            lambda match: match[0].upper(), text, flags=re.I,
+        )
+    return text
+
+
 def _location(locator: str) -> str:
     try:
         fragment = urlsplit(locator).fragment
@@ -194,7 +208,10 @@ def _build_package(
                 ])
             proposals, units, bases, quotes, labels, urls, retrieved, applicability = [], [], [], [], [], [], [], []
             for index, candidate in enumerate(attribute.candidates):
-                proposals.append(_display(candidate.value))
+                proposed_value = _proposed_display(
+                    candidate.value, vendor=any(indexed[key].source_tier == "vendor_table" for key in candidate.evidence_ids),
+                )
+                proposals.append(proposed_value)
                 units.append(_display(candidate.unit))
                 bases.append(candidate.evidence_basis)
                 quotes.append(_display(candidate.supporting_quote))
@@ -218,7 +235,7 @@ def _build_package(
                     applicability.append(scope)
                     evidence_rows.append([
                         product.item_id, product.mpn, attribute.attribute_id,
-                        _display(candidate.value), _display(candidate.unit), label, evidence.source_tier, _candidate_location(candidate, evidence),
+                        proposed_value, _display(candidate.unit), label, evidence.source_tier, _candidate_location(candidate, evidence),
                         _display(candidate.supporting_quote), url, date, scope, candidate.evidence_basis,
                         candidate.origin, candidate.judge_status, _display(candidate.judge_reason),
                     ])
@@ -227,7 +244,7 @@ def _build_package(
                 product.item_id, product.mpn, attribute.attribute_id,
                 review.decision.capitalize() if review else "", _display(review.corrected_value) if review else "",
                 _display(review.corrected_unit) if review else "", _display(review.reason) if review else "",
-                status, action, "\n".join(proposals) or _display(result.manifest.existing_values.get(attribute.attribute_id)),
+                status, action, "\n".join(proposals) or _proposed_display(result.manifest.existing_values.get(attribute.attribute_id)),
                 "\n".join(dict.fromkeys(units)), "\n".join(dict.fromkeys(bases)), "\n".join(dict.fromkeys(quotes)),
                 "\n".join(dict.fromkeys(labels)), "\n".join(dict.fromkeys(urls)),
                 "\n".join(dict.fromkeys(retrieved)), "\n".join(dict.fromkeys(applicability)),

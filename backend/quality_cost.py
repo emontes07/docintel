@@ -7,13 +7,14 @@ from time import monotonic
 from backend.batch_store import Missing, read_json, write_json
 
 logger = logging.getLogger(__name__)
+CostAmount = str | int | float | Decimal
 
 
 class CostLimitExceeded(RuntimeError):
-    pass
+    quality_budget_stop = True
 
 
-def _amount(value) -> Decimal:
+def _amount(value: CostAmount) -> Decimal:
     number = Decimal(str(value))
     if not number.is_finite() or number < 0:
         raise ValueError("Cost and elapsed-time amounts must be finite and nonnegative")
@@ -22,9 +23,10 @@ def _amount(value) -> Decimal:
 
 class QualityCostMeter:
     def __init__(
-        self, store, batch_id, run_id, *, run_base_cost_usd=0,
-        overnight_prior_cost_usd=0, worker_usd_per_second=0,
-        search_usd="0.0125", browse_usd="0.0125", clock=monotonic,
+        self, store, batch_id, run_id, *, run_base_cost_usd: CostAmount = 0,
+        overnight_prior_cost_usd: CostAmount = 0, worker_usd_per_second: CostAmount = 0,
+        search_usd: CostAmount = "0.0125", browse_usd: CostAmount = "0.0125",
+        di_usd_per_page: CostAmount = "0.01", clock=monotonic,
     ):
         self.store = store
         self.key = f"quality-runs/{batch_id}/{run_id}/cost.json"
@@ -34,6 +36,7 @@ class QualityCostMeter:
         self.overnight_prior = _amount(overnight_prior_cost_usd)
         self.worker_rate = _amount(worker_usd_per_second)
         self.search_rate, self.browse_rate = _amount(search_usd), _amount(browse_usd)
+        self.di_rate = _amount(di_usd_per_page)
         try:
             self.state, self.version = read_json(store, self.key)
         except Missing:
@@ -42,13 +45,16 @@ class QualityCostMeter:
                 "worker_cost_usd": 0, "model_calls": 0, "searches": 0, "browses": 0,
                 "unpriced_model_calls": 0,
             }, None
+        for key in ("di_cost_usd", "di_calls", "di_pages", "di_cache_hits", "unpriced_di_calls"):
+            self.state.setdefault(key, 0)
         self.previous_seconds = _amount(self.state["worker_seconds"])
         self.previous_worker_cost = _amount(self.state["worker_cost_usd"])
 
     def summary(self) -> dict:
         elapsed = _amount(self.clock() - self.started)
         worker = self.previous_worker_cost + elapsed * self.worker_rate
-        total = self.run_base + _amount(self.state["model_cost_usd"]) + _amount(self.state["web_cost_usd"]) + worker
+        total = (self.run_base + _amount(self.state["model_cost_usd"]) + _amount(self.state["web_cost_usd"])
+                 + _amount(self.state["di_cost_usd"]) + worker)
         self.state.update(
             run_base_cost_usd=float(self.run_base),
             worker_seconds=float(self.previous_seconds + elapsed),
@@ -93,6 +99,25 @@ class QualityCostMeter:
             self.state["web_cost_usd"] = float(_amount(self.state["web_cost_usd"]) + charge)
         elif operation in {"direct_page", "page", "web_retrieval"}:
             charge = Decimal(0)
+        elif operation == "document_intelligence":
+            if entry.get("cache_hit") is True:
+                charge = Decimal(0)
+                self.state["di_cache_hits"] += 1
+            elif entry.get("analysis_attempted") is False:
+                charge = Decimal(0)
+            else:
+                pages = entry.get("analyzed_pages")
+                if pages is not None and (type(pages) is not int or pages < 0):
+                    raise ValueError("DI analyzed pages must be a nonnegative integer or unknown")
+                self.state["di_calls"] += 1
+                charge = None if pages is None else _amount(pages) * self.di_rate
+                if charge is None:
+                    self.state["unpriced_di_calls"] += 1
+                    logger.warning("DI call has no reported page usage; retaining unknown cost, not reporting it as free")
+                else:
+                    self.state["di_pages"] += pages
+                    self.state["di_cost_usd"] = float(_amount(self.state["di_cost_usd"]) + charge)
+            entry["pricing_basis"] = f"Configured DI prebuilt-layout estimate, ${self.di_rate}/page; not final billing"
         else:
             raise ValueError(f"Unknown usage operation: {operation}")
         current = self.summary()

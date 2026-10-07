@@ -48,6 +48,33 @@ candidate for the same attribute was disputed.
 Reviewer wording distinguishes a retained pressure candidate from a pressure
 question with no verified value; both still require definition/unit clarification.
 
+Gap-closing extraction keeps decoded vendor inch marks (including an accidentally
+repeated JSON escape) and dimension separators equivalent while preserving every
+number, unit and `or` alternative. Suppressed drawing title blocks are restored
+only for Manufacturer; their configuration dimensions cannot supply other values.
+The second pass explicitly revisits already-cited passages for unresolved fields.
+
+The additional closed rules are `nonflanged_outlet_mechanism_v1` (review-only
+Flanged Outlet=False from a stated different outlet mechanism, never silence),
+`connection_material_v1` (iron-pipe thread -> Iron pipe; copper service or
+flare/compression connections -> Copper), and `brass_plus_nl_identification_v1`
+(the potable-water brass paragraph plus the product's NL main-body paragraph ->
+No-lead brass). Derived rules record their justification; quotes and applicability
+still have to ground. Optional, negated, contradictory and wrong-role assertions
+do not satisfy these rules.
+
+Reviewer Proposed value cells show Yes/No, sentence-case all-caps vendor prose
+while retaining technical abbreviations, and display `NSF61` as `NSF 61`.
+Machine values and supporting quotations are unchanged.
+
+Manufacturer PDF retrieval uses pinned public HTTPS on Mueller/Ford domains,
+`pdftotext` first, then cached DI only for a textless PDF of at most five pages.
+Only the worker injects the DI client. Successful byte-hash caches are reused;
+failures remain explicit and retryable. `QUALITY_DI_USD_PER_PAGE` defaults to
+the disclosed $0.01/page prebuilt-layout estimate. DI pages, cache hits and
+unknown usage join the same run meter; no separate reservation or admission
+system is introduced. Existing WebIQ search/browse caps remain unchanged.
+
 ```python
 from pydantic import BaseModel
 from backend.core.quality_model import ResponsesCompletion

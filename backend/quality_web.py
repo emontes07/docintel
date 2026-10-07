@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 from datetime import datetime, timezone
+from functools import partial
+from typing import Callable
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -20,6 +22,10 @@ from backend.core.websearch import (
     validate_original_url,
 )
 from backend.models.enrichment import Evidence
+from backend.quality_cost import CostLimitExceeded
+from backend.quality_pdf import (
+    OCR_MAX_PAGES, PDF_MAX_BYTES, TEXT_MAX_BYTES, CachedPDFOCR, PDFOCRResult, PDFPageError, PDFPageEvidence, pdf_text,
+)
 
 ENDPOINT = "https://api.microsoft.ai/v3/search/web"
 BROWSE_ENDPOINT = "https://api.microsoft.ai/v3/browse"
@@ -38,8 +44,8 @@ class BrowseUnavailable(ValueError):
         self.retry_after = retry_after
 
 
-def original_page(url: str) -> OriginalPageEvidence:
-    """Public DNS and a pinned socket, no proxy, redirects, credentials or DI."""
+def original_page(url: str, *, pdf_ocr: Callable[..., PDFOCRResult] | None = None) -> OriginalPageEvidence:
+    """Pinned public HTTPS; manufacturer PDF OCR requires explicit worker injection."""
     host = urlsplit(url).hostname
     if not host:
         raise ValueError("Original page has no hostname")
@@ -54,12 +60,51 @@ def original_page(url: str) -> OriginalPageEvidence:
         response = connection.getresponse()
         if response.status != 200 or response.getheader("Content-Encoding", "identity") != "identity":
             raise ValueError("Original page unavailable; redirects and encoded responses are not followed")
-        media = response.getheader("Content-Type", "").split(";", 1)[0].lower()
-        if media not in {"text/html", "text/plain"}:
-            raise ValueError("Original page is not HTML/text; provide cached text for PDF sources (DI disabled)")
-        raw = response.read(262145)
-        if not raw or len(raw) > 262144:
-            raise ValueError("Original page empty or exceeds 256 KiB")
+        media = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
+        if media not in {"text/html", "text/plain", "application/pdf"}:
+            raise ValueError("Original page is not HTML/text or a manufacturer PDF")
+        if media == "application/pdf" and host not in {host for hosts in MANUFACTURERS.values() for host in hosts}:
+            raise ValueError("PDF sources require an approved manufacturer domain")
+        limit = PDF_MAX_BYTES if media == "application/pdf" else TEXT_MAX_BYTES
+        raw = response.read(limit + 1)
+        if not raw or len(raw) > limit:
+            raise ValueError("Original page empty or exceeds its byte bound")
+        retrieved_at = datetime.now(timezone.utc)
+        content_hash = hashlib.sha256(raw).hexdigest()
+        if media == "application/pdf":
+            provenance = {
+                "source_url": url, "sha256": content_hash, "retrieved_at": retrieved_at.isoformat(),
+                "media_type": media, "byte_size": len(raw), "extraction": "pdftotext",
+            }
+            try:
+                text, page_count = pdf_text(raw)
+                provenance["page_count"] = page_count
+                result = None
+                if not text.strip():
+                    if page_count > OCR_MAX_PAGES or pdf_ocr is None:
+                        provenance["reason"] = "Textless PDF requires worker OCR and at most five actual pages"
+                        raise ValueError("PDF OCR is not authorized")
+                    provenance["extraction"] = "document_intelligence_ocr"
+                    result = pdf_ocr(raw, source=url, page_count=page_count, retrieved_at=retrieved_at)
+                    if result.document.cache_key != "sha256:" + content_hash:
+                        raise ValueError("PDF OCR content version mismatch")
+                    text = result.document.raw_text
+                if not text.strip() or "\x00" in text or len(text.encode("utf-8")) > TEXT_MAX_BYTES:
+                    raise ValueError("PDF contains no usable bounded text")
+                return PDFPageEvidence(
+                    text=text, final_url=url, content_hash=content_hash, retrieved_at=retrieved_at,
+                    media_type=media, byte_size=len(raw), pdf_page_count=page_count,
+                    pdf_extraction="document_intelligence_ocr" if result else "pdftotext",
+                    pdf_cache_key=result.cache_key if result else None,
+                    pdf_cache_hit=result.cache_hit if result else False,
+                    pdf_parsed_at=result.document.parsed_at if result else None,
+                    pdf_parse_source=result.document.source if result else None,
+                    pdf_first_retrieved_at=result.first_retrieved_at if result else None,
+                )
+            except CostLimitExceeded:
+                raise
+            except Exception as error:
+                raise PDFPageError(provenance, type(error).__name__) from None
         charset = (response.headers.get_content_charset() or "utf-8").lower()
         if charset not in {"utf-8", "ascii", "us-ascii", "iso-8859-1", "latin-1", "windows-1252"}:
             raise ValueError("Unsupported original-page encoding")
@@ -69,8 +114,8 @@ def original_page(url: str) -> OriginalPageEvidence:
         if not text.strip() or "\x00" in text:
             raise ValueError("Original page contains no usable text")
         return OriginalPageEvidence(
-            text=text, final_url=url, content_hash=hashlib.sha256(raw).hexdigest(),
-            retrieved_at=datetime.now(timezone.utc), media_type=media, byte_size=len(raw),
+            text=text, final_url=url, content_hash=content_hash,
+            retrieved_at=retrieved_at, media_type=media, byte_size=len(raw),
             text_normalization="html_visible_text_v1" if media == "text/html" else "decoded_plain_text",
         )
     finally:
@@ -78,18 +123,30 @@ def original_page(url: str) -> OriginalPageEvidence:
 
 
 class QualityWeb:
-    def __init__(self, *, api_key=None, search=None, browse=None, page_fetch=None, usage_callback=None, before_call=None):
+    def __init__(self, *, api_key=None, search=None, browse=None, page_fetch=None, usage_callback=None, before_call=None, pdf_ocr=None):
         self.api_key = api_key if api_key is not None else os.environ.get("WEBIQ_API_KEY") or settings.WEBIQ_API_KEY
         if search is None and not self.api_key:
             raise ValueError("WEBIQ_API_KEY is required when QUALITY_WEB_ENABLED is true")
         self.search = search or self._search
         self.browse = browse or self._browse
-        self.page_fetch = page_fetch or original_page
+        self.pdf_ocr = pdf_ocr
+        self._default_page_fetch = partial(original_page, pdf_ocr=pdf_ocr)
+        self.page_fetch = page_fetch or self._default_page_fetch
         self.usage_callback = usage_callback
         self.before_call = before_call
         self.counts = {}
         self.seen = {}
         self.diagnostics = []
+
+    def _ocr_event(self, event, context, hook):
+        entry = {**event, "item_id": context["item_id"], "tier": context["tier"], "phase": "ocr"}
+        if hook == "usage_callback":
+            self.diagnostics.append(entry)
+        # The worker assigns run hooks after construction; use those live hooks
+        # instead of charging both an adapter callback and the same run meter.
+        callback = getattr(self, hook) or getattr(self.pdf_ocr, hook)
+        if callback:
+            return callback(entry)
 
     def _request(self, endpoint, body):
         if not self.api_key:
@@ -156,14 +213,30 @@ class QualityWeb:
         if self.before_call:
             self.before_call(entry)
         try:
-            value = function(*args)
+            if (operation == "direct_page" and function is self._default_page_fetch
+                    and isinstance(self.pdf_ocr, CachedPDFOCR)):
+                ocr = CachedPDFOCR(
+                    self.pdf_ocr.store, self.pdf_ocr.parser,
+                    usage_callback=lambda event: self._ocr_event(event, entry, "usage_callback"),
+                    before_call=lambda event: self._ocr_event(event, entry, "before_call"),
+                )
+                value = original_page(*args, pdf_ocr=ocr)
+            else:
+                value = function(*args)
             entry["status"] = "succeeded"
             if operation == "web_browse":
                 entry["content_chars"] = len(value["content"])
                 entry["evidence_status"] = "provider_content_unverified"
+            elif operation == "direct_page" and isinstance(value, PDFPageEvidence):
+                entry["pdf"] = value.provenance()
             return value
+        except CostLimitExceeded:
+            entry.update(status="stopped", error_type="CostLimitExceeded")
+            raise
         except Exception as error:
             entry.update(status="unavailable" if operation == "web_browse" else "failed", error_type=type(error).__name__)
+            if isinstance(error, PDFPageError):
+                entry.update(pdf=error.provenance, error_type=error.error_type)
             if isinstance(error, BrowseUnavailable):
                 entry.update(reason=error.reason, http_status=error.status_code, retry_after=error.retry_after)
             elif isinstance(error, httpx.HTTPStatusError):
@@ -219,13 +292,16 @@ class QualityWeb:
                 if page is None or not _identity(page.text, product.mpn):
                     continue
                 source_id = "quality-web-" + hashlib.sha256(page.final_url.encode()).hexdigest()[:16]
+                qualification = "WebIQ search and paid Browse followed by independent original-page retrieval; exact MPN present. Verify every attribute quotation against the original page, not provider content."
+                if isinstance(page, PDFPageEvidence):
+                    qualification += " PDF text remains untrusted; exact-product applicability is required. PDF provenance: " + json.dumps(page.provenance(), sort_keys=True)
                 evidence.append(Evidence(
                     evidence_id=source_id + ":" + page.content_hash, source_id=source_id,
                     source_locator=page.final_url, source_version="sha256:" + page.content_hash,
                     source_tier=tier, content_kind="source_excerpt", text=page.text,
                     observed_at=datetime.now(timezone.utc), provider_retrieved_at=page.retrieved_at,
                     discovery_method="webiq",
-                    qualification="WebIQ search and paid Browse followed by independent original-page retrieval; exact MPN present. Verify every attribute quotation against the original page, not provider content.",
+                    qualification=qualification,
                     attribute_ids=pending,
                 ))
             if tier_browse >= 3:

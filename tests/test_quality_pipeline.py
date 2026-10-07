@@ -139,6 +139,47 @@ def test_three_call_bound_judges_both_passes_and_retains_disagreement():
     assert all(call["run_id"] == "r" and call["call_id"] for call in result.quality_diagnostics)
 
 
+def test_second_pass_reasks_material_using_already_cited_brass_and_nl_paragraphs():
+    brass = ". All brass that comes in contact with potable water conforms to AWWA Standard C800 (ASTM B584, UNS C89833)"
+    nl = '. The product has the letters "NL" cast into the main body for lead-free identification'
+    first, second = evidence(brass), evidence(nl, key="e2")
+    second.source_locator = "https://example.com/catalog#page=1&paragraph=1"
+    definitions = [
+        AttributeDefinition(attribute_id="Material Standard (Brass Alloy)", description="", value_type="string"),
+        AttributeDefinition(attribute_id="Lead-Free", description="", value_type="boolean"),
+        AttributeDefinition(attribute_id="Primary Material", description="", value_type="string"),
+    ]
+    client = Completion([
+        [proposal(attribute_id=definitions[0].attribute_id, value="ASTM B584, UNS C89833", supporting_quote=brass),
+         proposal(attribute_id="Lead-Free", value=True, supporting_quote=nl, evidence_ids=["e2"])],
+        [proposal(value="No-lead brass", supporting_quote=brass + "; " + nl, evidence_ids=["e1", "e2"])],
+    ])
+    result = run_product(manifest(definitions), [first, second], client, run_id="material-reask")
+    assert len(client.calls) == 3
+    refinement = client.calls[1][1]
+    assert refinement["unresolved_attributes"] == ["Primary Material"]
+    assert {entry["evidence_id"] for entry in refinement["already_cited_passages"]} == {"e1", "e2"}
+    material = next(attribute for attribute in result.attributes if attribute.attribute_id == "Primary Material")
+    assert material.candidates[0].value == "No-lead brass"
+    assert material.candidates[0].origin == "derived"
+    assert material.candidates[0].judge_status == "accepted"
+
+
+def test_reviewer_proposals_are_readable_without_changing_quotes_or_machine_values():
+    quote = "FLANGED OUTLET: NO"
+    result = run_product(manifest([
+        AttributeDefinition(attribute_id="Flanged Outlet", description="", value_type="boolean"),
+    ]), [evidence(quote)], Completion([[proposal(
+        attribute_id="Flanged Outlet", value=False, supporting_quote=quote,
+    )]]), run_id="readable")
+    before = result.model_dump(mode="json")
+    public = read_workbook(build_reviewer_package([result]).workbook)
+    assert public["Review"][0]["Proposed value"] == public["Evidence"][0]["Proposed value"] == "No"
+    assert public["Review"][0]["Supporting quote"] == public["Evidence"][0]["Quote"] == quote
+    assert result.model_dump(mode="json") == before
+    assert result.attributes[0].candidates[0].value is False
+
+
 def test_only_unresolved_advances_and_no_unnecessary_refinement():
     client = Completion([[proposal()]])
     class Web:
