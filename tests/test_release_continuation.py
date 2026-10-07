@@ -190,7 +190,7 @@ def continued(pilot_release, monkeypatch):
             target["properties"]["template"]["containers"] = payload["properties"]["template"]["containers"]
             state.calls.append(args)
             return {}
-        return underlying_azure(*args)
+        return underlying_azure(*args, **kwargs)
 
     monkeypatch.setattr(release, "azure", azure)
     return state
@@ -551,6 +551,8 @@ def test_one_last_worker_has_exact_limits_and_closure_preserves_read_export(cont
         "--concurrency", "1", "--max-batches", "1", "--item-limit", "2",
     ]
     assert not set(release.environment_entries(container)) & (release.PILOT_EXTERNAL_ENVIRONMENT_KEYS | {"WEBIQ_API_KEY"})
+    assert "volumes" not in template
+    release.write_schema().validate_action_payload("jobStart", template)
     assert state.job == original_job
     with pytest.raises(ValueError, match="already attempted"):
         continuation.start(state.work, state.config, state.decision)

@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, urlsplit
 API_VERSION = "2024-03-01"
 SPEC_COMMIT = "1249f8e2b407b339083c5125a245bdd3057f6cd5"
 PROVENANCE_SHA256 = "f32d30dc6b96aa0b5cab3a179d0645557702ae6930716493feca57e799875cfb"
-ACTION_PROVENANCE_SHA256 = "84e9a131caf42742a90dd013a40cee905194726826d83cb6b0b37e8209679659"
+ACTION_PROVENANCE_SHA256 = "d661e1322799eea642097bbc1a879958f39befe6e2776393f190bbdb4582de6f"
 ASSETS = Path(__file__).with_name("azure_write_schemas")
 SPEC_DIRECTORY = "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2024-03-01/"
 OPERATIONS = {
@@ -36,6 +36,7 @@ ACTION_OPERATIONS = {
     "acrUpload": (ACR_SPEC, "2019-04-01", "Registries_GetBuildSourceUploadUrl"),
     "acrBuild": (ACR_SPEC, "2019-04-01", "Registries_ScheduleRun"),
     "jobStart": (JOB_ACTION_SPEC, "2025-01-01", "Jobs_Start"),
+    "jobStart202507": (JOB_ACTION_SPEC.replace("2025-01-01", "2025-07-01"), "2025-07-01", "Jobs_Start"),
     "jobStop": (JOB_ACTION_SPEC, "2025-01-01", "Jobs_StopExecution"),
 }
 _ANNOTATIONS = {"description", "title", "default", "example", "externalDocs"}
@@ -51,6 +52,7 @@ _KEYWORDS = {
 }
 _FORMATS = {"int32", "int64", "float", "double", "password", "arm-id"}
 GENERATED_FILE = "generated-write-contracts.json"
+NATIVE_JOB_START_ACTIONS = {"2025-01-01": "jobStart", "2025-07-01": "jobStart202507"}
 
 
 class WriteSchemaError(ValueError):
@@ -61,6 +63,25 @@ class WriteSchemaError(ValueError):
         }
         self.reason = reason if reason in allowed else "schema"
         super().__init__("Unsupported Azure write request for API 2024-03-01; contract reason=" + self.reason)
+
+
+def native_cli_diagnostic(value):
+    reasons = {"unsupported_job_api_version", "native_invocation_failed", "request_mismatch",
+               "unexpected_request", "network_attempt"}
+    result = {"reason": value.get("reason") if value.get("reason") in reasons else "native_invocation_failed"}
+    for name, pattern in (("client_version", r"\d+\.\d+\.\d+"), ("job_api_version", r"\d{4}-\d{2}-\d{2}")):
+        text = value.get(name)
+        result[name] = text if isinstance(text, str) and re.fullmatch(pattern, text) else "unavailable"
+    for name in ("captured_write_requests", "fixture_get_responses", "network_attempts", "unexpected_requests"):
+        count = value.get(name)
+        result[name] = count if type(count) is int and 0 <= count <= 100000 else 0
+    return result
+
+
+class NativeCLIError(ValueError):
+    def __init__(self, **diagnostic):
+        self.diagnostic = native_cli_diagnostic(diagnostic)
+        super().__init__("Native CLI no-send rejected: " + json.dumps(self.diagnostic, sort_keys=True))
 
 
 def _require(condition, reason):
@@ -89,7 +110,7 @@ def _documents():
             if manifest == "provenance.json":
                 _require(provenance["api_version"] == API_VERSION, "integrity")
             else:
-                _require(set(provenance["api_versions"]) == {"2019-04-01", "2024-08-04", "2025-01-01"}, "integrity")
+                _require(set(provenance["api_versions"]) == {"2019-04-01", "2024-08-04", *NATIVE_JOB_START_ACTIONS}, "integrity")
             for name, digest in provenance["files"].items():
                 candidate = ASSETS / "vendor" / name
                 _require(candidate.resolve().is_relative_to((ASSETS / "vendor").resolve()), "integrity")
@@ -232,6 +253,7 @@ def generate_contracts():
         }
     for action in ACTION_OPERATIONS:
         result["actions"][action] = _source_action(action)
+    _require(result["actions"]["jobStart"]["schema"] == result["actions"]["jobStart202507"]["schema"], "schema")
     result["binary_upload"] = _source_blob()
     return result
 
@@ -361,9 +383,9 @@ def action_for_url(method, url):
             contract = action_contract(action)
             pattern = "".join("[A-Za-z0-9_.()-]+" if piece.startswith("{") else re.escape(piece)
                               for piece in re.split(r"(\{[^}]+\})", contract["path"]))
-            if re.fullmatch(pattern, parts.path, flags=re.IGNORECASE):
-                _require(parse_qsl(parts.query, keep_blank_values=True)
-                         == [("api-version", contract["api_version"])], "target")
+            if (re.fullmatch(pattern, parts.path, flags=re.IGNORECASE)
+                    and parse_qsl(parts.query, keep_blank_values=True)
+                    == [("api-version", contract["api_version"])]):
                 return action
     except WriteSchemaError:
         raise
@@ -605,6 +627,19 @@ def _wire_fingerprints(request):
     }
 
 
+def native_job_start_url(expected, api_version, client_version):
+    action = NATIVE_JOB_START_ACTIONS.get(api_version)
+    if action is None:
+        raise NativeCLIError(reason="unsupported_job_api_version", client_version=client_version,
+                             job_api_version=api_version)
+    # Both pinned operation schemas are identical; no native coercion can rescue invalid input.
+    validate_action_payload(action, expected["body"])
+    parts = urlsplit(expected["url"])
+    url = parts._replace(query="api-version=" + api_version).geturl()
+    _require(action_for_url(expected["method"], url) == action, "target")
+    return url
+
+
 def native_cli_no_send(packet):
     """Run the installed CLI parser/client with isolated state and denied transports."""
     import contextlib
@@ -643,17 +678,27 @@ def native_cli_no_send(packet):
     auxiliary = []
     fixture_counts = {"get": 0, "write": 0}
     wire = []
-    expected = packet["expected"]
+    expected = copy.deepcopy(packet["expected"])
     observed = packet.get("resource_snapshot")
+    job_api_version = None
+    if tuple(packet["arguments"][:3]) == ("containerapp", "job", "start"):
+        from azure.cli.command_modules.containerapp._clients import ContainerAppsJobClient
+        job_api_version = ContainerAppsJobClient.api_version
+        expected["url"] = native_job_start_url(expected, job_api_version, __version__)
+    request_errors = []
     def capture(session, request, **kwargs):
         if request.method == expected["method"] and request.url == expected["url"]:
-            actual = json.loads(request.body, object_pairs_hook=_json_object_pairs) if request.body else None
-            validate_request(request.method, request.url, actual)
-            _require(actual == expected["body"], "body")
-            _require(request.headers.get("Content-Type", "").split(";")[0] == "application/json"
-                     or actual is None, "body")
-            for key, value in expected.get("headers", {}).items():
-                _require(request.headers.get(key) == value, "body")
+            try:
+                actual = json.loads(request.body, object_pairs_hook=_json_object_pairs) if request.body else None
+                validate_request(request.method, request.url, actual)
+                _require(actual == expected["body"], "body")
+                _require(request.headers.get("Content-Type", "").split(";")[0] == "application/json"
+                         or actual is None, "body")
+                for key, value in expected.get("headers", {}).items():
+                    _require(request.headers.get(key) == value, "body")
+            except (ValueError, TypeError):
+                request_errors.append("request_mismatch")
+                raise
             prepared.append({
                 "method": request.method, "url_sha256": hashlib.sha256(request.url.encode()).hexdigest(),
                 "body_sha256": hashlib.sha256(json.dumps(actual, sort_keys=True).encode()).hexdigest(),
@@ -662,8 +707,8 @@ def native_cli_no_send(packet):
             wire.append(_wire_fingerprints(request))
             fixture_counts["write"] += 1
             value = {}
-        elif request.method == "GET" and observed and request.url.split("?")[0].lower() == (
-                "https://management.azure.com" + observed["id"]).lower():
+        elif (request.method == "GET" and observed and job_api_version and request.url.lower() == (
+                "https://management.azure.com" + observed["id"] + "?api-version=" + job_api_version).lower()):
             value = observed
             fixture_counts["get"] += 1
         elif request.method in {"GET", "HEAD"}:
@@ -683,7 +728,12 @@ def native_cli_no_send(packet):
     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         cli = get_default_cli()
         result = cli.invoke(packet["arguments"], out_file=output)
-    _require(result == 0 and len(prepared) == 1 and not attempts, "arguments")
+    if result != 0 or len(prepared) != 1 or attempts or request_errors:
+        reason = ("network_attempt" if "socket" in attempts else "unexpected_request" if attempts
+                  else "request_mismatch" if request_errors else "native_invocation_failed")
+        raise NativeCLIError(reason=reason, client_version=__version__, job_api_version=job_api_version,
+                             captured_write_requests=len(prepared), fixture_get_responses=fixture_counts["get"],
+                             network_attempts=attempts.count("socket"), unexpected_requests=attempts.count("unexpected_request"))
     return {
         "schema_version": 1, "status": "validated", "no_send": True, "client": "azure-cli",
         "client_version": __version__, "request": prepared[0], "network_requests_sent": 0,
@@ -774,6 +824,9 @@ def main():
             packet = json.load(sys.stdin)
             result = (native_cli_no_send(packet) if options.native_cli_no_send
                       else native_http_request(packet, send=options.native_http_send))
+        except NativeCLIError as error:
+            result = {"status": "rejected", "no_send": True, "reason": "native_client_construction",
+                      "diagnostic": error.diagnostic}
         except BaseException:
             result = {"status": "rejected", "no_send": not options.native_http_send,
                       "reason": "native_client_construction_or_transport"}

@@ -168,8 +168,12 @@ def preflight_azure(arguments, *, resource_snapshot=None):
             [str(native_cli_python()), "-B", str(ROOT / "scripts" / "azure_write_schema.py"), "--native-cli-no-send"],
             input=json.dumps(packet).encode(), capture_output=True, timeout=60, env=environment, cwd=ROOT,
         )
-        receipt = json.loads(result.stdout) if result.returncode == 0 else {}
-        require(receipt.get("status") == "validated" and receipt.get("no_send") is True,
+        receipt = json.loads(result.stdout) if result.stdout.strip() else {}
+        if result.returncode != 0 and isinstance(receipt.get("diagnostic"), dict):
+            diagnostic = write_schema().native_cli_diagnostic(receipt["diagnostic"])
+            raise ValueError("Native deployment request construction rejected; no write sent; diagnostic="
+                             + json.dumps(diagnostic, sort_keys=True))
+        require(result.returncode == 0 and receipt.get("status") == "validated" and receipt.get("no_send") is True,
                 "Native deployment request construction rejected; no write sent")
         return receipt
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):

@@ -1777,7 +1777,7 @@ def pilot_release(tmp_path, monkeypatch):
     monkeypatch.setattr(release, "identity_contract", lambda _: None)
     monkeypatch.setattr(release, "active_executions", lambda _: (copy.deepcopy(job), list(state.active)))
 
-    def azure(*arguments, resource_snapshot=None, before_send=None):
+    def azure(*arguments, resource_snapshot=None, before_send=None, timeout=None):
         if before_send is not None:
             before_send()
         if arguments[:3] == ("containerapp", "revision", "show"):

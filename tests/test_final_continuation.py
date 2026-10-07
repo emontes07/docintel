@@ -1174,10 +1174,13 @@ def test_deploy_checks_overall_window_before_each_patch(final_state, monkeypatch
 def test_last_worker_is_attempt_three_and_closure_preserves_reads(final_state):
     state = final_state
     enabled(state)
+    original_job = copy.deepcopy(state.job)
     final.start(state.work, state.config, state.decision)
     attempt = final.receipt(state.work, "worker-attempt", state.decision)
     assert attempt["attempt"] == 3
     template = release.private_json(state.work / "final-worker-template.json")
+    assert state.job == original_job and "volumes" not in template
+    release.write_schema().validate_action_payload("jobStart", template)
     container = template["containers"][0]
     assert container["args"][-6:] == ["--concurrency", "1", "--max-batches", "1", "--item-limit", "2"]
     assert not any(entry["name"] in release.PILOT_EXTERNAL_ENVIRONMENT_KEYS | {"WEBIQ_API_KEY"} for entry in container["env"])

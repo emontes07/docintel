@@ -1195,7 +1195,7 @@ def start(work, config, decision):
                             if entry["name"] not in release.PILOT_EXTERNAL_ENVIRONMENT_KEYS | {"WEBIQ_API_KEY"}]
         release.merge_environment(container, {**approval["environment"], **release.pilot_values(approval),
                                               "DOCINTEL_REAL_PILOT_EXECUTION_SCOPE": "internal_only"})
-        template["containers"] = release.writable_containers(template["containers"])
+        template = release.writable_execution_template(template)
         processing_window(recovery)
         fresh, running = release.active_executions(current)
         require(not running and fresh == job, "Worker changed before the final start")
@@ -1209,7 +1209,9 @@ def start(work, config, decision):
         })
         processing_window(recovery)
         result = release.azure("containerapp", "job", "start", "--subscription", current["subscription"],
-                               "-g", current["group"], "-n", current["job"], "--yaml", str(path))
+                               "-g", current["group"], "-n", current["job"], "--yaml", str(path),
+                               resource_snapshot=fresh,
+                               before_send=lambda: (live_window(work, decision, "processing", 600), processing_window(recovery)))
         require(isinstance(result, dict) and isinstance(result.get("name"), str) and result["name"],
                 "Worker start uncertain; inspect existing execution, never repeat")
         release.save_once(work / "final-worker-result.json", {

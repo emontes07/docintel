@@ -1492,8 +1492,8 @@ Schema validation alone, CLI help output, and mocked argument lists are not
 substitutes. No-send evidence is construction evidence, not observed Azure
 authorization, resource freshness, upload metadata, or successful service results.
 
-`action-provenance.json` pins four additional official files at the same source
-commit: ACR `2019-04-01`, Jobs and common definitions `2025-01-01`, and Blob
+`action-provenance.json` pins six additional official files at the same source
+commit: ACR `2019-04-01`, Jobs and common definitions `2025-01-01` and `2025-07-01`, and Blob
 `2024-08-04`. Their derived contracts regenerate into the existing artifact:
 
 | Operation | Required request |
@@ -1524,7 +1524,19 @@ matching GET snapshot and synthetic write response. These are never actual
 provider outcomes. Dedicated Requests no-send prepares without response fixtures.
 The provider/DI receipt schemas are separate and are not imported or extended.
 
-Installed CLI 2.77.0 uses Jobs API `2025-01-01` for native start. Its native
+Installed CLI 2.77.0 uses Jobs API `2025-01-01` for native start; CLI 2.90.0
+(Ubuntu runner image `20260927.320.1`) uses `2025-07-01`. The no-send harness
+reads the genuine installed `ContainerAppsJobClient.api_version` and validates
+the original template against that exact pinned operation before invoking the
+native parser/serializer. Regeneration requires the two official execution-body
+schemas to be structurally identical; neither a widened body nor an arbitrary
+future API version is accepted. The captured GET and POST must use that same
+version. Native rejection diagnostics retain only fixed reason codes, sanitized
+client/API versions and bounded request counters—never CLI stderr, private
+targets or request values. This avoids the former generic failure that hid the
+Ubuntu client's `2025-07-01` versus expected `2025-01-01` mismatch.
+
+The native
 specific-execution stop route differs from the official operation; the wrapper
 therefore constructs the schema-backed canonical REST stop, never the legacy
 `/jobs/{job}/stop/{execution}` route. No new stop scope is authorized.
@@ -1568,6 +1580,10 @@ operators use their existing clock callback to recheck the full allowance **afte
 no-send construction, immediately before submission. Gapfill and publication
 paths compose those callbacks without moving clocks or replacing reservations.
 The existing-key transport retains its required `check_window` interface.
+Legacy pilot/final/row start callers also supply the already captured unchanged
+job and recheck their existing full-600-second clock after no-send construction.
+Their new execution overrides use the shared action-schema projection; retained
+historical templates, attempts, results and volume definitions are not rewritten.
 
 For durable, decision-bound construction evidence, supply
 `on_preflight(receipt)` to `release.azure`, `release.execute_publication`,

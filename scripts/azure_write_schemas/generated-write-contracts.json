@@ -1,5 +1,5 @@
 {
-  "action_source_provenance_sha256": "84e9a131caf42742a90dd013a40cee905194726826d83cb6b0b37e8209679659",
+  "action_source_provenance_sha256": "d661e1322799eea642097bbc1a879958f39befe6e2776393f190bbdb4582de6f",
   "actions": {
     "acrBuild": {
       "api_version": "2019-04-01",
@@ -191,6 +191,145 @@
     },
     "jobStart": {
       "api_version": "2025-01-01",
+      "operation_id": "Jobs_Start",
+      "path": "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.App/jobs/{jobName}/start",
+      "schema": {
+        "additionalProperties": false,
+        "properties": {
+          "containers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "args": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "command": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "env": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "secretRef": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "image": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "resources": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "format": "double",
+                      "maximum": 1.7976931348623157e+308,
+                      "minimum": -1.7976931348623157e+308,
+                      "type": "number"
+                    },
+                    "ephemeralStorage": {
+                      "not": {},
+                      "readOnly": true
+                    },
+                    "memory": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "initContainers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "args": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "command": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "env": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "secretRef": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "image": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "resources": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "format": "double",
+                      "maximum": 1.7976931348623157e+308,
+                      "minimum": -1.7976931348623157e+308,
+                      "type": "number"
+                    },
+                    "ephemeralStorage": {
+                      "not": {},
+                      "readOnly": true
+                    },
+                    "memory": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "jobStart202507": {
+      "api_version": "2025-07-01",
       "operation_id": "Jobs_Start",
       "path": "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.App/jobs/{jobName}/start",
       "schema": {

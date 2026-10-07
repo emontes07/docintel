@@ -472,6 +472,7 @@ def test_installed_native_cli_start_uses_captured_get_and_validates_original_tem
     result = release.preflight_azure(args, resource_snapshot=job)
     assert result["no_send"] and result["network_requests_sent"] == 0
     assert result["request"]["method"] == "POST"
+    assert result["api_version"] in schema.NATIVE_JOB_START_ACTIONS
     assert result["provider_response_fabricated"] is True
     assert result["fixture_response_counts"] == {"get": 1, "write": 1}
     assert result["authentication_performed"] is False and result["provider_send_performed"] is False
@@ -718,3 +719,46 @@ def test_secret_receipt_hook_never_receives_keys_and_failed_receipt_blocks_send(
                           "worker_secret_credential_bound", "window", "send"]
         assert len(retained) == 2 and retained[0]["body_sha256"] != retained[1]["body_sha256"]
     assert payload == original
+
+
+@pytest.mark.parametrize("version,action", list(schema.NATIVE_JOB_START_ACTIONS.items()))
+def test_exact_installed_job_api_selection_uses_identical_pinned_original_input_contracts(version, action):
+    payload = {"containers": [{"name": "worker", "image": "retained",
+                               "resources": {"cpu": 1, "memory": "2Gi"}}]}
+    expected = {"method": "POST", "url": "https://management.azure.com" + JOB_ID
+                + "/start?api-version=2025-01-01", "body": payload}
+    before = copy.deepcopy(expected)
+    target = schema.native_job_start_url(expected, version, "2.90.0")
+    assert target.endswith("?api-version=" + version)
+    assert schema.action_for_url("POST", target) == action
+    assert schema.action_contract(action)["schema"] == schema.action_contract("jobStart")["schema"]
+    assert expected == before
+    payload["containers"][0]["resources"]["cpu"] = "1"
+    with pytest.raises(schema.WriteSchemaError):
+        schema.native_job_start_url(expected, version, "2.90.0")
+
+
+@pytest.mark.parametrize("version", ["2026-01-01", "2025-07-01-preview", "SYNTHETIC-PRIVATE"])
+def test_unknown_native_job_versions_fail_closed_with_sanitized_diagnostic(version):
+    with pytest.raises(schema.NativeCLIError) as error:
+        schema.native_job_start_url({}, version, "2.90.0")
+    assert error.value.diagnostic["reason"] == "unsupported_job_api_version"
+    assert error.value.diagnostic["client_version"] == "2.90.0"
+    assert "SYNTHETIC-PRIVATE" not in str(error.value)
+
+
+def test_installed_native_rejection_diagnostic_survives_parent_boundary_without_raw_details(monkeypatch):
+    monkeypatch.setattr(release, "native_cli_python", lambda: Path(sys.executable))
+    monkeypatch.setattr(release.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=2, stdout=json.dumps({
+            "status": "rejected", "no_send": True,
+            "diagnostic": {"reason": "unsupported_job_api_version", "client_version": "2.90.0",
+                           "job_api_version": "2026-01-01", "captured_write_requests": 0,
+                           "raw_error": "SYNTHETIC-SECRET", "url": "SYNTHETIC-PRIVATE-URL"},
+        }).encode(), stderr=b"SYNTHETIC-SECRET",
+    ))
+    with pytest.raises(ValueError, match="unsupported_job_api_version") as error:
+        release.preflight_azure(("rest", "--method", "POST", "--url",
+                                 ACR_URL + "/listBuildSourceUploadUrl?api-version=2019-04-01"))
+    assert "2.90.0" in str(error.value) and "2026-01-01" in str(error.value)
+    assert "SYNTHETIC" not in str(error.value)
