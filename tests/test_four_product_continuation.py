@@ -21,6 +21,34 @@ def records_of(store):
     return {key: json.loads(raw) for key, (raw, _) in all_records(store).items() if key.endswith(".json")}
 
 
+def test_superseding_source_selection_preserves_original_receipts_and_allowances(tmp_path):
+    original = {"source_revision": "a" * 40, "source_review": {"revision": "a" * 40},
+                "history": {"retained.json": "b" * 64}, "postprep_snapshot_sha256": "c" * 64,
+                "target": "unchanged-target", "owner_authorization_sha256": "d" * 64}
+    helper.release.save_once(helper.path(tmp_path, "baseline"), original)
+    before = helper.path(tmp_path, "baseline").read_bytes()
+    assert helper.baseline_path(tmp_path) == helper.path(tmp_path, "baseline")
+    assert helper.source_work(tmp_path) == tmp_path / helper.CHILD
+    selected = {**original, "source_revision": "e" * 40, "source_review": {"revision": "e" * 40},
+                "supersedes_baseline_sha256": helper.digest_file(helper.path(tmp_path, "baseline"))}
+    helper.release.save_once(helper.path(tmp_path, "source-selection"), selected)
+    assert helper.baseline_path(tmp_path) == helper.path(tmp_path, "source-selection")
+    assert helper.source_work(tmp_path) == tmp_path / helper.CHILD / "canonical-write-enums"
+    assert helper.path(tmp_path, "baseline").read_bytes() == before
+
+
+@pytest.mark.parametrize("mutation", ["target", "history", "supersedes_baseline_sha256", "extra"])
+def test_superseding_source_selection_cannot_change_non_source_scope(tmp_path, mutation):
+    original = {"source_revision": "a" * 40, "source_review": {}, "target": "retained", "history": {"old": "b" * 64}}
+    helper.release.save_once(helper.path(tmp_path, "baseline"), original)
+    selected = {**original, "source_revision": "c" * 40,
+                "supersedes_baseline_sha256": helper.digest_file(helper.path(tmp_path, "baseline"))}
+    selected[mutation] = "changed"
+    helper.release.save_once(helper.path(tmp_path, "source-selection"), selected)
+    with pytest.raises(ValueError, match="Superseding source"):
+        helper.baseline_path(tmp_path)
+
+
 def duration_assumptions():
     return {
         "basis": "empirical_provider_latency_conditional", "deployment_tpm": 30000,
