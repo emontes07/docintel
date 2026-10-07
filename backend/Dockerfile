@@ -1,11 +1,12 @@
 FROM python:3.13-slim
 
-# Install system dependencies needed for OpenCV
+# Install OpenCV dependencies and the cached-PDF page renderer.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libgthread-2.0-0 \
     curl \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv.

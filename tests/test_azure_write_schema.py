@@ -318,7 +318,7 @@ def test_generated_contract_comparison_is_not_json_key_order_sensitive(tmp_path,
 
 def test_stdlib_only_ci_regeneration_command_has_no_dependency_or_network_setup():
     result = subprocess.run(
-        [sys.executable, "-S", "-m", "scripts.azure_write_schema", "--check-generated"],
+        [sys.executable, "-S", "-m", "tools.legacy.scripts.azure_write_schema", "--check-generated"],
         cwd=release.ROOT, capture_output=True, check=False, timeout=30,
     )
     assert result.returncode == 0 and b"Verified four generated write contracts" in result.stdout

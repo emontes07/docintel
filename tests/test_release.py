@@ -1299,7 +1299,7 @@ def test_publication_installed_native_cli_constructs_exact_arm_requests_without_
 def test_publication_paths_do_not_construct_acr_build_commands():
     import ast
 
-    tree = ast.parse(Path(release.__file__).read_text())
+    tree = ast.parse(Path(release.__legacy_source__).read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "azure":
             leading = [argument.value if isinstance(argument, ast.Constant) else None for argument in node.args[:2]]
