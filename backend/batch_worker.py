@@ -1045,10 +1045,11 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                 guard = RealPilotGuard(store, record)
                 four = getattr(guard, "four_product", None)
                 if guard.recovery is not None:
-                    expected_items = 4 if four is not None else 2
+                    sliced = four is not None and four.get("worker_slices") is not None
+                    expected_items = 4 if four is not None and not sliced else 2
                     if item_limit != expected_items:
                         raise ValueError(
-                            "Four-product recovery requires an exact four-item worker slice"
+                            "Four-product recovery requires its exact authorized worker slice"
                             if four is not None else "Recovery requires an exact two-item worker slice"
                         )
                 if processor is None:
@@ -1090,6 +1091,14 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
             if guard is not None and getattr(guard, "four_product", None) is not None:
                 order = guard.four_product["execution_order"]
                 pending.sort(key=lambda item: order.index(item["item_key"]))
+                if guard.four_product.get("worker_slices") is not None:
+                    selected = guard.active_slice_item_keys
+                    if (not isinstance(selected, list) or len(selected) != item_limit
+                            or len(set(selected)) != item_limit or not set(selected) <= set(order)):
+                        raise ExecutionConfigurationError("Execution guard did not select the exact authorized product slice")
+                    pending = [item for item in pending if item["item_key"] in selected]
+                    if [item["item_key"] for item in pending] != selected:
+                        raise ExecutionConfigurationError("Authorized slice contains an attempted or unavailable product; no retry")
 
             def execute(item):
                 item_started = monotonic()
@@ -1140,6 +1149,9 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
             record["updated_at"] = now()
             states = [read_json(store, key)[0]["state"] for key in store.keys(f"items/{batch_id}/")]
             record["state"] = "deferred" if "deferred" in states else "queued" if len(pending) > item_limit else "completed"
+            if (guard is not None and getattr(guard, "four_product", None) is not None
+                    and guard.four_product.get("worker_slices") is not None and "recovery_ready" in states):
+                record["state"] = "queued"
             record["progress"] = {"finished": sum(state not in {"running", "queued", "recovery_ready", "deferred"} for state in states), "unresolved": states.count("unresolved"), "failed": states.count("failed") + states.count("interrupted")}
             if "deferred" in states:
                 record["progress"]["deferred"] = states.count("deferred")
