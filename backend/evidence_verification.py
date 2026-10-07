@@ -48,6 +48,15 @@ def normalized(text: str, *, vendor: bool = False) -> tuple[list[str], list[str]
     if spaced != value:
         rules.append("numeric_spacing")
     value = spaced
+    if vendor:
+        unescaped = re.sub(r'''(?<=\d)\\+(?=["'′″”“])''', "", value)
+        if unescaped != value:
+            rules.append("json_escaped_unit_mark")
+        value = unescaped
+        dimensions = re.sub(r"(?<=\d)\s*[x×]\s*(?=\d)", " x ", value)
+        if dimensions != value:
+            rules.append("dimension_separator_spacing")
+        value = dimensions
     marks = re.sub(r"(?<=\d)(?:′′|”|“)", '"', value)
     marks = re.sub(r"(?<=\d)(?:′|’)", "'", marks)
     if marks != value:

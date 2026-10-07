@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Protocol
+from urllib.parse import quote
 
 from pydantic import ValidationError
 
@@ -126,10 +127,12 @@ def source_evidence(source: OfflineSource, observed_at: datetime) -> list[Eviden
         return []
     evidence = []
 
-    def append(text: str, position: str, page: int | None) -> None:
+    def append(text: str, position: str, page: int | None, role: str | None = None) -> None:
         if not text.strip():
             return
         locator = f"{document.source}#" + (f"page={page}&" if page is not None else "") + position
+        if role:
+            locator += "&role=" + quote(role, safe="")
         evidence.append(Evidence(
             evidence_id=f"{source.source_id}:{document.cache_key}:{position}",
             source_id=source.source_id,
@@ -146,7 +149,7 @@ def source_evidence(source: OfflineSource, observed_at: datetime) -> list[Eviden
         ))
 
     for paragraph_index, paragraph in enumerate(document.paragraphs):
-        append(paragraph.text, f"paragraph={paragraph_index}", paragraph.page_number)
+        append(paragraph.text, f"paragraph={paragraph_index}", paragraph.page_number, paragraph.role)
     for table_index, table in enumerate(document.tables):
         for row_index, row in enumerate(table.cells):
             for column_index, text in enumerate(row):

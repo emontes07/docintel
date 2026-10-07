@@ -1,8 +1,9 @@
 """Finite append-only quality worker using stored manifests and existing parses.
 
 Run ``python -m backend.quality_worker`` with QUALITY_BATCH_ID, QUALITY_OWNER and
-QUALITY_RUN_ID. No Document Intelligence, SharePoint or legacy pilot admission
-path is invoked. Failed cache loads are explicit evidence gaps, never new parses.
+QUALITY_RUN_ID. Local sources reuse cached parses; their failed cache loads never
+trigger analyses. Public manufacturer PDFs may use bounded cached DI OCR when
+they lack a text layer. No SharePoint or legacy pilot admission path is invoked.
 The CLI defaults to one Mueller smoke followed by all products in the same job;
 the smoke candidate is reused within the vendor tier's three-call limit.
 """
@@ -18,7 +19,7 @@ import subprocess
 import uuid
 from datetime import datetime, timezone
 from io import BytesIO
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 from backend.batch import BatchService, digest, now
 from backend.batch_store import Conflict, Missing, configured_store, read_json, write_json
@@ -101,7 +102,11 @@ def scope_document(document: ParsedDocument, product, binding: dict) -> ParsedDo
     for paragraph in document.paragraphs:
         if (" ".join(paragraph.text.split()).casefold() in suppressed_paragraph_texts
                 or any(_identity(paragraph.text, mpn) for mpn in others) and not _identity(paragraph.text, product.mpn)):
-            paragraph.text = ""
+            if len(re.findall(r"\b(?:DRFTR|CHKR|ENGR|THIRD ANGLE PROJECTION|UNLESS OTHERWISE NOTED)\b",
+                              paragraph.text, re.I)) >= 2:
+                paragraph.role = "manufacturerTitleBlock"
+            else:
+                paragraph.text = ""
     document.raw_text = ""
     return document
 
@@ -165,7 +170,18 @@ class CachedEvidenceLoader:
                         qualification=qualification, attribute_ids=scope.get("attribute_ids"),
                         provider_retrieved_at=document.parsed_at,
                     )
-                    evidence.extend(source_evidence(source, observed))
+                    excerpts = source_evidence(source, observed)
+                    for excerpt in excerpts:
+                        if parse_qs(urlsplit(excerpt.source_locator).fragment).get("role") == ["manufacturerTitleBlock"]:
+                            excerpt.attribute_ids = [
+                                name for name in (source.attribute_ids if source.attribute_ids is not None else ["Manufacturer"])
+                                if name == "Manufacturer"
+                            ]
+                            excerpt.qualification = (
+                                qualification + " Drawing title block: manufacturer identity only; "
+                                "configuration dimensions and tolerances do not apply to this product."
+                            )
+                    evidence.extend(excerpts)
                     entry["parsing"] = "cached_only"
                 else:
                     blob = binding["blob"]
@@ -546,6 +562,9 @@ def main(argv=None) -> int:
         parser.error("QUALITY_BATCH_ID, QUALITY_OWNER and QUALITY_RUN_ID (or CLI equivalents) are required")
     from backend.quality_web import QualityWeb
     from backend.quality_cost import QualityCostMeter
+    from backend.quality_pdf import CachedPDFOCR
+    from backend.core.docintel import DocumentIntelligenceService
+    from azure.identity import ManagedIdentityCredential
 
     store = configured_store()
     cost_run_id = os.environ.get("QUALITY_COST_RUN_ID") or args.run_id
@@ -557,6 +576,7 @@ def main(argv=None) -> int:
         "worker_usd_per_second": os.environ.get("QUALITY_WORKER_USD_PER_SECOND", "0"),
         "search_usd": os.environ.get("QUALITY_WEB_SEARCH_USD_PER_CALL", "0.0125"),
         "browse_usd": os.environ.get("QUALITY_WEB_BROWSE_USD_PER_CALL", "0.0125"),
+        "di_usd_per_page": os.environ.get("QUALITY_DI_USD_PER_PAGE", "0.01"),
     }
     meter = QualityCostMeter(store, args.batch_id, cost_run_id, **prices)
 
@@ -571,13 +591,16 @@ def main(argv=None) -> int:
             "overnight_prior_cost_usd": float(prices["overnight_prior_cost_usd"]),
             "web_search_usd_per_call": float(prices["search_usd"]),
             "web_browse_usd_per_call": float(prices["browse_usd"]),
+            "di_usd_per_page": float(prices["di_usd_per_page"]),
             "compute_reconciliation": "Replace this elapsed worker compute estimate with measured execution-time cost; do not add both.",
         }
 
     try:
         summary = run_quality_batch(
             store, args.batch_id, args.owner, args.run_id,
-            web=QualityWeb() if not args.smoke_only and os.environ.get("QUALITY_WEB_ENABLED", "true").lower() == "true" else None,
+            web=QualityWeb(pdf_ocr=CachedPDFOCR(store, DocumentIntelligenceService(
+                credential=ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID")),
+            ))) if not args.smoke_only and os.environ.get("QUALITY_WEB_ENABLED", "true").lower() == "true" else None,
             ford_image_blob=os.environ.get("QUALITY_FORD_IMAGE_BLOB"),
             smoke_only=args.smoke_only,
             smoke_first=args.smoke_first and not args.smoke_only,

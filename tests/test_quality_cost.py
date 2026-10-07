@@ -52,3 +52,19 @@ def test_direct_original_page_fetch_does_not_charge_webiq(tmp_path):
     meter = QualityCostMeter(SQLiteStore(tmp_path / "cost"), "b", "r")
     assert meter.record({"operation": "direct_page"})["cost_usd"] == 0
     assert meter.summary()["web_cost_usd"] == 0
+
+
+def test_di_pages_cache_and_unknown_usage_share_the_existing_meter(tmp_path, caplog):
+    meter = QualityCostMeter(SQLiteStore(tmp_path / "cost"), "b", "r", clock=lambda: 0)
+    assert meter.record({"operation": "document_intelligence", "analyzed_pages": 2, "cache_hit": False})["cost_usd"] == .02
+    assert meter.record({"operation": "document_intelligence", "analyzed_pages": 0, "cache_hit": True})["cost_usd"] == 0
+    assert meter.record({"operation": "document_intelligence", "analyzed_pages": None, "cache_hit": False})["cost_usd"] is None
+    assert meter.record({"operation": "document_intelligence", "analyzed_pages": 0, "cache_hit": False,
+                         "analysis_attempted": False, "status": "failed"})["cost_usd"] == 0
+    result = meter.summary()
+    assert result["known_run_cost_usd"] == result["di_cost_usd"] == .02
+    assert result["di_calls"] == 2 and result["di_pages"] == 2 and result["di_cache_hits"] == 1
+    assert result["unpriced_di_calls"] == 1 and result["model_calls"] == 0
+    assert "unknown cost" in caplog.text
+    with pytest.raises(ValueError, match="analyzed pages"):
+        meter.record({"operation": "document_intelligence", "analyzed_pages": True})

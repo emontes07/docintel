@@ -7,7 +7,6 @@ import hashlib
 import ipaddress
 import json
 import re
-import unicodedata
 from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
 import xml.etree.ElementTree as ET
@@ -15,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from backend.batch import export_workbook
+from backend.evidence_verification import Fragment, match_text
 from backend.models.enrichment import (
     AttributeDefinition, AttributeResult, Candidate, EnrichmentResult, Evidence, Manifest, ProductKey,
 )
@@ -104,6 +104,20 @@ def _display(value) -> str:
     return re.sub(r"(?i)extraction failed", "processing needs attention", text)
 
 
+def _proposed_display(value, *, vendor: bool = False) -> str:
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    text = _display(value)
+    text = re.sub(r"\bNSF\s*61\b", "NSF 61", text, flags=re.I)
+    if vendor and text.isupper():
+        text = text.capitalize()
+        text = re.sub(
+            r"\b(?:nsf|ansi|astm|awwa|uns|epdm|fip|mip|fnpt|mnpt|npt|cts|ptfe|pex|pe|llb|nl)\b",
+            lambda match: match[0].upper(), text, flags=re.I,
+        )
+    return text
+
+
 def _location(locator: str) -> str:
     try:
         fragment = urlsplit(locator).fragment
@@ -127,10 +141,6 @@ def _candidate_location(candidate: Candidate, evidence: Evidence) -> str:
     if len(quote) >= 2 and quote[0] == quote[-1] and quote[0] in "\"'":
         quote = quote[1:-1]
 
-    def normalized(value: str) -> str:
-        return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
-
-    quote = normalized(quote)
     matched: list[str] = []
     for cell in cells if isinstance(cells, list) else []:
         if not isinstance(cell, dict):
@@ -139,7 +149,8 @@ def _candidate_location(candidate: Candidate, evidence: Evidence) -> str:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}", name):
             continue
         value = cell.get("value")
-        if isinstance(value, (str, int, float, bool)) and quote and quote in normalized(str(value)):
+        if (isinstance(value, (str, int, float, bool)) and quote
+                and match_text(quote, [[Fragment(evidence, str(value), cell=name, vendor=True)]])):
             matched.append(name)
     # Legacy candidates cite a row; these are quote matches, not invented cell citations.
     detail = "quote matched cells " + ", ".join(dict.fromkeys(matched)) if matched else "row-level citation"
@@ -194,7 +205,10 @@ def _build_package(
                 ])
             proposals, units, bases, quotes, labels, urls, retrieved, applicability = [], [], [], [], [], [], [], []
             for index, candidate in enumerate(attribute.candidates):
-                proposals.append(_display(candidate.value))
+                proposed_value = _proposed_display(
+                    candidate.value, vendor=any(indexed[key].source_tier == "vendor_table" for key in candidate.evidence_ids),
+                )
+                proposals.append(proposed_value)
                 units.append(_display(candidate.unit))
                 bases.append(candidate.evidence_basis)
                 quotes.append(_display(candidate.supporting_quote))
@@ -218,7 +232,7 @@ def _build_package(
                     applicability.append(scope)
                     evidence_rows.append([
                         product.item_id, product.mpn, attribute.attribute_id,
-                        _display(candidate.value), _display(candidate.unit), label, evidence.source_tier, _candidate_location(candidate, evidence),
+                        proposed_value, _display(candidate.unit), label, evidence.source_tier, _candidate_location(candidate, evidence),
                         _display(candidate.supporting_quote), url, date, scope, candidate.evidence_basis,
                         candidate.origin, candidate.judge_status, _display(candidate.judge_reason),
                     ])
@@ -227,7 +241,7 @@ def _build_package(
                 product.item_id, product.mpn, attribute.attribute_id,
                 review.decision.capitalize() if review else "", _display(review.corrected_value) if review else "",
                 _display(review.corrected_unit) if review else "", _display(review.reason) if review else "",
-                status, action, "\n".join(proposals) or _display(result.manifest.existing_values.get(attribute.attribute_id)),
+                status, action, "\n".join(proposals) or _proposed_display(result.manifest.existing_values.get(attribute.attribute_id)),
                 "\n".join(dict.fromkeys(units)), "\n".join(dict.fromkeys(bases)), "\n".join(dict.fromkeys(quotes)),
                 "\n".join(dict.fromkeys(labels)), "\n".join(dict.fromkeys(urls)),
                 "\n".join(dict.fromkeys(retrieved)), "\n".join(dict.fromkeys(applicability)),
