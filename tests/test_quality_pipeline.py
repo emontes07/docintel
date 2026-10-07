@@ -81,7 +81,7 @@ def proposal(**updates):
             "evidence_ids": ["e1"], "origin": "literal", **updates}
 
 
-def test_fallback_receives_prior_judge_feedback_only_for_unresolved_attributes():
+def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdicts():
     definitions = manifest().attributes + [
         AttributeDefinition(attribute_id="Valve Type", description="", value_type="string"),
     ]
@@ -107,11 +107,7 @@ def test_fallback_receives_prior_judge_feedback_only_for_unresolved_attributes()
     packet = next(packet for schema, packet, _ in client.calls
                   if schema == QualityExtraction and packet["active_tier"] == "vendor_table")
     assert packet["unresolved_attributes"] == ["Primary Material"]
-    assert [entry["attribute_id"] for entry in packet["prior_tier_review"]] == ["Primary Material"]
-    previous = packet["prior_tier_review"][0]["candidates"][0]
-    assert previous["judge_status"] == "judge_disputed"
-    assert previous["judge_reason"] == "Use target-specific vendor evidence instead of this family drawing."
-    assert previous["evidence_ids"] == ["e1"]
+    assert "prior_tier_review" not in packet
     assert len(packet["evidence"]) == 2
     assert len(client.calls) == 4
     assert [candidate.judge_status for candidate in result.attributes[0].candidates] == [
