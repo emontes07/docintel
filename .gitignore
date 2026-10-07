@@ -186,3 +186,7 @@ notebooks/video-generations/
 frontend/lighthouse-report.html
 scripts/allow-local-access.sh
 .agents.azure/
+
+# Machine-specific editor choices and private run outputs
+.vscode/
+output/
