@@ -416,6 +416,13 @@ def live(work, decision, phase, minimum=0):
             if phase == "publication" and (name == "upload_publication_context" or args[:3] == ("rest", "--method", "POST")):
                 needed = max(needed, 900)
             window(work, decision, phase, needed)
+            if name in {"azure", "upload_publication_context"}:
+                previous = kwargs.get("before_send")
+                def before_send():
+                    if previous is not None:
+                        previous()
+                    window(work, decision, phase, needed)
+                kwargs["before_send"] = before_send
             return function(*args, **kwargs)
         return call
 
@@ -626,23 +633,29 @@ def patch(work, config, decision, label, resource, containers, *, job=False, bin
             sleep(5)
 
 
-def secure_worker_patch(work, config, decision, resource, redacted_payload, *, check_window=None):
+def secure_worker_patch(work, config, decision, resource, redacted_payload, *, check_window=None, on_preflight=None):
     """Compatibility wrapper retaining the original gapfill clock by default."""
     if check_window is None:
         check_window = lambda: window(work, decision, "overall", 600)
     return send_existing_secret_patch(
         config, resource, redacted_payload,
         secret_ref=decision.get("webiq_secret_ref"), check_window=check_window,
+        **({"on_preflight": on_preflight} if on_preflight is not None else {}),
     )
 
 
-def send_existing_secret_patch(config, resource, redacted_payload, *, secret_ref, check_window):
+def send_existing_secret_patch(config, resource, redacted_payload, *, secret_ref, check_window, on_preflight=None):
     """Namespace-independent transport; the only key source is the existing owner file."""
     expected_id = (f"/subscriptions/{config['subscription']}/resourceGroups/{config['group']}"
                    f"/providers/Microsoft.App/jobs/{config['job']}")
     require(resource["id"].lower() == expected_id.lower(), "Credential binding must target the existing manual job")
     url = "https://management.azure.com" + resource["id"] + "?api-version=2024-03-01"
     release.write_schema().validate_request("PATCH", url, redacted_payload)
+    packet = {"contract": "job_secret", "method": "PATCH", "url": url, "timeout": 60,
+              "payload": redacted_payload, "headers": {"Content-Type": "application/json"}}
+    if resource.get("etag"):
+        packet["headers"]["If-Match"] = resource["etag"]
+    release._emit_preflight(on_preflight, release.native_http(packet), "worker_secret_redacted")
     require(callable(check_window), "A bounded operation clock check is required")
     check_window()
     phase = "configuration"
@@ -663,25 +676,15 @@ def send_existing_secret_patch(config, resource, redacted_payload, *, secret_ref
                 and token.get("subscription", config["subscription"]) == config["subscription"]
                 and token.get("tenant", config["tenant"]) == config["tenant"],
                 "Existing management identity binding changed")
-        transport = "header = " + json.dumps("Authorization: Bearer " + bearer) + "\n"
-        if resource.get("etag"):
-            transport += "header = " + json.dumps("If-Match: " + resource["etag"]) + "\n"
-        transport += "data = " + json.dumps(json.dumps(payload, separators=(",", ":"))) + "\n"
+        packet["headers"]["Authorization"] = "Bearer " + bearer
+        packet["payload"] = payload
+        release._emit_preflight(on_preflight, release.native_http(packet), "worker_secret_credential_bound")
         phase = "worker_patch"
         check_window()
-        result = subprocess.run([
-            "curl", "--disable", "--silent", "--show-error", "--fail",
-            "--proto", "=https", "--retry", "0", "--max-redirs", "0", "--noproxy", "*",
-            "--request", "PATCH", "--header", "Content-Type: application/json",
-            "--url", url,
-            "--max-time", "60", "--output", "/dev/null", "--write-out", "%{http_code}", "--config", "-",
-        ], input=transport.encode(), capture_output=True, timeout=60,
-            env={key: value for key, value in os.environ.items()
-                 if key not in {"WEBIQ_API_KEY", "WEBIQ_SUBSCRIPTION_KEY"}})
-        status = http_status(result.stdout)
-        returncode = result.returncode if type(result.returncode) is int else None
-        if returncode != 0 or status not in (200, 202):
-            raise WorkerPatchFailure(phase, http_status=status, curl_returncode=returncode)
+        result = release.native_http(packet, send=True)
+        status = result["http_status"]
+        if status not in (200, 202):
+            raise WorkerPatchFailure(phase, http_status=status)
     except WorkerPatchFailure:
         raise
     except subprocess.TimeoutExpired as error:
@@ -847,7 +850,7 @@ def start(work, config, decision):
     else:
         entries["WEBIQ_API_KEY"] = credential
     container["env"] = list(entries.values())
-    template["containers"] = release.writable_containers(template["containers"])
+    template = release.writable_execution_template(template)
     capacity = prior.require_model_capacity(config, approval)
     fresh, active = release.active_executions(config)
     require(not active and fresh == job, "Worker changed or active before start")
@@ -861,7 +864,8 @@ def start(work, config, decision):
     })
     window(work, decision, "processing", 600)
     result = release.azure("containerapp", "job", "start", "--subscription", config["subscription"],
-                           "-g", config["group"], "-n", config["job"], "--yaml", str(path(work, "worker-template")))
+                           "-g", config["group"], "-n", config["job"], "--yaml", str(path(work, "worker-template")),
+                           resource_snapshot=fresh, before_send=lambda: window(work, decision, "processing", 600))
     require(isinstance(result, dict) and isinstance(result.get("name"), str) and result["name"],
             "Worker outcome unknown; inspect the same attempt, never retry")
     release.save_once(path(work, "worker-result"), {**binding(decision), "execution_name": result["name"], "attempt": 5})

@@ -202,11 +202,44 @@ permit a new reservation. Actual token/verified-identity regressions remain
 owned by the preparation path; the synthetic preflight credential is never
 evidence of real identity verification.
 
+`backend.sdk_image_smoke.collect_image_smoke` produces the image-side proof.
+Run it in a separate Python process through the deployed API console after
+verifying that API and worker reference the same immutable backend digest.
+This does not start the worker. Supply the reviewed source manifest (including
+the lock), revision, externally verified digest, and a callback invoking the
+existing native preflight APIs with the complete prepared planning inputs.
+The callback must cover model, WebIQ and original-page request builders; actual
+runtime inputs still self-gate before their reservations and sends.
+
+The producer verifies image source bytes and installed provider packages against
+the reviewed lock before and after capture. DNS, socket operations, subprocess
+creation and real Azure credential methods are denied in that isolated process.
+An attempted forbidden operation fails the proof even if the callback catches
+the exception. This is a Python-process denial boundary, not a claim that the
+container's network namespace was disabled. Registry identity is verified by the
+operator from build/deployment records, not self-attested by the image.
+
+Keep its `source_revision`, `image_digest`, `code_sha256`, `lock_sha256`,
+`installed_sdk_versions`, and `native_requests` together with those external
+records. Never substitute an operator-host receipt. In particular, the current
+lock uses OpenAI 1.91.0/httpx whereas the preparation host may use OpenAI
+3.3.1/httpx2: compare the image to its lock, not to the preparation host.
+Synthetic test bindings are not deployed-image evidence.
+
+`scripts.image_sdk_smoke.capture` is the explicit operator bridge: it verifies
+the published digest is installed on the stopped API/worker pair, sends the
+complete measured planning requests to a separate API-console process, and
+retains only the returned native metadata. It invokes the image producer for
+all twelve model, four discovery and six prospective page requests, then calls
+the four-product image-proof validator. This inspection neither discovers a
+page nor invokes a model; prospective web inputs are still planning envelopes.
+It never starts the worker, enables processing or changes a reservation.
+
 Focused offline regression suite:
 
 ```bash
 python -m pytest -q tests/test_sdk_preflight.py tests/test_original_page_preflight.py \
-  tests/test_websearch_webiq.py tests/test_response_validation.py
+  tests/test_websearch_webiq.py tests/test_response_validation.py tests/test_sdk_image_smoke.py
 ```
 
 The native regression suite explicitly denies sockets, DNS, subprocess

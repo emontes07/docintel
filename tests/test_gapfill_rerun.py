@@ -279,7 +279,9 @@ def test_nonsecret_configuration_builder_uses_exact_owner_prices_and_existing_pu
     expected["max_cost_microdollars"] = real_pilot.RealPilotGuard._cost(
         records[real_pilot.APPROVAL_KEY], "inference", 52000, 4096, 0,
     ) + 25000
-    assert configuration["public_web_policy"] == expected
+    from backend.core.websearch_policy import OptionalWebPolicy
+
+    assert OptionalWebPolicy.model_validate(configuration["public_web_policy"]) == OptionalWebPolicy.model_validate(expected)
     assert configuration["web_environment"]["WEBIQ_ENDPOINT"] == "https://api.microsoft.ai/v3/search/web"
     assert "WEBIQ_API_KEY" not in json.dumps(configuration)
     assert configuration["public_web_policy"]["items"]["row-2"]["mpn"] == batch["items"][0]["manifest"]["product"]["mpn"]
@@ -368,7 +370,10 @@ def install_reproduction(monkeypatch, batch):
     monkeypatch.setattr(worker, "prepare_inference_request", prepare)
     monkeypatch.setattr(worker, "LLMClient", Client)
     monkeypatch.setattr("backend.core.websearch_webiq.WebIQSearchClient", type(
-        "ReproductionDiscovery", (), {"validate_configuration": lambda _: None, "search": search},
+        "ReproductionDiscovery", (WebIQSearchClient,), {
+            "__init__": lambda self: WebIQSearchClient.__init__(self, api_key="synthetic-no-send-only"),
+            "search": search,
+        },
     ))
     monkeypatch.setattr("backend.core.websearch.fetch_original_page", fetch)
     monkeypatch.setattr(worker, "DocumentIntelligenceService", lambda *a, **k: pytest.fail("No new analysis"))

@@ -19,7 +19,7 @@ from pydantic import ValidationError
 from backend.batch import digest, now
 from backend.batch_store import Conflict, Missing, configured_store, read_json, write_json
 from backend.core.docintel import DocumentIntelligenceError, DocumentIntelligenceService, ParsedDocument
-from backend.core.llm import LLMClient, LLMSchemaValidationError, COGNITIVE_SERVICES_SCOPE
+from backend.core.llm import LLMClient, LLMSchemaValidationError, COGNITIVE_SERVICES_SCOPE, preflight_structured_request
 from backend.core.websearch import WebSearchError, validate_original_url
 from backend.core.websearch_policy import OptionalWebPolicy, configured_optional_web_policy
 from backend.extract import ExecutionConfigurationError, run_enrichment
@@ -29,6 +29,7 @@ from backend.multisource import OptionalTierSkipped, WEB_TIERS, attribute_resolv
 from backend.pdf_presentation import pdf_items
 from backend.telemetry import ItemTelemetry, milliseconds, record_accounting
 from backend.real_pilot import BUDGET_KEY, RealPilotBudgetExceeded, RealPilotGuard, binding_digest
+from backend.sdk_preflight import SDKPreflightError
 from backend.response_validation import (
     CitationReferences, ResponseValidationError, map_citations, parsed_content, response_diagnostic, schema_issues,
 )
@@ -325,7 +326,8 @@ class RealBatchProcessor(BatchProcessor):
         self.optional_cost = 0
         if self.optional_web_policy:
             if (guard.execution_scope != "full"
-                    or (guard.recovery is not None and guard.gapfill is None)
+                    or (guard.recovery is not None and guard.gapfill is None
+                        and getattr(guard, "four_product", None) is None)
                     or self.optional_web_policy.batch_sha256 != binding_digest(record)):
                 raise ExecutionConfigurationError("Optional web requires a separately authorized full, exact-batch scope")
             selected = {entry["item_key"]: entry for entry in record["items"]}
@@ -349,8 +351,9 @@ class RealBatchProcessor(BatchProcessor):
         try:
             paced = self.guard.recovery is not None and args[0] == "inference"
             if paced and self._last_recovery_inference is not None:
-                # The bounded recovery uses the existing 30k-TPM deployment.
-                delay = 61 - (monotonic() - self._last_recovery_inference)
+                four = getattr(self.guard, "four_product", None)
+                interval = four["inference_interval_seconds"] if four is not None else 61
+                delay = interval - (monotonic() - self._last_recovery_inference)
                 if delay > 0:
                     sleep(delay)
             reservation = self.guard.reserve(*args, **kwargs)
@@ -391,9 +394,12 @@ class RealBatchProcessor(BatchProcessor):
         if policy is None:
             raise ExecutionConfigurationError("Optional web policy was not supplied")
         approval = self.optional_guard_state()
+        public = policy.items.get(item_key)
+        if public is None:
+            raise OptionalTierSkipped("optional_public_scope_not_selected")
         limits = {
             "search": (policy.max_search_calls, 1),
-            "web_retrieval": (policy.max_direct_page_attempts, 2),
+            "web_retrieval": (policy.max_direct_page_attempts, public.max_direct_page_attempts),
             "inference": (policy.max_inference_calls, 1),
         }
         total_limit, item_limit = limits[operation]
@@ -565,7 +571,7 @@ class RealBatchProcessor(BatchProcessor):
     def web_sources(self, binding, item, scope, pending, provenance):
         if self.guard.execution_scope == "internal_only":
             raise ExecutionConfigurationError("Web tiers are excluded by internal-only approval")
-        from backend.core.websearch import WebSearchError, fetch_original_page
+        from backend.core.websearch import WebSearchError, fetch_original_page, preflight_original_page
         from backend.core.websearch_webiq import WebIQSearchClient
 
         product = ProductKey.model_validate(item["manifest"]["product"])
@@ -589,8 +595,16 @@ class RealBatchProcessor(BatchProcessor):
         key = self.key(item, "search", binding["url"] + ":" + digest(query.encode()))
         try:
             client = WebIQSearchClient()
-            if optional:
+            if getattr(self.guard, "four_product", None) is not None:
+                try:
+                    provenance["sdk_preflight"] = client.preflight_search(
+                        query, allowed_domains=[host], authorized=True,
+                    )
+                except SDKPreflightError as error:
+                    raise ExecutionConfigurationError("Native WebIQ request validation blocked execution") from error
+            elif optional:
                 client.validate_configuration()
+            if optional:
                 self.reserve_optional("search", key, item_key=item["item_key"])
             else:
                 self.reserve_real("search", key, item_key=item["item_key"])
@@ -613,17 +627,31 @@ class RealBatchProcessor(BatchProcessor):
                 "content_characters": len(getattr(result, "content", "")),
             } for result in discovered],
         )
-        # The supplied reference is attempted first; discovered pages stay on its approved host.
-        urls = list(dict.fromkeys([binding["url"], *[result.url for result in discovered]]))[:2 if optional else 3]
+        if public is not None and getattr(self.guard, "four_product", None) is not None:
+            urls = [result.url for result in discovered]
+            if urlsplit(binding["url"]).path.strip("/"):
+                urls.append(binding["url"])
+            urls = list(dict.fromkeys(urls))[:public.max_direct_page_attempts]
+            if not urls:
+                provenance.update(retrieval="not_attempted", skip_reason="optional_no_product_page_leads")
+                return []
+        else:
+            # Historical runs retain supplied-reference-first retrieval.
+            urls = list(dict.fromkeys([binding["url"], *[result.url for result in discovered]]))[:2 if optional else 3]
         sources = []
         for url in urls:
             source_id = binding["source_id"] + "-" + digest(url.encode())[:12]
+            attempted = False
             try:
+                if getattr(self.guard, "four_product", None) is not None:
+                    proof = preflight_original_page(url, allowed_hosts=[host], authorized=True)
+                    provenance.setdefault("page_sdk_preflights", []).append({"source_id": source_id, **proof})
                 reserve = self.reserve_optional if optional else self.reserve_real
                 reserve(
                     "web_retrieval", self.key(item, "web_retrieval", url),
                     item_key=item["item_key"],
                 )
+                attempted = True
                 original = fetch_original_page(url, allowed_hosts=[host], authorized=True)
                 provenance.setdefault("original_pages", []).append({
                     "source_id": source_id, "url": original.final_url,
@@ -653,11 +681,16 @@ class RealBatchProcessor(BatchProcessor):
                     "source_id": source_id, "error": error.code, "retrieval": "not_attempted",
                 })
                 break
+            except SDKPreflightError as error:
+                raise ExecutionConfigurationError("Native original-page request validation blocked execution") from error
             except ExecutionConfigurationError:
                 raise
             except (WebSearchError, ValueError, OSError) as error:
                 code = error.code if isinstance(error, WebSearchError) else "web_source_unavailable_or_inapplicable"
-                detail: dict[str, str | int] = {"source_id": source_id, "error": code}
+                detail: dict[str, str | int] = {
+                    "source_id": source_id, "error": code,
+                    "retrieval": "failed" if attempted else "not_attempted",
+                }
                 if isinstance(error, RealPilotBudgetExceeded):
                     detail.update(
                         error="budget_exhausted", budget=error.dimension,
@@ -753,6 +786,22 @@ class RealBatchProcessor(BatchProcessor):
                 except Missing:
                     pass
                 input_bound = request.input_bound
+                sdk_preflight = None
+                if getattr(processor.guard, "four_product", None) is not None:
+                    try:
+                        sdk_preflight = preflight_structured_request(
+                            system, user, schema,
+                            endpoint=settings.LLM_ENDPOINT or settings.AI_FOUNDRY_ENDPOINT,
+                            deployment=settings.LLM_DEPLOYMENT,
+                            sdk_max_retries=0, **request_parameters,
+                        )
+                    except SDKPreflightError as error:
+                        processor.inference_provenance.append({
+                            "method": "native_sdk_preflight_blocked", "new_model_call": False,
+                            "source_tier": self.source_tier, "error_type": error.error_type,
+                            "accounting": request.accounting,
+                        })
+                        raise ExecutionConfigurationError("Native model request validation blocked execution") from error
                 try:
                     reserve = processor.reserve_optional if optional else processor.reserve_real
                     reservation = reserve(
@@ -794,6 +843,7 @@ class RealBatchProcessor(BatchProcessor):
                         })
                     raise
                 model_started = monotonic()
+                sdk_blocked = False
                 try:
                     try:
                         try:
@@ -802,6 +852,9 @@ class RealBatchProcessor(BatchProcessor):
                             model_ms = milliseconds(model_started, monotonic())
                         self.response_payload = response.model_dump(mode="json")
                         response = map_citations(schema.model_validate(self.response_payload), references)
+                    except SDKPreflightError as error:
+                        sdk_blocked = True
+                        raise ExecutionConfigurationError("Native model request revalidation blocked execution") from error
                     except (LLMSchemaValidationError, ValidationError, ResponseValidationError) as error:
                         raw_hash = getattr(client, "last_response_sha256", None)
                         self.last_response_sha256 = raw_hash if isinstance(raw_hash, str) else None
@@ -817,20 +870,22 @@ class RealBatchProcessor(BatchProcessor):
                         )
                         raise failure from error
                     finally:
-                        self.response_usage = client.last_usage
-                        if client.last_usage is not None:
+                        self.response_usage = None if sdk_blocked else client.last_usage
+                        if self.response_usage is not None:
                             try:
-                                processor.guard.record_usage(reservation["reservation_id"], **client.last_usage)
+                                processor.guard.record_usage(reservation["reservation_id"], **self.response_usage)
                             except (ValueError, Missing) as error:
                                 raise ExecutionConfigurationError("Real-pilot measured usage exceeded or invalidated its reservation") from error
                         processor.inference_provenance.append({
-                            "method": "model", "reservation_id": reservation["reservation_id"],
-                            "usage": client.last_usage, "new_model_call": True,
+                            "method": "native_sdk_preflight_blocked" if sdk_blocked else "model",
+                            "reservation_id": reservation["reservation_id"],
+                            "usage": self.response_usage, "new_model_call": not sdk_blocked,
                             "request_parameters": request_parameters,
                             "prompt_format": COMPACT_PROMPT_FORMAT,
                             "source_tier": self.source_tier,
                             "accounting": request.accounting,
                             "elapsed_ms": model_ms,
+                            **({"sdk_preflight": sdk_preflight} if sdk_preflight is not None else {}),
                         })
                     raw_hash = getattr(client, "last_response_sha256", None)
                     self.last_response_sha256 = raw_hash if isinstance(raw_hash, str) else None
@@ -988,8 +1043,15 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                 if concurrency != 1 or not 1 <= item_limit <= 4:
                     raise ValueError("Real pilot requires one thread and at most four items")
                 guard = RealPilotGuard(store, record)
-                if guard.recovery is not None and item_limit != 2:
-                    raise ValueError("Recovery requires an exact two-item worker slice")
+                four = getattr(guard, "four_product", None)
+                if guard.recovery is not None:
+                    sliced = four is not None and four.get("worker_slices") is not None
+                    expected_items = 4 if four is not None and not sliced else 2
+                    if item_limit != expected_items:
+                        raise ValueError(
+                            "Four-product recovery requires its exact authorized worker slice"
+                            if four is not None else "Recovery requires an exact two-item worker slice"
+                        )
                 if processor is None:
                     try:
                         policy = configured_optional_web_policy()
@@ -1008,9 +1070,9 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                 key = f"items/{batch_id}/{item['item_key']}.json"
                 try:
                     state, item_version = read_json(store, key)
-                    if (guard is not None and guard.recovery is not None
+                    if (guard is not None and guard.active_recovery is not None
                             and state["state"] == "recovery_ready"
-                            and item["item_key"] in guard.recovery["selected_item_keys"]
+                            and item["item_key"] in guard.active_recovery["selected_item_keys"]
                             and state.get("recovery_sha256") == guard.recovery_sha256):
                         pending.append(item)
                     if state["state"] == "running":
@@ -1026,6 +1088,17 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
                         pending.append(item)
                     else:
                         raise Conflict("Recovery status disappeared; no automatic resubmission")
+            if guard is not None and getattr(guard, "four_product", None) is not None:
+                order = guard.four_product["execution_order"]
+                pending.sort(key=lambda item: order.index(item["item_key"]))
+                if guard.four_product.get("worker_slices") is not None:
+                    selected = guard.active_slice_item_keys
+                    if (not isinstance(selected, list) or len(selected) != item_limit
+                            or len(set(selected)) != item_limit or not set(selected) <= set(order)):
+                        raise ExecutionConfigurationError("Execution guard did not select the exact authorized product slice")
+                    pending = [item for item in pending if item["item_key"] in selected]
+                    if [item["item_key"] for item in pending] != selected:
+                        raise ExecutionConfigurationError("Authorized slice contains an attempted or unavailable product; no retry")
 
             def execute(item):
                 item_started = monotonic()
@@ -1076,10 +1149,16 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
             record["updated_at"] = now()
             states = [read_json(store, key)[0]["state"] for key in store.keys(f"items/{batch_id}/")]
             record["state"] = "deferred" if "deferred" in states else "queued" if len(pending) > item_limit else "completed"
+            if (guard is not None and getattr(guard, "four_product", None) is not None
+                    and guard.four_product.get("worker_slices") is not None and "recovery_ready" in states):
+                record["state"] = "queued"
             record["progress"] = {"finished": sum(state not in {"running", "queued", "recovery_ready", "deferred"} for state in states), "unresolved": states.count("unresolved"), "failed": states.count("failed") + states.count("interrupted")}
             if "deferred" in states:
                 record["progress"]["deferred"] = states.count("deferred")
             write_json(store, path, record, version)
+            if (guard is not None and getattr(guard, "four_product", None) is not None
+                    and guard.four_product.get("worker_slices") is not None):
+                guard.finish_slice()
         finally:
             stopped.set()
             thread.join()

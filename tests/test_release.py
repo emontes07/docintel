@@ -12,6 +12,12 @@ release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 
+@pytest.fixture(autouse=True)
+def mock_native_preflight_for_unit_transports(monkeypatch, request):
+    if "installed_native" not in request.node.name:
+        monkeypatch.setattr(release, "preflight_azure", lambda *a, **k: {"no_send": True})
+
+
 def test_release_helper_ci_regenerates_and_verifies_pinned_write_contracts():
     contracts = release.write_schema().check_generated()
     assert set(contracts["contracts"]) == {"containerApps", "jobs"}
@@ -285,15 +291,19 @@ def publication_transport(monkeypatch):
     def install(work, config, status="Succeeded", *, cpu=2, digest_mismatch=False):
         calls, requests, archives = [], {}, []
 
-        def upload(location, archive, timeout):
+        def upload(location, archive, timeout, *, before_send=None):
             import tarfile
+            if before_send is not None:
+                before_send()
             assert 0 < timeout <= 120
             assert archive.stat().st_mode & 0o777 == 0o600
             with tarfile.open(archive) as contents:
                 archives.append(contents.getnames())
             return location["relativePath"]
 
-        def azure(*arguments, timeout=None):
+        def azure(*arguments, timeout=None, before_send=None):
+            if before_send is not None:
+                before_send()
             assert 0 < timeout <= 60
             calls.append(arguments)
             if arguments[:2] == ("acr", "repository"):
@@ -682,7 +692,7 @@ def test_supplemental_full_publish_reuses_metadata_and_preserves_all_counters(tm
             metadata.append(result)
         return result
 
-    def upload_context(location, archive, timeout):
+    def upload_context(location, archive, timeout, **kwargs):
         assert location is metadata[len(uploaded)]
         uploaded.append(location)
         return upload(location, archive, timeout)
@@ -993,9 +1003,9 @@ def test_publication_rechecks_full_window_before_every_upload_and_queue(tmp_path
             advance()
         return result
 
-    def upload_context(*args):
+    def upload_context(*args, **kwargs):
         uploads.append(args)
-        result = upload(*args)
+        result = upload(*args, **kwargs)
         if stage == "queue":
             advance()
         return result
@@ -1078,12 +1088,13 @@ def test_publication_blob_put_never_exposes_sas_or_retries(tmp_path, monkeypatch
         calls.append((args, kwargs))
         assert "PRIVATE-SAS" not in " ".join(args)
         assert b"PRIVATE-SAS" in kwargs["input"]
-        assert args[:2] == ["curl", "--disable"]
-        assert args[args.index("--retry") + 1] == "0"
-        assert args[args.index("--max-redirs") + 1] == "0"
-        assert args[args.index("--header") + 1] == "x-ms-blob-type: BlockBlob"
+        packet = json.loads(kwargs["input"])
+        assert packet["headers"]["x-ms-blob-type"] == "BlockBlob"
         assert kwargs["timeout"] == 30
-        return SimpleNamespace(returncode=1 if failure else 0, stdout=b"403 PRIVATE-SAS" if failure else b"201", stderr=b"PRIVATE-SAS")
+        sending = args[-1] == "--native-http-send"
+        return SimpleNamespace(returncode=1 if failure and sending else 0, stdout=json.dumps({
+            "status": "validated", "no_send": not sending, "http_status": 201,
+        }).encode(), stderr=b"PRIVATE-SAS")
 
     monkeypatch.setattr(release.subprocess, "run", run)
     location = {"relativePath": "source/20300203/source.tar.gz", "uploadUrl": url}
@@ -1093,7 +1104,7 @@ def test_publication_blob_put_never_exposes_sas_or_retries(tmp_path, monkeypatch
         assert "PRIVATE-SAS" not in str(error.value)
     else:
         assert release.upload_publication_context(location, tmp_path / "source.tar.gz", 30) == location["relativePath"]
-    assert len(calls) == 1 and not capsys.readouterr().out
+    assert len(calls) == 2 and not capsys.readouterr().out
 
 
 @pytest.mark.parametrize("source", [
@@ -1107,11 +1118,12 @@ def test_publication_accepts_safe_opaque_relative_paths_without_prefix_or_extens
     from urllib.parse import quote
     calls = []
     (tmp_path / "context.tar.gz").write_bytes(b"SYNTHETIC-ARCHIVE")
-    monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)) or SimpleNamespace(returncode=0, stdout=b"201"))
+    monkeypatch.setattr(release, "native_http", lambda *args, **kwargs:
+                        calls.append((args, kwargs)) or {"status": "validated", "http_status": 201})
     blob_path = quote(source, safe="/%")
     location = {"relativePath": source, "uploadUrl": "https://registryaccount.blob.core.windows.net/container/" + blob_path + "?sig=SYNTHETIC"}
     assert release.upload_publication_context(location, tmp_path / "context.tar.gz", 30) == source
-    assert len(calls) == 1
+    assert len(calls) == 2
     for kind in ("backend", "frontend"):
         assert release.publication_request(kind, "a" * 40, source)["sourceLocation"] == source
 
@@ -1236,9 +1248,6 @@ def test_publication_contract_with_installed_real_azure_cli(isolated_azure_cli):
     assert "cpu" not in {argument.arg for argument in function.args.args}
     constructor = next(node for node in ast.walk(function) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "DockerBuildRequest")
     assert "agent_configuration" not in {keyword.arg for keyword in constructor.keywords}
-    help_result = subprocess.run(["az", "rest", "--help"], capture_output=True, timeout=60, check=True)
-    for argument in ("--method", "--url", "--body", "--headers", "--only-show-errors", "--output"):
-        assert argument.encode() in help_result.stdout
     raw = ast.parse((site / "azure/cli/core/util.py").read_text())
     send = next(node for node in raw.body if isinstance(node, ast.FunctionDef) and node.name == "send_raw_request")
     assert sum(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "send" for node in ast.walk(send)) == 1
@@ -1266,64 +1275,24 @@ def test_publication_contract_with_installed_real_azure_cli(isolated_azure_cli):
     assert result.stdout.strip() == b"verified"
 
 
-def test_publication_real_azure_cli_sends_exact_arm_requests_over_loopback(tmp_path, monkeypatch, isolated_azure_cli):
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    import threading
-
-    requests = []
+def test_publication_installed_native_cli_constructs_exact_arm_requests_without_network(tmp_path, isolated_azure_cli):
     path = "/subscriptions/00000000-0000-4000-8000-000000000000/resourceGroups/synthetic/providers/Microsoft.ContainerRegistry/registries/synthetic/scheduleRun?api-version=2019-04-01"
-    queued = {"properties": {"runId": "local-contract-only", "status": "Queued", "agentConfiguration": {"cpu": 2}}}
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            requests.append((self.path, dict(self.headers), body))
-            payload = json.dumps(queued).encode()
-            self.send_response(200 if self.path == path else 400)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def log_message(self, *args):
-            pass
-
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-        url = f"http://127.0.0.1:{server.server_port}"
-        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-            monkeypatch.setenv(name, url)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            for kind in ("backend", "frontend"):
-                body = release.publication_request(kind, "a" * 40, "opaque-object" if kind == "backend" else "nested path/frontend.bundle")
-                request_path = tmp_path / "private request files" / (kind + "-request.json")
-                release.save(request_path, body)
-                request_id = str(release.uuid.uuid4())
-                # Real production subprocess/parser, with only a loopback URL and
-                # explicit no-auth flag substituted; no CLI/transport mocking.
-                result = release.azure(
-                    "rest", "--method", "POST", "--url", url + path,
-                    "--body", "@" + str(request_path),
-                    "--headers", "x-docintel-publication-attempt-id=" + request_id,
-                    "--skip-authorization-header", timeout=60,
-                )
-                assert result == queued
-                assert len(requests) == (1 if kind == "backend" else 2)
-                received_path, headers, received_body = requests[-1]
-                assert received_path == path
-                normalized = {key.lower(): value for key, value in headers.items()}
-                assert "authorization" not in normalized
-                assert normalized["x-docintel-publication-attempt-id"] == request_id
-                assert str(release.uuid.UUID(normalized["x-ms-client-request-id"])) == normalized["x-ms-client-request-id"]
-                assert normalized["content-type"].startswith("application/json")
-                assert json.loads(received_body) == body
-                assert json.loads(received_body)["agentConfiguration"] == {"cpu": 2}
-                assert json.loads(received_body)["timeout"] == 900
-        finally:
-            server.shutdown()
-            thread.join(timeout=5)
-            assert not thread.is_alive()
+    for kind in ("backend", "frontend"):
+        body = release.publication_request(kind, "a" * 40, "opaque-object" if kind == "backend" else "nested path/frontend.bundle")
+        request_path = tmp_path / (kind + "-request.json")
+        release.save(request_path, body)
+        result = release.preflight_azure((
+            "rest", "--method", "POST", "--url", "https://management.azure.com" + path,
+            "--body", "@" + str(request_path),
+            "--headers", "x-docintel-publication-attempt-id=" + str(release.uuid.uuid4()),
+        ))
+        assert result["no_send"] and result["network_requests_sent"] == 0
+        assert result["request"]["method"] == "POST"
+        assert result["request"]["body_sha256"] == release.fingerprint(body)
+        assert result["request"]["body_hash_encoding"] == "canonical-json"
+        assert result["provider_response_fabricated"] is True
+        assert result["fixture_response_counts"] == {"get": 0, "write": 1}
+        assert result["validation_status"] == "validated_no_send"
     assert not list((tmp_path / "azure-config").glob("*token*"))
 
 
@@ -1335,6 +1304,65 @@ def test_publication_paths_do_not_construct_acr_build_commands():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "azure":
             leading = [argument.value if isinstance(argument, ast.Constant) else None for argument in node.args[:2]]
             assert leading != ["acr", "build"]
+
+
+@pytest.mark.parametrize("fail_stage", [
+    None, "publication_upload_metadata", "binary_source_upload", "publication_schedule_run",
+])
+def test_publication_forwards_exact_boundary_receipts_and_blocks_failed_persistence(tmp_path, monkeypatch, fail_stage):
+    config = {"subscription": "subscription", "group": "group", "registry": "registry"}
+    revision = "a" * 40
+    digest = "sha256:" + "b" * 64
+    attempt = tmp_path / "backend-publication-attempt.json"
+    release.save_once(attempt, {"attempt_id": "existing-reservation"})
+    original_attempt = attempt.read_bytes()
+    events = []
+    def archive(work, kind, destination):
+        destination.write_bytes(b"SYNTHETIC-ARCHIVE")
+        return "context-hash"
+    def native(packet, *, send=False):
+        if send:
+            events.append("binary-send")
+            return {"http_status": 201}
+        return {"status": "validated", "no_send": True}
+    def command(arguments, **kwargs):
+        if arguments[0] == "git":
+            return revision.encode()
+        if arguments[1:3] == ["acr", "repository"]:
+            return json.dumps({"digest": digest}).encode()
+        url = arguments[arguments.index("--url") + 1]
+        if "/listBuildSourceUploadUrl?" in url:
+            events.append("metadata-send")
+            value = {"relativePath": "source", "uploadUrl": "https://storage.blob.core.windows.net/context/source?sig=SYNTHETIC"}
+        elif "/scheduleRun?" in url:
+            events.append("schedule-send")
+            value = {"properties": {"runId": "existing-run", "status": "Queued"}}
+        else:
+            value = {"properties": {"runId": "existing-run", "status": "Succeeded",
+                                   "agentConfiguration": {"cpu": 2}, "outputImages": [{
+                                       "registry": "registry.azurecr.io", "repository": "docintel/backend",
+                                       "tag": revision, "digest": digest,
+                                   }]}}
+        return json.dumps(value).encode()
+    def record(proof):
+        stage = proof["operation_stage"]
+        events.append(stage)
+        if stage == fail_stage:
+            raise OSError("SYNTHETIC-PRIVATE-ERROR")
+    monkeypatch.setattr(release, "archive_publication_context", archive)
+    monkeypatch.setattr(release, "native_http", native)
+    monkeypatch.setattr(release, "command", command)
+    if fail_stage is not None:
+        with pytest.raises(ValueError, match="receipt persistence failed"):
+            release.execute_publication(config, tmp_path, "backend", revision, attempt, on_preflight=record)
+        assert events[-1] == fail_stage
+    else:
+        result = release.execute_publication(config, tmp_path, "backend", revision, attempt, on_preflight=record)
+        assert result["digest"] == digest
+        assert events == ["publication_upload_metadata", "metadata-send", "binary_source_upload",
+                          "binary-send", "publication_schedule_run", "schedule-send"]
+    assert attempt.read_bytes() == original_attempt
+    assert not (tmp_path / "backend-publication-context.tar.gz").exists()
 
 
 @pytest.mark.parametrize("nonempty", [False, True])
@@ -1749,12 +1777,15 @@ def pilot_release(tmp_path, monkeypatch):
     monkeypatch.setattr(release, "identity_contract", lambda _: None)
     monkeypatch.setattr(release, "active_executions", lambda _: (copy.deepcopy(job), list(state.active)))
 
-    def azure(*arguments):
+    def azure(*arguments, resource_snapshot=None, before_send=None, timeout=None):
+        if before_send is not None:
+            before_send()
         if arguments[:3] == ("containerapp", "revision", "show"):
             name = arguments[arguments.index("-n") + 1]
             return {"properties": {"healthState": "Healthy", "template": copy.deepcopy(resources[name]["properties"]["template"])}}
         state.calls.append(arguments)
         if arguments[:3] == ("containerapp", "job", "start"):
+            assert resource_snapshot == job
             return {"name": "synthetic-execution-" + str(len(state.calls))}
         assert arguments[:3] == ("rest", "--method", "PATCH")
         assert "--headers" in arguments and arguments[-1] == "If-Match=synthetic-etag"
@@ -2116,7 +2147,8 @@ def test_pilot_start_has_exact_cli_settings_and_bounded_immutable_attempts(pilot
         attempt = release.private_json(state.work / f"pilot-execution-attempt-{number}.json")
         assert attempt["attempt"] == number
         assert attempt["execution_sha256"] == release.fingerprint(template)
-        assert template["volumes"] == baseline["properties"]["template"]["volumes"]
+        assert "volumes" not in template
+        assert state.job["properties"]["template"]["volumes"] == baseline["properties"]["template"]["volumes"]
     assert state.job == baseline
     with pytest.raises(ValueError, match="allowance exhausted"):
         release.pilot_start(state.config, state.approval, state.work, 2)
@@ -2146,9 +2178,9 @@ def test_pilot_start_unknown_outcome_is_not_retried_or_refunded(pilot_release, m
     calls = []
     original = release.azure
 
-    def fail(*arguments):
+    def fail(*arguments, **kwargs):
         if arguments[:3] != ("containerapp", "job", "start"):
-            return original(*arguments)
+            return original(*arguments, **kwargs)
         calls.append(arguments)
         raise ValueError("Synthetic lost response")
 

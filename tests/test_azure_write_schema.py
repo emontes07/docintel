@@ -1,11 +1,14 @@
 """Pinned official request bodies and transport gates; no live writes or credentials."""
 
 import copy
+import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,14 +26,18 @@ EXAMPLES = [
 
 
 @pytest.fixture(autouse=True)
-def offline(monkeypatch):
+def offline(monkeypatch, request):
     monkeypatch.setattr("socket.socket.connect", lambda *a, **k: pytest.fail("No network"))
     monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: pytest.fail("No network"))
     schema._documents.cache_clear()
     schema._contract.cache_clear()
+    schema.action_contract.cache_clear()
+    if "installed_native" not in request.node.name:
+        monkeypatch.setattr(release, "preflight_azure", lambda *a, **k: {"no_send": True})
     yield
     schema._documents.cache_clear()
     schema._contract.cache_clear()
+    schema.action_contract.cache_clear()
 
 
 def example(filename, member):
@@ -403,19 +410,355 @@ def test_blob_publication_remains_a_separate_specific_binary_put_contract(tmp_pa
         calls.append(arguments)
         assert "SYNTHETIC-SAS" not in repr(arguments)
         assert b"SYNTHETIC-SAS" in kwargs["input"]
-        assert arguments[arguments.index("--request") + 1] == "PUT"
-        assert arguments[arguments.index("--header") + 1] == "x-ms-blob-type: BlockBlob"
-        assert arguments[arguments.index("--upload-file") + 1] == str(archive)
-        return subprocess.CompletedProcess(arguments, 0, stdout=b"201", stderr=b"")
+        packet = json.loads(kwargs["input"])
+        assert packet["method"] == "PUT" and packet["headers"]["x-ms-blob-type"] == "BlockBlob"
+        assert packet["archive"] == str(archive)
+        return subprocess.CompletedProcess(arguments, 0, stdout=json.dumps({
+            "status": "validated", "no_send": arguments[-1] == "--native-http-no-send", "http_status": 201,
+        }).encode(), stderr=b"")
     monkeypatch.setattr(release.subprocess, "run", transport)
     assert release.upload_publication_context(upload, archive, 30) == upload["relativePath"]
     invalid = {**upload, "uploadUrl": "https://management.azure.com/unapproved?sig=SYNTHETIC-SAS"}
     with pytest.raises(release.PublicationUploadError):
         release.upload_publication_context(invalid, archive, 30)
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 def test_stdlib_only_direct_script_cli_keeps_preinstall_staging_importable():
     result = subprocess.run([sys.executable, "-S", str(release.ROOT / "scripts/release.py"), "--help"],
                             capture_output=True, check=False, timeout=20)
     assert result.returncode == 0 and not result.stderr
+
+
+ACR_URL = ("https://management.azure.com/subscriptions/00000000-0000-4000-8000-000000000000/"
+           "resourceGroups/group/providers/Microsoft.ContainerRegistry/registries/registry")
+JOB_ID = ("/subscriptions/00000000-0000-4000-8000-000000000000/resourceGroups/group/"
+          "providers/Microsoft.App/jobs/worker")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("type", "FileTaskRunRequest"), ("agentConfiguration", {"cpu": 4}), ("timeout", 901),
+    ("unexpected", True), ("platform", {"os": "not-linux"}),
+])
+def test_acr_selected_official_variant_rejects_wrong_type_budget_or_unknown_member(field, value):
+    payload = release.publication_request("backend", "a" * 40, "source")
+    payload[field] = value
+    with pytest.raises(schema.WriteSchemaError):
+        schema.validate_request("POST", ACR_URL + "/scheduleRun?api-version=2019-04-01", payload)
+
+
+@pytest.mark.parametrize("suffix,payload", [
+    ("/listBuildSourceUploadUrl?api-version=2019-04-01", {}),
+    ("/unknown?api-version=2019-04-01", None),
+    ("/scheduleRun?api-version=2025-01-01", {}),
+])
+def test_no_unmodeled_post_or_bodyless_operation_bypass(suffix, payload):
+    with pytest.raises(schema.WriteSchemaError):
+        schema.validate_request("POST", ACR_URL + suffix, payload)
+
+
+def test_installed_native_cli_start_uses_captured_get_and_validates_original_template(tmp_path):
+    if not shutil.which("az"):
+        pytest.skip("Release-host installed Azure CLI required")
+    template = {"containers": [{"name": "worker", "image": "registry.invalid/image@sha256:" + "a" * 64,
+                                 "resources": {"cpu": 1, "memory": "2Gi"}}]}
+    job = {"id": JOB_ID, "name": "worker", "properties": {
+        "configuration": {"triggerType": "Manual"}, "template": copy.deepcopy(template),
+    }}
+    candidate = tmp_path / "execution.json"
+    candidate.write_text(json.dumps(template))
+    args = ("containerapp", "job", "start", "--subscription", "00000000-0000-4000-8000-000000000000",
+            "-g", "group", "-n", "worker", "--yaml", str(candidate))
+    result = release.preflight_azure(args, resource_snapshot=job)
+    assert result["no_send"] and result["network_requests_sent"] == 0
+    assert result["request"]["method"] == "POST"
+    assert result["api_version"] in schema.NATIVE_JOB_START_ACTIONS
+    assert result["provider_response_fabricated"] is True
+    assert result["fixture_response_counts"] == {"get": 1, "write": 1}
+    assert result["authentication_performed"] is False and result["provider_send_performed"] is False
+    template["containers"][0]["resources"]["cpu"] = "1"
+    candidate.write_text(json.dumps(template))
+    with pytest.raises(schema.WriteSchemaError):
+        release.preflight_azure(args, resource_snapshot=job)
+    assert job["properties"]["template"]["containers"][0]["resources"]["cpu"] == 1
+
+
+def test_installed_native_cli_parser_rejects_unknown_option_before_live_command(monkeypatch):
+    if not shutil.which("az"):
+        pytest.skip("Release-host installed Azure CLI required")
+    monkeypatch.setattr(release, "command", lambda *a, **k: pytest.fail("No live command"))
+    with pytest.raises(ValueError):
+        release.azure("rest", "--method", "POST", "--url",
+                      ACR_URL + "/listBuildSourceUploadUrl?api-version=2019-04-01",
+                      "--headers", "valid=value", "unexpected-positional")
+
+
+def test_installed_native_cli_stop_is_canonical_and_unknown_legacy_route_rejected():
+    if not shutil.which("az"):
+        pytest.skip("Release-host installed Azure CLI required")
+    args = ("containerapp", "job", "stop", "--subscription", "00000000-0000-4000-8000-000000000000",
+            "-g", "group", "-n", "worker", "--job-execution-name", "execution")
+    canonical = release.canonical_job_stop(args)
+    assert "/jobs/worker/executions/execution/stop?" in canonical[-1]
+    assert release.preflight_azure(args)["no_send"]
+    with pytest.raises(schema.WriteSchemaError):
+        schema.validate_request("POST", "https://management.azure.com" + JOB_ID
+                                + "/stop/execution?api-version=2025-01-01", None)
+
+
+@pytest.mark.parametrize("contract", ["binary_blob", "job_secret"])
+def test_installed_native_http_request_prepares_without_network_or_owner_keys(tmp_path, monkeypatch, contract):
+    if not shutil.which("az"):
+        pytest.skip("Release-host native requests runtime required")
+    monkeypatch.setenv("WEBIQ_API_KEY", "MUST-NOT-BE-READ")
+    if contract == "binary_blob":
+        archive = tmp_path / "archive.tar.gz"
+        archive.write_bytes(b"synthetic")
+        packet = {"contract": contract, "method": "PUT", "timeout": 30,
+                  "url": "https://storage.blob.core.windows.net/container/blob?sig=NO-SEND",
+                  "archive": str(archive),
+                  "headers": {"x-ms-version": "2024-08-04", "x-ms-blob-type": "BlockBlob",
+                              "Content-Type": "application/octet-stream", "Content-Length": archive.stat().st_size}}
+    else:
+        packet = {"contract": contract, "method": "PATCH", "timeout": 30,
+                  "url": "https://management.azure.com" + JOB_ID + "?api-version=2024-03-01",
+                  "payload": {"properties": {"configuration": {"triggerType": "Manual", "replicaTimeout": 600,
+                                                               "secrets": [{"name": "existing-reference"}]}}},
+                  "headers": {"Content-Type": "application/json"}}
+    result = release.native_http(packet)
+    assert result["no_send"] is True and result["status"] == "validated"
+    expected_body = (archive.read_bytes() if contract == "binary_blob"
+                     else json.dumps(packet["payload"], separators=(",", ":")).encode())
+    assert result["body_sha256"] == hashlib.sha256(expected_body).hexdigest()
+    assert result["body_bytes"] == len(expected_body)
+    assert result["request_sha256"] == hashlib.sha256(
+        (packet["method"] + "\n" + packet["url"] + "\n").encode() + expected_body,
+    ).hexdigest()
+    assert result["validation_status"] == "validated_no_send"
+    assert result["provider_response_fabricated"] is False
+    assert result["fixture_response_counts"] == {"get": 0, "write": 0}
+    assert result["network_calls"] == result["credential_real_calls"] == result["transport_real_calls"] == 0
+    assert "MUST-NOT-BE-READ" not in json.dumps(result)
+    packet["headers"]["Content-Length"] = 0 if contract == "binary_blob" else "invalid"
+    with pytest.raises(ValueError):
+        release.native_http(packet)
+
+
+def test_native_preflight_precedes_existing_window_check_and_send(monkeypatch):
+    events = []
+    monkeypatch.setattr(release, "preflight_azure", lambda *a, **k: events.append("no-send"))
+    monkeypatch.setattr(release, "command", lambda *a, **k: events.append("send") or b"{}")
+    def window():
+        events.append("window")
+        raise ValueError("Full window expired")
+    with pytest.raises(ValueError, match="window"):
+        release.azure("rest", "--method", "POST", "--url",
+                      ACR_URL + "/listBuildSourceUploadUrl?api-version=2019-04-01", before_send=window)
+    assert events == ["no-send", "window"]
+
+
+def test_installed_native_deployment_readiness_uses_only_supplied_shapes(tmp_path, monkeypatch):
+    if not shutil.which("az"):
+        pytest.skip("Release-host installed Azure CLI required")
+    monkeypatch.setattr(release, "azure", lambda *a, **k: pytest.fail("No Azure calls"))
+    monkeypatch.setattr(gap, "existing_webiq_key", lambda: pytest.fail("No key reads"))
+    template = {"containers": [{"name": "worker", "image": "registry.invalid/retained"}]}
+    worker = {"id": JOB_ID, "name": "worker", "properties": {
+        "configuration": {"triggerType": "Manual"}, "template": copy.deepcopy(template),
+    }}
+    backend = {"id": JOB_ID.replace("/jobs/worker", "/containerApps/api"), "location": "westus",
+               "properties": {"template": copy.deepcopy(template)}}
+    before = copy.deepcopy((worker, backend, template))
+    config = {"subscription": "00000000-0000-4000-8000-000000000000", "group": "group",
+              "job": "worker", "registry": "registry"}
+    result = release.preflight_deployment(config, backend, worker, template)
+    assert result["no_send"] and len(result["requests"]) == 4
+    assert "actual_binary_archive" in result["pending_dynamic_boundary"]
+    assert (worker, backend, template) == before
+    assert not list(release.ROOT.glob(".native-write-preflight-*"))
+    assert not list(release.ROOT.glob(".native-deployment-template-*"))
+
+
+@pytest.mark.parametrize("arguments", [
+    ("deployment", "group", "create"), ("storage", "blob", "upload-batch"),
+    ("acr", "build"), ("rest", "--method", "DELETE", "--url", "https://management.azure.com"),
+])
+def test_unmodeled_bootstrap_writes_never_bypass_native_contract(monkeypatch, arguments):
+    monkeypatch.setattr(release, "command", lambda *a, **k: pytest.fail("No live command"))
+    with pytest.raises(schema.WriteSchemaError):
+        release.azure(*arguments)
+
+
+@pytest.mark.parametrize("arguments", [
+    ("cognitiveservices", "account", "deployment", "show"),
+    ("cognitiveservices", "account", "show"), ("role", "assignment", "list"),
+    ("ad", "signed-in-user", "show"),
+])
+def test_existing_capacity_and_preparation_reads_are_preserved(monkeypatch, arguments):
+    calls = []
+    monkeypatch.setattr(release, "command", lambda *a, **k: calls.append(a) or b"{}")
+    assert release.azure(*arguments) == {}
+    assert len(calls) == 1
+
+
+def test_native_construction_failure_stops_before_owner_key_or_token(monkeypatch):
+    def fail(*args, **kwargs):
+        raise ValueError("Native client cannot construct request")
+    monkeypatch.setattr(release, "native_http", fail)
+    monkeypatch.setattr(release, "azure", lambda *a, **k: pytest.fail("No token request"))
+    monkeypatch.setattr(gap, "existing_webiq_key", lambda: pytest.fail("No key read"))
+    config = {"subscription": "00000000-0000-4000-8000-000000000000", "group": "group", "job": "worker"}
+    payload = {"properties": {"configuration": {"triggerType": "Manual", "replicaTimeout": 600,
+                                               "secrets": [{"name": "existing"}]}}}
+    with pytest.raises(ValueError, match="Native client"):
+        gap.send_existing_secret_patch(config, {"id": JOB_ID}, payload,
+                                       secret_ref="existing", check_window=lambda: None)
+
+
+def test_execution_override_projection_retains_job_only_settings_in_original_snapshot():
+    template = {"containers": [{"name": "worker", "image": "retained",
+                                 "resources": {"cpu": 1, "memory": "2Gi", "ephemeralStorage": "4Gi"}}],
+                "initContainers": None, "volumes": [{"name": "retained", "storageType": "EmptyDir"}]}
+    original = copy.deepcopy(template)
+    result = release.writable_execution_template(template)
+    assert template == original
+    assert "volumes" not in result and "initContainers" not in result
+    assert "ephemeralStorage" not in result["containers"][0]["resources"]
+    schema.validate_action_payload("jobStart", result)
+    template["unmodeled"] = None
+    with pytest.raises(schema.WriteSchemaError, match="additionalProperties"):
+        release.writable_execution_template(template)
+
+
+@pytest.mark.parametrize("body", [None, b'{"b":2, "a":1}', '{"b":2, "a":1}', io.BytesIO(b"binary-body")])
+def test_wire_fingerprints_hash_exact_bytes_and_restore_stream_position(body):
+    request = SimpleNamespace(method="POST", url="https://management.azure.com/path?api-version=2024-03-01",
+                              body=body, headers={"Content-Type": "application/json"})
+    expected = body.getvalue() if isinstance(body, io.BytesIO) else body
+    expected = expected.encode() if isinstance(expected, str) else expected or b""
+    receipt = schema._wire_fingerprints(request)
+    assert receipt["body_bytes"] == len(expected)
+    assert receipt["body_sha256"] == hashlib.sha256(expected).hexdigest()
+    assert receipt["request_sha256"] == hashlib.sha256(
+        (request.method + "\n" + request.url + "\n").encode() + expected,
+    ).hexdigest()
+    assert receipt["api_version"] == "2024-03-01"
+    assert request.url not in json.dumps(receipt)
+    if isinstance(body, io.BytesIO):
+        assert body.tell() == 0 and body.read() == expected
+
+
+@pytest.mark.parametrize("fail_receipt", [False, True])
+def test_azure_receipt_hook_is_isolated_and_precedes_clock_and_send(monkeypatch, fail_receipt):
+    events = []
+    proof = {"status": "validated", "no_send": True, "request": {"body_sha256": "synthetic-hash"}}
+    original = copy.deepcopy(proof)
+    monkeypatch.setattr(release, "preflight_azure", lambda *a, **k: events.append("preflight") or proof)
+    monkeypatch.setattr(release, "command", lambda *a, **k: events.append("send") or b'{"actual_result":true}')
+    def record(value):
+        events.append("receipt")
+        assert value["operation_stage"] == "azure_write"
+        value["request"]["body_sha256"] = "caller-copy"
+        if fail_receipt:
+            raise OSError("SYNTHETIC-PRIVATE-RECEIPT-PATH")
+    def send():
+        return release.azure(
+            "rest", "--method", "POST", "--url", ACR_URL + "/listBuildSourceUploadUrl?api-version=2019-04-01",
+            on_preflight=record, before_send=lambda: events.append("window"),
+        )
+    if fail_receipt:
+        with pytest.raises(ValueError, match="receipt persistence failed") as error:
+            send()
+        assert "SYNTHETIC" not in str(error.value)
+        assert events == ["preflight", "receipt"]
+    else:
+        assert send() == {"actual_result": True}
+        assert events == ["preflight", "receipt", "window", "send"]
+    assert proof == original
+
+
+@pytest.mark.parametrize("fail_stage", [None, "worker_secret_redacted", "worker_secret_credential_bound"])
+def test_secret_receipt_hook_never_receives_keys_and_failed_receipt_blocks_send(monkeypatch, fail_stage):
+    events = []
+    retained = []
+    key, token = "SYNTHETIC-OWNER-KEY", "SYNTHETIC-ACCESS-TOKEN"
+    config = {"subscription": "00000000-0000-4000-8000-000000000000", "group": "group",
+              "job": "worker", "tenant": "tenant"}
+    payload = {"properties": {"configuration": {"triggerType": "Manual", "replicaTimeout": 600,
+                                               "secrets": [{"name": "existing"}]}}}
+    original = copy.deepcopy(payload)
+    def native(packet, *, send=False):
+        if send:
+            events.append("send")
+            return {"http_status": 200}
+        return {"status": "validated", "no_send": True, "body_sha256": release.fingerprint(packet["payload"])}
+    def record(receipt):
+        stage = receipt["operation_stage"]
+        events.append(stage)
+        assert key not in json.dumps(receipt) and token not in json.dumps(receipt)
+        if stage == fail_stage:
+            raise OSError("SYNTHETIC-PRIVATE-ERROR")
+        retained.append(copy.deepcopy(receipt))
+    monkeypatch.setattr(release, "native_http", native)
+    monkeypatch.setattr(gap, "existing_webiq_key", lambda: events.append("key") or key)
+    monkeypatch.setattr(release, "azure", lambda *a, **k: events.append("token") or {"accessToken": token})
+    def send():
+        gap.send_existing_secret_patch(
+            config, {"id": JOB_ID}, payload, secret_ref="existing",
+            check_window=lambda: events.append("window"), on_preflight=record,
+        )
+    if fail_stage is not None:
+        with pytest.raises(ValueError) as error:
+            send()
+        assert "SYNTHETIC" not in str(error.value) and "send" not in events
+        if fail_stage == "worker_secret_redacted":
+            assert events == [fail_stage]
+    else:
+        send()
+        assert events == ["worker_secret_redacted", "window", "key", "token",
+                          "worker_secret_credential_bound", "window", "send"]
+        assert len(retained) == 2 and retained[0]["body_sha256"] != retained[1]["body_sha256"]
+    assert payload == original
+
+
+@pytest.mark.parametrize("version,action", list(schema.NATIVE_JOB_START_ACTIONS.items()))
+def test_exact_installed_job_api_selection_uses_identical_pinned_original_input_contracts(version, action):
+    payload = {"containers": [{"name": "worker", "image": "retained",
+                               "resources": {"cpu": 1, "memory": "2Gi"}}]}
+    expected = {"method": "POST", "url": "https://management.azure.com" + JOB_ID
+                + "/start?api-version=2025-01-01", "body": payload}
+    before = copy.deepcopy(expected)
+    target = schema.native_job_start_url(expected, version, "2.90.0")
+    assert target.endswith("?api-version=" + version)
+    assert schema.action_for_url("POST", target) == action
+    assert schema.action_contract(action)["schema"] == schema.action_contract("jobStart")["schema"]
+    assert expected == before
+    payload["containers"][0]["resources"]["cpu"] = "1"
+    with pytest.raises(schema.WriteSchemaError):
+        schema.native_job_start_url(expected, version, "2.90.0")
+
+
+@pytest.mark.parametrize("version", ["2026-01-01", "2025-07-01-preview", "SYNTHETIC-PRIVATE"])
+def test_unknown_native_job_versions_fail_closed_with_sanitized_diagnostic(version):
+    with pytest.raises(schema.NativeCLIError) as error:
+        schema.native_job_start_url({}, version, "2.90.0")
+    assert error.value.diagnostic["reason"] == "unsupported_job_api_version"
+    assert error.value.diagnostic["client_version"] == "2.90.0"
+    assert "SYNTHETIC-PRIVATE" not in str(error.value)
+
+
+def test_installed_native_rejection_diagnostic_survives_parent_boundary_without_raw_details(monkeypatch):
+    monkeypatch.setattr(release, "native_cli_python", lambda: Path(sys.executable))
+    monkeypatch.setattr(release.subprocess, "run", lambda *a, **k: SimpleNamespace(
+        returncode=2, stdout=json.dumps({
+            "status": "rejected", "no_send": True,
+            "diagnostic": {"reason": "unsupported_job_api_version", "client_version": "2.90.0",
+                           "job_api_version": "2026-01-01", "captured_write_requests": 0,
+                           "raw_error": "SYNTHETIC-SECRET", "url": "SYNTHETIC-PRIVATE-URL"},
+        }).encode(), stderr=b"SYNTHETIC-SECRET",
+    ))
+    with pytest.raises(ValueError, match="unsupported_job_api_version") as error:
+        release.preflight_azure(("rest", "--method", "POST", "--url",
+                                 ACR_URL + "/listBuildSourceUploadUrl?api-version=2019-04-01"))
+    assert "2.90.0" in str(error.value) and "2026-01-01" in str(error.value)
+    assert "SYNTHETIC" not in str(error.value)

@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tarfile
 import time
@@ -60,10 +61,179 @@ def command(arguments, *, cwd=None, env=None, timeout=None):
     return completed.stdout
 
 
-def azure(*arguments, timeout=None):
+def _emit_preflight(callback, receipt, stage):
+    if callback is None:
+        return
+    require(callable(callback), "Native preflight receipt callback must be callable")
+    try:
+        callback({**copy.deepcopy(receipt), "operation_stage": stage})
+    except Exception:
+        raise ValueError("Native preflight receipt persistence failed; no request sent") from None
+
+
+def azure(*arguments, timeout=None, resource_snapshot=None, before_send=None, on_preflight=None):
+    arguments = canonical_job_stop(arguments)
     write_schema().validate_azure_arguments(arguments)
+    if azure_write(arguments):
+        proof = preflight_azure(arguments, resource_snapshot=resource_snapshot)
+        _emit_preflight(on_preflight, proof, "azure_write")
+    if before_send is not None:
+        before_send()
     output = command(["az", *arguments, "--only-show-errors", "-o", "json"], timeout=timeout)
     return json.loads(output) if output.strip() else None
+
+
+def azure_write(arguments):
+    return (tuple(arguments[:3]) == ("containerapp", "job", "start")
+            or bool(write_schema().validate_azure_arguments(arguments)))
+
+
+def cli_options(arguments, start):
+    require(len(arguments[start:]) % 2 == 0, "Exact native CLI option/value pairs required")
+    options = {}
+    for index in range(start, len(arguments), 2):
+        key = arguments[index]
+        require(key not in options, "Duplicate native CLI option")
+        options[key] = arguments[index + 1]
+    return options
+
+
+def canonical_job_stop(arguments):
+    if tuple(arguments[:3]) != ("containerapp", "job", "stop"):
+        return tuple(arguments)
+    options = cli_options(arguments, 3)
+    require(set(options) == {"--subscription", "-g", "-n", "--job-execution-name"},
+            "Only the exact reserved execution may be stopped")
+    url = (f"https://management.azure.com/subscriptions/{options['--subscription']}"
+           f"/resourceGroups/{options['-g']}/providers/Microsoft.App/jobs/{options['-n']}"
+           f"/executions/{options['--job-execution-name']}/stop?api-version=2025-01-01")
+    write_schema().validate_request("POST", url, None)
+    return ("rest", "--method", "POST", "--url", url)
+
+
+def native_cli_python():
+    executable = shutil.which("az")
+    require(executable, "Installed Azure CLI is required for no-send construction")
+    launcher = Path(executable).resolve()
+    text = launcher.read_text()
+    match = re.search(r"(/[^ \n\"']+/bin/python[\d.]*)[\"']? -Im azure\.cli", text)
+    if match:
+        interpreter = Path(match[1])
+    else:
+        interpreter = Path(text.splitlines()[0].removeprefix("#!").strip())
+    require(interpreter.is_absolute() and interpreter.is_file()
+            and re.fullmatch(r"python[\d.]*", interpreter.name), "Unsupported installed Azure CLI launcher")
+    return interpreter
+
+
+def preflight_azure(arguments, *, resource_snapshot=None):
+    """Construct the exact installed CLI request, without owner state or transport."""
+    arguments = canonical_job_stop(tuple(arguments))
+    descriptor = write_schema().validate_azure_arguments(arguments)
+    require(azure_write(arguments), "A modeled deployment/publication write is required")
+    if arguments[0] == "rest":
+        expected = descriptor
+        payload = expected["body"]
+        if "--headers" in arguments:
+            key, value = arguments[arguments.index("--headers") + 1].split("=", 1)
+            expected["headers"] = {key: value}
+        subscription = expected["url"].split("/subscriptions/")[1].split("/")[0]
+    else:
+        options = cli_options(arguments, 3)
+        require(set(options) == {"--subscription", "-g", "-n", "--yaml"},
+                "Exact start command with a JSON execution template required")
+        payload = json.loads(Path(options["--yaml"]).read_text())
+        resource_id = (f"/subscriptions/{options['--subscription']}/resourceGroups/{options['-g']}"
+                       f"/providers/Microsoft.App/jobs/{options['-n']}")
+        require(resource_snapshot and resource_snapshot.get("id", "").lower() == resource_id.lower(),
+                "Native no-send start requires the already captured current job")
+        expected = {"method": "POST", "url": "https://management.azure.com" + resource_id
+                    + "/start?api-version=2025-01-01", "body": payload}
+        subscription = options["--subscription"]
+    write_schema().validate_request(expected["method"], expected["url"], payload)
+    root = ROOT / (".native-write-preflight-" + uuid.uuid4().hex)
+    root.mkdir(mode=0o700)
+    try:
+        native_arguments = list(arguments)
+        if arguments[0] != "rest":
+            template = root / "template.json"
+            template.write_text(json.dumps(payload))
+            template.chmod(0o600)
+            native_arguments[native_arguments.index("--yaml") + 1] = str(template)
+        packet = {"state_directory": str(root), "arguments": [*native_arguments, "--only-show-errors", "-o", "json"],
+                  "expected": expected, "subscription": subscription, "resource_snapshot": resource_snapshot}
+        environment = {key: value for key, value in os.environ.items()
+                       if key in {"PATH", "SYSTEMROOT", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR"}}
+        result = subprocess.run(
+            [str(native_cli_python()), "-B", str(ROOT / "scripts" / "azure_write_schema.py"), "--native-cli-no-send"],
+            input=json.dumps(packet).encode(), capture_output=True, timeout=60, env=environment, cwd=ROOT,
+        )
+        receipt = json.loads(result.stdout) if result.stdout.strip() else {}
+        if result.returncode != 0 and isinstance(receipt.get("diagnostic"), dict):
+            diagnostic = write_schema().native_cli_diagnostic(receipt["diagnostic"])
+            raise ValueError("Native deployment request construction rejected; no write sent; diagnostic="
+                             + json.dumps(diagnostic, sort_keys=True))
+        require(result.returncode == 0 and receipt.get("status") == "validated" and receipt.get("no_send") is True,
+                "Native deployment request construction rejected; no write sent")
+        return receipt
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        raise ValueError("Native deployment request construction failed; no write sent") from None
+    finally:
+        shutil.rmtree(root)
+
+
+def native_http(packet, *, send=False):
+    """No generic URL transport: the child accepts only the two explicit contracts."""
+    environment = {key: value for key, value in os.environ.items()
+                   if key in {"PATH", "SYSTEMROOT", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR"}}
+    mode = "--native-http-send" if send else "--native-http-no-send"
+    try:
+        result = subprocess.run(
+            [str(native_cli_python()), "-B", str(ROOT / "scripts" / "azure_write_schema.py"), mode],
+            input=json.dumps(packet).encode(), capture_output=True,
+            timeout=packet["timeout"], env=environment, cwd=ROOT,
+        )
+        receipt = json.loads(result.stdout) if result.returncode == 0 else {}
+        require(receipt.get("status") == "validated" and receipt.get("no_send") is (not send),
+                "Native HTTP construction/transport failed; details withheld, no automatic retry")
+        return receipt
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        raise ValueError("Native HTTP construction/transport failed; details withheld, no automatic retry") from None
+
+
+def preflight_deployment(config, backend, worker, execution_template, *,
+                         api_payload=None, worker_payload=None, publication=None):
+    """Readiness check from supplied shapes only; no credentials, service reads or receipts."""
+    results = []
+    for resource, supplied, job in ((backend, api_payload, False), (worker, worker_payload, True)):
+        payload = supplied if supplied is not None else build_update_payload(
+            resource, safe_containers(resource), job=job,
+        )
+        url = "https://management.azure.com" + resource["id"] + "?api-version=2024-03-01"
+        results.append(preflight_azure(("rest", "--method", "PATCH", "--url", url, "--body", json.dumps(payload))))
+    root = ROOT / (".native-deployment-template-" + uuid.uuid4().hex)
+    root.mkdir(mode=0o700)
+    try:
+        template = root / "template.json"
+        template.write_text(json.dumps(execution_template))
+        template.chmod(0o600)
+        results.append(preflight_azure((
+            "containerapp", "job", "start", "--subscription", config["subscription"],
+            "-g", config["group"], "-n", config["job"], "--yaml", str(template),
+        ), resource_snapshot=worker))
+    finally:
+        shutil.rmtree(root)
+    registry = (f"https://management.azure.com/subscriptions/{config['subscription']}/resourceGroups/"
+                f"{config['group']}/providers/Microsoft.ContainerRegistry/registries/{config['registry']}")
+    results.append(preflight_azure(("rest", "--method", "POST", "--url",
+                                   registry + "/listBuildSourceUploadUrl?api-version=" + PUBLICATION_API_VERSION)))
+    if publication is not None:
+        results.append(preflight_azure(("rest", "--method", "POST", "--url",
+                                       registry + "/scheduleRun?api-version=" + PUBLICATION_API_VERSION,
+                                       "--body", json.dumps(publication))))
+    return {"status": "validated", "no_send": True, "requests": results,
+            "pending_dynamic_boundary": ["actual_source_upload_metadata", "actual_binary_archive",
+                                         "actual_schedule_request"] if publication is None else ["actual_binary_archive"]}
 
 
 def write_schema():
@@ -89,6 +259,16 @@ def build_update_payload(resource, containers, *, job=False, configuration=UNCHA
                 "The pinned Container Apps PATCH contract requires the observed resource location")
         members["location"] = resource["location"]
     return write_schema().build_payload(kind, "PATCH", **members)
+
+
+def writable_execution_template(template):
+    value = copy.deepcopy(template)
+    # Execution overrides cannot change the existing job's volume definitions.
+    value.pop("volumes", None)
+    for name in ("containers", "initContainers"):
+        if value.get(name) is not None:
+            value[name] = writable_containers(value[name])
+    return write_schema().project_action_payload("jobStart", value)
 
 
 def private_path(path):
@@ -620,14 +800,15 @@ def pilot_start(config, approval, work, item_limit):
             **approval["environment"], **pilot_values(approval),
             "DOCINTEL_REAL_PILOT_EXECUTION_SCOPE": scope,
         })
-        template["containers"] = writable_containers(template["containers"])
+        template = writable_execution_template(template)
         pilot_window(approval)
         fresh_job, running = active_executions(config)
         require(not running and fresh_job == job, "Worker changed before pilot start; inspect rather than overwrite drift")
         execution = work / f"pilot-execution-{number}.json"
         save_once(execution, template)
         save_once(work / f"pilot-execution-attempt-{number}.json", {"binding": binding, "attempt": number, "execution_sha256": fingerprint(template), "state": "start_attempted_completion_unknown"})
-        result = azure("containerapp", "job", "start", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"], "--yaml", str(execution))
+        result = azure("containerapp", "job", "start", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"],
+                       "--yaml", str(execution), resource_snapshot=fresh_job, before_send=lambda: pilot_window(approval))
         require(isinstance(result, dict) and isinstance(result.get("name"), str) and result["name"], "Worker start outcome unknown; no automatic retry")
         save_once(work / f"pilot-execution-result-{number}.json", {"binding": binding, "attempt": number, "execution_name": result["name"]})
 
@@ -1240,23 +1421,19 @@ def validate_publication_upload(upload, *, now=None, valid_until=None):
     return source
 
 
-def upload_publication_context(upload, archive, timeout):
+def upload_publication_context(upload, archive, timeout, *, before_send=None, on_preflight=None):
     source = validate_publication_upload(upload)
     require(Path(archive).is_file() and type(timeout) in (int, float) and 0 < timeout < float("inf"),
             "Binary Blob PUT requires an existing archive and a finite positive timeout")
-    url = upload["uploadUrl"]
-    # The SAS travels only over stdin, never argv, receipts, or diagnostic output.
-    try:
-        result = subprocess.run([
-            "curl", "--disable", "--silent", "--show-error", "--fail",
-            "--proto", "=https", "--retry", "0", "--max-redirs", "0",
-            "--request", "PUT", "--header", "x-ms-blob-type: BlockBlob",
-            "--upload-file", str(archive), "--max-time", str(timeout),
-            "--write-out", "%{http_code}", "--config", "-",
-        ], input=("url = " + json.dumps(url) + "\n").encode(), capture_output=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
-        raise ValueError("Private build-source upload failed or timed out; details withheld, no automatic retry") from None
-    require(result.returncode == 0 and result.stdout == b"201", "Private build-source upload failed; details withheld, no automatic retry")
+    packet = {"contract": "binary_blob", "method": "PUT", "url": upload["uploadUrl"],
+              "archive": str(Path(archive).resolve()), "timeout": timeout,
+              "headers": {"x-ms-blob-type": "BlockBlob", "x-ms-version": "2024-08-04",
+                          "Content-Type": "application/octet-stream", "Content-Length": Path(archive).stat().st_size}}
+    _emit_preflight(on_preflight, native_http(packet), "binary_source_upload")
+    if before_send is not None:
+        before_send()
+    result = native_http(packet, send=True)
+    require(result["http_status"] == 201, "Private build-source upload failed; details withheld, no automatic retry")
     return source
 
 
@@ -1276,7 +1453,8 @@ def publication_metadata_preflight(config, work, revision, approval):
     resource = f"https://management.azure.com/subscriptions/{config['subscription']}/resourceGroups/{config['group']}/providers/Microsoft.ContainerRegistry/registries/{config['registry']}"
     try:
         supplemental_upload_window(approval)
-        upload = azure("rest", "--method", "POST", "--url", resource + "/listBuildSourceUploadUrl?api-version=" + PUBLICATION_API_VERSION, timeout=60)
+        upload = azure("rest", "--method", "POST", "--url", resource + "/listBuildSourceUploadUrl?api-version=" + PUBLICATION_API_VERSION,
+                       timeout=60, before_send=lambda: supplemental_upload_window(approval))
     except (ValueError, OSError, TypeError):
         save_once(work / "metadata-preflight-result.json", {**binding, "stage": "metadata_request", "status": "failed_or_unknown"})
         raise ValueError("Supplemental metadata request failed or is unknown; no upload/build reserved, no retry") from None
@@ -1310,7 +1488,7 @@ def build_publication(config, work, kind, revision, *, replacement=None, supplem
 
 
 def execute_publication(config, work, kind, revision, attempt, *, expires=None,
-                        upload_metadata=None, validate_upload_window=False):
+                        upload_metadata=None, validate_upload_window=False, on_preflight=None):
     """Execute an already reserved attempt; callers own the immutable authority."""
     require(attempt.is_file(), "Publication must be reserved before requesting upload metadata")
     stem = attempt.name.removesuffix("-attempt.json")
@@ -1326,10 +1504,19 @@ def execute_publication(config, work, kind, revision, attempt, *, expires=None,
         require(seconds > 0, "Publication observation deadline reached; outcome unknown, never resubmit")
         return min(maximum, seconds)
 
+    def build_window():
+        require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no next upload/queue action")
+
     def rest(method, suffix, *arguments):
-        if method == "POST" and expires is not None:
-            require(remaining(1200) >= 900, "Insufficient approved time remains for a 900-second build; no next upload/queue action")
-        return azure("rest", "--method", method, "--url", resource + suffix + "?api-version=" + PUBLICATION_API_VERSION, *arguments, timeout=remaining())
+        hooks = {}
+        if method == "POST":
+            build_window()
+            if on_preflight is not None:
+                stage = ("publication_upload_metadata" if suffix == "/listBuildSourceUploadUrl"
+                         else "publication_schedule_run")
+                hooks["on_preflight"] = lambda proof: _emit_preflight(on_preflight, proof, stage)
+        return azure("rest", "--method", method, "--url", resource + suffix + "?api-version=" + PUBLICATION_API_VERSION,
+                     *arguments, timeout=remaining(), before_send=build_window if method == "POST" else None, **hooks)
 
     try:
         context_hash = archive_publication_context(work, kind, archive)
@@ -1343,7 +1530,8 @@ def execute_publication(config, work, kind, revision, attempt, *, expires=None,
         if validate_upload_window:
             now, valid_until = supplemental_upload_window({"expires_at": expires.isoformat()})
             validate_publication_upload(upload, now=now, valid_until=valid_until)
-        source = upload_publication_context(upload, archive, remaining(120))
+        hooks = {"on_preflight": on_preflight} if on_preflight is not None else {}
+        source = upload_publication_context(upload, archive, remaining(120), before_send=build_window, **hooks)
         body = publication_request(kind, revision, source)
         body_path = work / (stem + "-request.json")
         save_once(body_path, body)
@@ -1701,14 +1889,15 @@ def run(options):
         require(not running, "A worker execution is already active")
         settings = job["properties"]["configuration"]
         require(settings["replicaRetryLimit"] == 0 and settings["replicaTimeout"] == 600, "Unexpected worker retry/timeout configuration")
-        template = job["properties"]["template"]
+        template = copy.deepcopy(job["properties"]["template"])
         require(len(template["containers"]) == 1, "Unexpected worker containers")
         container = template["containers"][0]
         require(container["image"] == image(config, "backend"), "Worker image mismatch")
         require(any(entry["name"] == "DOCINTEL_BATCH_LIVE_ENABLED" and entry.get("value") == "false" for entry in container["env"]), "Worker live AI must be disabled")
         container["args"] = ["-m", "backend.batch_worker", "--concurrency", "2", "--max-batches", "1", "--item-limit", str(options.item_limit), "--synthetic-acceptance", "--batch-id", options.batch_id]
+        template = writable_execution_template(template)
         save(work / "execution.json", template)
-        result = azure("containerapp", "job", "start", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"], "--yaml", str(work / "execution.json"))
+        result = azure("containerapp", "job", "start", "--subscription", config["subscription"], "-g", config["group"], "-n", config["job"], "--yaml", str(work / "execution.json"), resource_snapshot=job)
         save(work / "last-execution.json", result)
     elif options.action == "stop":
         stop(config)

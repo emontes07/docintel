@@ -186,6 +186,8 @@ def row_state(final_state, monkeypatch):
 
     def azure(*args, **kwargs):
         if args[:3] == ("containerapp", "job", "start"):
+            assert kwargs["resource_snapshot"] == state.job
+            kwargs["before_send"]()
             state.calls.append(args)
             return {"name": "fourth-worker"}
         if args[:4] == ("containerapp", "job", "execution", "list"):

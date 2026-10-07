@@ -420,11 +420,14 @@ def test_credential_transport_uses_stdin_only_and_does_not_change_redacted_paylo
 
     def transport(arguments, **kwargs):
         assert key not in repr(arguments) and token not in repr(arguments)
-        assert key.encode() in kwargs["input"] and token.encode() in kwargs["input"]
         assert "WEBIQ_API_KEY" not in kwargs["env"]
-        assert arguments[arguments.index("--retry") + 1] == "0"
-        assert arguments[arguments.index("--config") + 1] == "-"
-        return SimpleNamespace(returncode=0, stdout=b"200", stderr=b"")
+        packet = json.loads(kwargs["input"])
+        if arguments[-1] == "--native-http-send":
+            assert key.encode() in kwargs["input"] and token.encode() in kwargs["input"]
+        assert packet["method"] == "PATCH"
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "status": "validated", "no_send": arguments[-1] == "--native-http-no-send", "http_status": 200,
+        }).encode(), stderr=b"")
 
     monkeypatch.setattr(gap.subprocess, "run", transport)
     gap.secure_worker_patch(state.work, config, state.decision, resource, payload)
@@ -450,15 +453,21 @@ def test_credential_transport_failure_is_sanitized_without_retry(
     calls = []
 
     def transport(*args, **kwargs):
+        if args[0][-1] == "--native-http-no-send":
+            return SimpleNamespace(returncode=0, stdout=b'{"status":"validated","no_send":true}')
         calls.append(1)
-        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=b"SYNTHETIC-KEY SYNTHETIC-TOKEN")
+        if expected_status is None:
+            return SimpleNamespace(returncode=1, stdout=stdout, stderr=b"SYNTHETIC-KEY SYNTHETIC-TOKEN")
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "status": "validated", "no_send": False, "http_status": expected_status,
+        }).encode())
 
     monkeypatch.setattr(gap.subprocess, "run", transport)
     with pytest.raises(gap.WorkerPatchFailure, match="details withheld, no retry") as error:
         gap.secure_worker_patch(state.work, config, state.decision, resource, payload)
     assert error.value.metadata() == {
         "phase": "worker_patch", "http_status": expected_status,
-        "curl_returncode": returncode, "retry_permitted": False,
+        "curl_returncode": None, "retry_permitted": False,
     }
     assert "SYNTHETIC" not in str(error.value) and calls == [1]
 
@@ -484,6 +493,8 @@ def test_credential_phase_failures_and_timeout_never_expose_raw_details(state, m
         return {"accessToken": "SYNTHETIC-TOKEN"}
 
     def transport(*args, **kwargs):
+        if args[0][-1] == "--native-http-no-send":
+            return SimpleNamespace(returncode=0, stdout=b'{"status":"validated","no_send":true}')
         calls.append("worker_patch")
         raise gap.subprocess.TimeoutExpired(["curl"], 70, output=b"", stderr=b"SYNTHETIC-KEY SYNTHETIC-TOKEN")
 
@@ -586,12 +597,11 @@ def test_worker_patch_preserves_configuration_and_records_no_key(state, monkeypa
         monkeypatch.setattr(gap.release, "save_once", save)
 
     def transport(arguments, **kwargs):
-        encoded = next(line.removeprefix("data = ") for line in kwargs["input"].decode().splitlines()
-                       if line.startswith("data = "))
-        payload = json.loads(json.loads(encoded))
+        if arguments[-1] == "--native-http-no-send":
+            return SimpleNamespace(returncode=0, stdout=b'{"status":"validated","no_send":true}')
+        payload = json.loads(kwargs["input"])["payload"]
         requests.append(copy.deepcopy(payload))
         assert key not in repr(arguments) and token not in repr(arguments)
-        assert "--retry" in arguments and arguments[arguments.index("--retry") + 1] == "0"
         submitted = payload["properties"]["configuration"]
         # The 2024 API rejects a newer GET shape; GET-only metadata survives successful PATCHes.
         response_status = 400 if {"identitySettings", "dapr"} & submitted.keys() else status
@@ -602,8 +612,9 @@ def test_worker_patch_preserves_configuration_and_records_no_key(state, monkeypa
             for registry in actual["properties"]["configuration"]["registries"]:
                 registry.update(username=None, passwordSecretRef=None)
             actual["properties"]["template"]["containers"] = copy.deepcopy(containers)
-        return SimpleNamespace(returncode=22 if response_status == 400 else 0,
-                               stdout=str(response_status).encode(), stderr=b"SYNTHETIC-PRIVATE-ERROR")
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "status": "validated", "no_send": False, "http_status": response_status,
+        }).encode(), stderr=b"SYNTHETIC-PRIVATE-ERROR")
 
     monkeypatch.setattr(gap.subprocess, "run", transport)
     if status == 400:
@@ -611,7 +622,7 @@ def test_worker_patch_preserves_configuration_and_records_no_key(state, monkeypa
             gap.patch(state.work, config, decision, "deploy-worker", resource, containers,
                       job=True, bind_existing_secret="existing-gbbdemo")
         assert error.value.metadata() == {
-            "http_status": 400, "curl_returncode": 22, "phase": "worker_patch", "retry_permitted": False,
+            "http_status": 400, "curl_returncode": None, "phase": "worker_patch", "retry_permitted": False,
         }
         if failed_receipt_write:
             assert not gap.path(state.work, "deploy-worker-failure").exists()
@@ -741,8 +752,10 @@ def test_secure_binding_reuses_explicit_owner_clock_without_old_namespace_or_rec
         return {"accessToken": "SYNTHETIC-TOKEN"}
 
     def transport(*args, **kwargs):
+        if args[0][-1] == "--native-http-no-send":
+            return SimpleNamespace(returncode=0, stdout=b'{"status":"validated","no_send":true}')
         events.append("patch")
-        return SimpleNamespace(returncode=0, stdout=b"200", stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=b'{"status":"validated","no_send":false,"http_status":200}')
 
     monkeypatch.setattr(gap, "window", lambda *a, **k: pytest.fail("Old gapfill namespace must not be read"))
     monkeypatch.setattr(gap, "existing_webiq_key", key)

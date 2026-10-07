@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "api_versions": ["2019-04-01", "2025-01-01", "2024-08-04", "2025-07-01"],
+  "repository": "https://github.com/Azure/azure-rest-api-specs",
+  "commit": "1249f8e2b407b339083c5125a245bdd3057f6cd5",
+  "source_url_prefix": "https://raw.githubusercontent.com/Azure/azure-rest-api-specs/1249f8e2b407b339083c5125a245bdd3057f6cd5/",
+  "license": "MIT",
+  "license_file": "vendor/LICENSE",
+  "files": {
+    "specification/containerregistry/resource-manager/Microsoft.ContainerRegistry/RegistryTasks/stable/2019-04-01/containerregistry_build.json": "0a04660819e1c7dba2d6e17bc0c20e476fa9418e4dceacab81082d3fa18a2bb4",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2025-01-01/Jobs.json": "4d075837f93d359176f12395b5ebe3329e2be60e9423d2e8a26acf09f0f692d5",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2025-01-01/CommonDefinitions.json": "c4555d0bbe987821f3a6c9b70c93871bcebe36a796ce18f56be9ab1f448ef3b4",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2025-07-01/Jobs.json": "85e56e5ff3f6cdcbb9dd0ff643971fe7061b31ea1d0c918b8336871d952d1678",
+    "specification/app/resource-manager/Microsoft.App/ContainerApps/stable/2025-07-01/CommonDefinitions.json": "63d0c13e3e42fae4324d38aa17df4c80ba965227bc85503f6dae77dcbd87b3de",
+    "specification/storage/data-plane/Microsoft.BlobStorage/stable/2024-08-04/blob.json": "9d01f9ed6d3bc9ddf47118602c97e81e94dedc6a69b9567057d5c146db9b945a"
+  }
+}

@@ -1,5 +1,518 @@
 {
+  "action_source_provenance_sha256": "d661e1322799eea642097bbc1a879958f39befe6e2776393f190bbdb4582de6f",
+  "actions": {
+    "acrBuild": {
+      "api_version": "2019-04-01",
+      "operation_id": "Registries_ScheduleRun",
+      "path": "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.ContainerRegistry/registries/{registryName}/scheduleRun",
+      "schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agentConfiguration": {
+            "additionalProperties": false,
+            "properties": {
+              "cpu": {
+                "format": "int32",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "arguments": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "isSecret": {
+                  "type": "boolean"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "value"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "credentials": {
+            "additionalProperties": false,
+            "properties": {
+              "customRegistries": {
+                "additionalProperties": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "identity": {
+                      "type": "string"
+                    },
+                    "password": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "enum": [
+                            "Opaque",
+                            "Vaultsecret"
+                          ],
+                          "type": "string"
+                        },
+                        "value": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "userName": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "type": {
+                          "enum": [
+                            "Opaque",
+                            "Vaultsecret"
+                          ],
+                          "type": "string"
+                        },
+                        "value": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                },
+                "properties": {},
+                "type": "object"
+              },
+              "sourceRegistry": {
+                "additionalProperties": false,
+                "properties": {
+                  "loginMode": {
+                    "enum": [
+                      "None",
+                      "Default"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "object"
+          },
+          "dockerFilePath": {
+            "type": "string"
+          },
+          "imageNames": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "isArchiveEnabled": {
+            "type": "boolean"
+          },
+          "isPushEnabled": {
+            "type": "boolean"
+          },
+          "noCache": {
+            "type": "boolean"
+          },
+          "platform": {
+            "additionalProperties": false,
+            "properties": {
+              "architecture": {
+                "enum": [
+                  "amd64",
+                  "x86",
+                  "arm"
+                ],
+                "type": "string"
+              },
+              "os": {
+                "enum": [
+                  "Windows",
+                  "Linux"
+                ],
+                "type": "string"
+              },
+              "variant": {
+                "enum": [
+                  "v6",
+                  "v7",
+                  "v8"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "os"
+            ],
+            "type": "object"
+          },
+          "sourceLocation": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "timeout": {
+            "format": "int32",
+            "maximum": 28800,
+            "minimum": 300,
+            "type": "integer"
+          },
+          "type": {
+            "enum": [
+              "DockerBuildRequest"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "dockerFilePath",
+          "platform",
+          "type"
+        ],
+        "type": "object"
+      }
+    },
+    "acrUpload": {
+      "api_version": "2019-04-01",
+      "operation_id": "Registries_GetBuildSourceUploadUrl",
+      "path": "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.ContainerRegistry/registries/{registryName}/listBuildSourceUploadUrl",
+      "schema": null
+    },
+    "jobStart": {
+      "api_version": "2025-01-01",
+      "operation_id": "Jobs_Start",
+      "path": "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.App/jobs/{jobName}/start",
+      "schema": {
+        "additionalProperties": false,
+        "properties": {
+          "containers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "args": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "command": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "env": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "secretRef": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "image": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "resources": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "format": "double",
+                      "maximum": 1.7976931348623157e+308,
+                      "minimum": -1.7976931348623157e+308,
+                      "type": "number"
+                    },
+                    "ephemeralStorage": {
+                      "not": {},
+                      "readOnly": true
+                    },
+                    "memory": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "initContainers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "args": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "command": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "env": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "secretRef": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "image": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "resources": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "format": "double",
+                      "maximum": 1.7976931348623157e+308,
+                      "minimum": -1.7976931348623157e+308,
+                      "type": "number"
+                    },
+                    "ephemeralStorage": {
+                      "not": {},
+                      "readOnly": true
+                    },
+                    "memory": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "jobStart202507": {
+      "api_version": "2025-07-01",
+      "operation_id": "Jobs_Start",
+      "path": "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.App/jobs/{jobName}/start",
+      "schema": {
+        "additionalProperties": false,
+        "properties": {
+          "containers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "args": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "command": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "env": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "secretRef": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "image": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "resources": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "format": "double",
+                      "maximum": 1.7976931348623157e+308,
+                      "minimum": -1.7976931348623157e+308,
+                      "type": "number"
+                    },
+                    "ephemeralStorage": {
+                      "not": {},
+                      "readOnly": true
+                    },
+                    "memory": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "initContainers": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "args": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "command": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "env": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "secretRef": {
+                        "type": "string"
+                      },
+                      "value": {
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "image": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "resources": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "format": "double",
+                      "maximum": 1.7976931348623157e+308,
+                      "minimum": -1.7976931348623157e+308,
+                      "type": "number"
+                    },
+                    "ephemeralStorage": {
+                      "not": {},
+                      "readOnly": true
+                    },
+                    "memory": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "jobStop": {
+      "api_version": "2025-01-01",
+      "operation_id": "Jobs_StopExecution",
+      "path": "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.App/jobs/{jobName}/executions/{jobExecutionName}/stop",
+      "schema": null
+    }
+  },
   "api_version": "2024-03-01",
+  "binary_upload": {
+    "api_version": "2024-08-04",
+    "body": {
+      "format": "file",
+      "type": "object"
+    },
+    "content_type": "application/octet-stream",
+    "headers": {
+      "additionalProperties": false,
+      "properties": {
+        "content-length": {
+          "format": "int64",
+          "maximum": 9223372036854775807,
+          "minimum": -9223372036854775808,
+          "type": "integer"
+        },
+        "x-ms-blob-type": {
+          "enum": [
+            "BlockBlob"
+          ],
+          "type": "string"
+        },
+        "x-ms-version": {
+          "enum": [
+            "2024-08-04"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "content-length",
+        "x-ms-blob-type",
+        "x-ms-version"
+      ],
+      "type": "object"
+    },
+    "operation_id": "BlockBlob_Upload"
+  },
   "contracts": {
     "containerApps": {
       "PATCH": {
