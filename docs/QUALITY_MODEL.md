@@ -153,3 +153,15 @@ Documented derived abbreviation mappings include FIP/FNPT, MIP/MNPT, EPDM and
 LLB (low lead brass). LLB also supports the base material brass, but plain brass
 does not establish low-lead content. An arbitrary normalization explanation
 cannot authorize an invented value.
+
+The worker connects all provider usage to one `QualityCostMeter`. Set
+`QUALITY_RUN_BASE_COST_USD` to this logical run's build/base spending,
+`QUALITY_OVERNIGHT_PRIOR_COST_USD` to earlier logical runs' spending, and
+`QUALITY_WORKER_USD_PER_SECOND` to the disclosed active compute rate.
+`QUALITY_COST_RUN_ID` defaults to the execution's `QUALITY_RUN_ID`; reuse a cost
+run ID when manually restarting the same logical run, while giving each execution
+a distinct run ID. Existing model/web charges then reload rather than reset.
+`QUALITY_WEB_SEARCH_USD_PER_CALL` and `QUALITY_WEB_BROWSE_USD_PER_CALL` select
+the disclosed WebIQ prices. Do not include earlier executions' usage again in
+the base amount. Each execution summary includes the final meter snapshot;
+unknown provider usage/cost remains unknown, never reported as free.
