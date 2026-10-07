@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  validate-backend:
+  tests:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -18,21 +18,34 @@ jobs:
       PYTHONDONTWRITEBYTECODE: "1"
       UV_HTTP_RETRIES: "0"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v6
         with:
           version: "0.11.31"
       - name: Install committed dependencies
         run: uv sync --locked --python 3.13
-      - name: Offline regression
-        run: .venv/bin/python -m pytest -m 'not integration' -q
-      - name: Verify synthetic fixture
-        run: .venv/bin/python -m scripts.release_fixture --output "$RUNNER_TEMP/docintel-synthetic" --verify
-      - name: Compile manual job template
-        run: az bicep build --file infra/batch.bicep --stdout > /dev/null
+      - name: Unit and offline integration tests
+        run: .venv/bin/python -m pytest --ignore=tests/integration -m 'not integration' -k 'not installed_native' -q
+      - name: Authenticated API, owner isolation and export assertions
+        run: .venv/bin/python -m pytest tests/test_batch_api.py::test_hosted_synthetic_continuation_review_and_export -q
+      - name: Shell syntax
+        run: bash -n run.sh scripts/operations.sh
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build backend container
+        run: docker build --file backend/Dockerfile --tag docintel-backend:ci .
+      - name: Non-root startup without provider access
+        run: |
+          docker run --rm --network none \
+            --mount "type=bind,src=$PWD/scripts/container_smoke.py,dst=/container_smoke.py,readonly" \
+            --entrypoint /app/.venv/bin/python docintel-backend:ci /container_smoke.py

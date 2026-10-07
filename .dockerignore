@@ -18,6 +18,10 @@
 notebooks/
 tests/
 docs/
+output/
+tools/
+scripts/
+run.sh
 
 # Env and secrets
 .env
@@ -38,6 +42,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+.cache/
 .mypy_cache/
 .ruff_cache/
 .venv/

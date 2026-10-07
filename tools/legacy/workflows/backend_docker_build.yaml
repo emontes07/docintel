@@ -1,0 +1,38 @@
+name: Validate Backend
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DOCINTEL_BATCH_LIVE_ENABLED: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      UV_HTTP_RETRIES: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.31"
+      - name: Install committed dependencies
+        run: uv sync --locked --python 3.13
+      - name: Offline regression
+        run: .venv/bin/python -m pytest -m 'not integration' -q
+      - name: Verify synthetic fixture
+        run: .venv/bin/python -m scripts.release_fixture --output "$RUNNER_TEMP/docintel-synthetic" --verify
+      - name: Compile manual job template
+        run: az bicep build --file infra/batch.bicep --stdout > /dev/null

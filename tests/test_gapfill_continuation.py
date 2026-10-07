@@ -719,7 +719,7 @@ def test_close_resolves_published_images_after_partial_deployment_without_reopen
 
 def test_module_cli_help_requires_no_owner_configuration_or_credentials():
     result = gap.subprocess.run(
-        [sys.executable, "-m", "scripts.gapfill_continuation", "--help"],
+        [sys.executable, "-m", "tools.legacy.scripts.gapfill_continuation", "--help"],
         cwd=gap.release.ROOT, capture_output=True, timeout=30, check=False,
     )
     assert result.returncode == 0 and b"--work" in result.stdout and not result.stderr

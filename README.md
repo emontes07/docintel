@@ -5,13 +5,11 @@ traceable attribute proposals, human decisions, and a qualified Excel export.
 DocIntel addresses the manual work of finding missing product attributes while
 keeping source evidence, conflicting values, and uncertainty visible.
 
-> **Real processing remains off by default.** The hosted synthetic foundation was
-> accepted on 2026-10-03: authenticated intake, private persistence, finite worker
-> continuation, owner isolation, review, and Excel download. That acceptance did not
-> establish real-product accuracy or SharePoint ingestion. The multi-source
-> increment requires its own validation, publication, and explicit bounded pilot
-> approval. Prior build/execution allowances are exhausted. Do not run `azd up`,
-> provision, deploy, grant access, or process customer batches without approval.
+> **Operations:** use the ten-line [`run.sh`](run.sh) and the one-page
+> [runbook](DEPLOYMENT.md): build, deploy, start, export and cost. Deployment uses
+> the existing API and manual job, sharing one immutable backend image; the
+> frontend is unchanged. Historical approval files, receipts, deadlines and
+> acceptance gates are superseded and archived under `tools/legacy`.
 
 ## The Batch Workflow
 
@@ -38,7 +36,7 @@ The intended experience is an Azure-hosted Next.js portal and FastAPI backend,
 Entra sign-in, private Blob batch state, and a manually started Container Apps Job.
 Document Intelligence parsing and Azure OpenAI structured extraction are distinct
 service calls, not a Foundry agent. Live work remains disabled by default and
-restricted to a previously approved pilot scope, not arbitrary catalog products.
+limited to the configured quality run, not arbitrary catalog products.
 
 Local development is an explicit loopback-only mode with unverified identity and
 private SQLite state. The separate local pilot can replay prior results. Its
@@ -60,9 +58,9 @@ local authentication controls do **not** secure hosted use.
 | --- | --- |
 | Business operator | [User guide](docs/USER_GUIDE.md): workbooks, validation, execution choices, exceptions, review, export. |
 | Developer or architect | [Architecture](docs/ARCHITECTURE.md): original Mermaid diagrams, implemented wiring, blocked connections, deployed-state distinction. |
-| Azure maintainer | [Deployment](DEPLOYMENT.md): settings, command ownership, gated activation, acceptance and rollback. |
-| Release reviewer | [Consolidated batch findings](BATCH.md): evidence, costs, security gates, complete browser attempt history. |
-| Local pilot operator | [Local pilot](PILOT.md): private setup, replay/live controls, conservative budgets, local-only security. |
+| Azure maintainer | [Operations runbook](DEPLOYMENT.md): five commands, environment, authenticated export and cost. |
+| Release reviewer | [Historical findings](tools/legacy/BATCH.md): superseded evidence, not current release gates. |
+| Local pilot operator | [Historical pilot](tools/legacy/PILOT.md): preserved reference, not the current execution path. |
 | Extraction developer | [Enrichment contracts](docs/ENRICHMENT.md): supplied-evidence CLI, validation, diagnostic limitations. |
 
 ## Lineage And License
