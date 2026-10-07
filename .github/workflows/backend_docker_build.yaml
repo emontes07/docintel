@@ -29,6 +29,8 @@ jobs:
           version: "0.11.31"
       - name: Install committed dependencies
         run: uv sync --locked --python 3.13
+      - name: Install PDF text tools used by offline tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils
       - name: Unit and offline integration tests
         run: .venv/bin/python -m pytest --ignore=tests/integration -m 'not integration' -k 'not installed_native' -q
       - name: Authenticated API, owner isolation and export assertions

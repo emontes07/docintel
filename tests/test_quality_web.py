@@ -413,7 +413,7 @@ def test_pdf_path_rejects_any_private_dns_answer(original_response, monkeypatch,
     (200, "identity", "application/pdf", b"%PDF-1.4\nmalformed"),
     (200, "identity", "application/pdf", b"%PDF-" + b"x" * PDF_MAX_BYTES),
     (200, "identity", "text/plain", b"x" * (TEXT_MAX_BYTES + 1)),
-])
+], ids=["redirect", "encoded", "unknown-media", "empty", "not-pdf", "malformed", "oversize-pdf", "oversize-text"])
 def test_pdf_retrieval_and_parser_failures_close_without_ocr(original_response, status, encoding, media, raw):
     _, connections = original_response(raw, media, status, encoding)
     ocr = Mock()
@@ -434,7 +434,7 @@ def test_missing_or_timed_out_pdf_tools_do_not_fall_back_to_ocr(original_respons
     ocr.assert_not_called()
 
 
-@pytest.mark.parametrize("text", ["", "\x00bad", "x" * (TEXT_MAX_BYTES + 1)])
+@pytest.mark.parametrize("text", ["", "\x00bad", "x" * (TEXT_MAX_BYTES + 1)], ids=["empty", "null", "oversize"])
 def test_unusable_ocr_results_are_not_cached_and_later_calls_can_retry(original_response, text):
     store, parser = OCRStore(), ocr_parser(text)
     for _ in range(2):

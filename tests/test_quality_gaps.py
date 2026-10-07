@@ -8,7 +8,7 @@ from backend.evidence_verification import normalized
 from backend.models.enrichment import AttributeDefinition, Evidence, Manifest, ProductKey
 from backend.quality_pipeline import QualityProposal, ground_candidate, product_packet
 from backend.quality_worker import CachedEvidenceLoader, scope_document
-from backend.reviewer_workbook import _proposed_display
+from backend.reviewer_workbook import _candidate_location, _proposed_display
 
 NOW = datetime(2026, 10, 7, tzinfo=timezone.utc)
 
@@ -38,6 +38,7 @@ def test_retained_row_2201_escaped_unit_failures(attribute, value, quote, cell):
     assert candidate.grounding["quote"]["cells"] == [cell]
     assert "json_escaped_unit_mark" in candidate.grounding["quote"]["normalization"]
     assert candidate.supporting_quote == quote
+    assert f"quote matched cells {cell}" in _candidate_location(candidate, vendor())
 
 
 def test_size_normalization_preserves_alternatives_units_and_all_numbers():

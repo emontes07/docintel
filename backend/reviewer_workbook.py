@@ -7,7 +7,6 @@ import hashlib
 import ipaddress
 import json
 import re
-import unicodedata
 from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
 import xml.etree.ElementTree as ET
@@ -15,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from backend.batch import export_workbook
+from backend.evidence_verification import Fragment, match_text
 from backend.models.enrichment import (
     AttributeDefinition, AttributeResult, Candidate, EnrichmentResult, Evidence, Manifest, ProductKey,
 )
@@ -141,10 +141,6 @@ def _candidate_location(candidate: Candidate, evidence: Evidence) -> str:
     if len(quote) >= 2 and quote[0] == quote[-1] and quote[0] in "\"'":
         quote = quote[1:-1]
 
-    def normalized(value: str) -> str:
-        return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
-
-    quote = normalized(quote)
     matched: list[str] = []
     for cell in cells if isinstance(cells, list) else []:
         if not isinstance(cell, dict):
@@ -153,7 +149,8 @@ def _candidate_location(candidate: Candidate, evidence: Evidence) -> str:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}", name):
             continue
         value = cell.get("value")
-        if isinstance(value, (str, int, float, bool)) and quote and quote in normalized(str(value)):
+        if (isinstance(value, (str, int, float, bool)) and quote
+                and match_text(quote, [[Fragment(evidence, str(value), cell=name, vendor=True)]])):
             matched.append(name)
     # Legacy candidates cite a row; these are quote matches, not invented cell citations.
     detail = "quote matched cells " + ", ".join(dict.fromkeys(matched)) if matched else "row-level citation"
