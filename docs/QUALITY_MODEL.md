@@ -30,7 +30,8 @@ changing subsequent extraction calls. A deployment's supported effort values are
 determined by Azure, not guessed from its name. Existing `gpt-5` deployments remain
 supported; no newer deployment or pricing is assumed to exist. Select a
 Responses-compatible deployment/region and disclose the configured price basis.
-Unknown cost does not block execution.
+Unknown cost remains explicit in ordinary extraction. The optional bounded tool
+pass stops further actions when usage cannot be priced.
 For the requested GPT-6 Sol run, the disclosed basis is
 [OpenAI public pricing](https://developers.openai.com/api/docs/pricing), not final
 Azure billing: short-context input/cached/cache-write/output prices are
@@ -71,6 +72,29 @@ literal exact-product evidence, Medium for derived or confirmed-family evidence,
 and Low for inference or unconfirmed-family evidence. The row uses its weakest
 candidate confidence; Evidence retains each candidate's label. The pure
 applicability classifier supplies these labels; it does not grant human approval.
+
+### Bounded unresolved-attribute tools
+
+`QUALITY_TOOL_LOOP_ENABLED=true` adds one Responses function-calling pass per
+product after the ordinary tiers. Only unresolved/disputed attributes participate.
+The five tools are `search_vendor_rows`, `read_pdf_page`, `web_search`, `browse`
+and `fetch_pdf`. Local tools read the already approved product-scoped evidence;
+search terms contain only the MPN and requested attribute, never a reference
+answer. Manufacturer discovery/retrieval precedes other public web. Only exact
+discovered public URLs may be retrieved; search/Browse text alone is not evidence.
+PDF/OCR retrieval retains the Mueller/Ford domain and five-page OCR limits.
+
+Each product gets at most 15 counted actions and $1 additional tool-pass usage,
+inside the existing $10/$40 meter. Cost estimates include the complete effective
+request, schema, tool definitions, source prefix, history, opaque reasoning replay
+and maximum output; they never assume a cache hit. Actual usage is charged once.
+Missing prices/unknown usage stop further requests, not a success-shaped result.
+Every action and an explicit completion/budget/error summary appear in Diagnostics.
+Already grounded first-pass candidates survive a stopped or failed tool pass.
+
+Tool proposals use the same structured grounder, applicability map, persistent
+judge cache and low-effort majority judging. Disputes and partial submissions stay
+visible. The scoring-only workbook is never an available tool or input source.
 
 ### Stable judging and prompt reuse
 

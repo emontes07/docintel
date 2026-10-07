@@ -1,10 +1,12 @@
 """Scoring references cannot reach extraction, refinement, or judge requests."""
 
 import base64
+from copy import deepcopy
 from datetime import datetime, timezone
 from io import BytesIO
 import json
 import socket
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 from PIL import Image, PngImagePlugin
@@ -13,6 +15,7 @@ import pytest
 from backend.batch import digest
 from backend.batch_store import Conflict, Missing, read_json, write_json
 from backend.core.docintel import ParsedDocument, ParsedParagraph
+from backend.core.quality_model import ResponsesCompletion
 from backend.models.enrichment import AttributeDefinition, Manifest, ProductKey
 from backend.pilot import PARSER_VERSION
 from backend import quality_scoring
@@ -241,6 +244,178 @@ def test_reference_is_absent_from_real_worker_model_requests_and_serialized_imag
         quality_scoring.reference_from_normalized(reference), comparison_schema="six_class",
     )
     assert scored["counts"] == {"differ": 1}
+
+
+def test_reference_is_absent_from_worker_tool_requests_continuation_and_native_judge(monkeypatch):
+    store, _, clean_image = seed_reference_and_evidence()
+    record, version = read_json(store, "batches/isolation.json")
+    item = record["items"][0]
+    product = item["manifest"]["product"]
+    product["vendor"] = "Synthetic Ford"
+    item["original"]["Vendor Name"] = product["vendor"]
+    for binding in item["sources"]:
+        binding["products"] = [product]
+    item["manifest"]["source_ids"] = ["catalog", "vendor"]
+    vendor_workbook = write_workbook({"Vendor": [
+        ["MPN", "Valve Type"], [product["mpn"], "Angle valve"],
+    ]})
+    store.write_bytes("documents/vendor.xlsx", vendor_workbook)
+    item["sources"].append({
+        "source_id": "vendor", "kind": "blob", "format": "xlsx", "source_tier": "vendor_table",
+        "blob": "documents/vendor.xlsx", "sha256": digest(vendor_workbook), "products": [product],
+        "table": {"sheet": "Vendor", "mpn_column": "MPN", "expected_vendor": product["vendor"]},
+        "applicability": [{"product": product, "attribute_ids": ["Valve Type"]}],
+    })
+    write_json(store, "batches/isolation.json", record, version)
+    captured = []
+    phases = []
+    reasoning = {
+        "type": "reasoning", "id": "offline-reasoning", "summary": [],
+        "encrypted_content": "offline-encrypted-continuation",
+    }
+    vendor_call = {
+        "type": "function_call", "id": "offline-function", "call_id": "offline-vendor-call",
+        "name": "search_vendor_rows", "arguments": json.dumps({"attribute_id": "Valve Type"}),
+        "status": "completed",
+    }
+
+    def no_reference_loading(*args, **kwargs):
+        pytest.fail("Scoring references must never be loaded during the worker or tool loop")
+
+    def create(**request):
+        assert_no_reference(request)
+        assert_no_reference(json.dumps(request, default=str))
+        captured.append(deepcopy(request))
+        inputs = request["extra_body"]["input"]
+        content = inputs[0]["content"]
+        prefix = json.loads(content[0]["text"])
+        packet = json.loads(content[1]["text"])
+        schema = request["text"]["format"]["name"]
+        if schema == "ToolConclusion":
+            retrieved = [entry for entry in inputs if entry.get("type") == "function_call_output"]
+            if not retrieved:
+                output = [reasoning, vendor_call]
+                answer = None
+            else:
+                assert len(retrieved) == 1
+                delivered = json.loads(retrieved[0]["output"])
+                assert delivered["status"] == "retrieved"
+                assert len(delivered["evidence"]) == 1
+                entry = delivered["evidence"][0]
+                assert entry["source_id"] == "vendor"
+                answer = {
+                    "candidates": [{
+                        "attribute_id": "Valve Type", "value": "angle valve", "origin": "literal",
+                        "supporting_quote": "Angle valve", "evidence_ids": [entry["evidence_id"]],
+                    }],
+                    "explanation": "Retrieved the current-product vendor row for the unresolved attribute.",
+                }
+        elif schema == "QualityJudgment":
+            answer = {"decisions": [
+                {"candidate_id": candidate["candidate_id"], "decision": "accepted",
+                 "reason": "Synthetic quote and product source support this candidate."}
+                for candidate in packet["candidates"]
+            ]}
+        else:
+            assert schema == "QualityExtraction"
+            answer = {"candidates": []}
+            if packet["active_tier"] == "internal_pdf" and "first_pass_candidates" not in packet:
+                entries = prefix["shared_source_documents"] + packet["evidence"]
+                entry = next(entry for entry in entries if entry["source_tier"] == "internal_pdf")
+                answer["candidates"] = [{
+                    "attribute_id": "Primary Material", "value": "brass", "origin": "literal",
+                    "supporting_quote": "Body: BRASS.", "evidence_ids": [entry["citation_id"]],
+                }]
+        if answer is not None:
+            output = [{
+                "type": "message", "id": "offline-message", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": json.dumps(answer), "annotations": []}],
+            }]
+        return {
+            "id": f"offline-response-{len(captured)}", "status": "completed", "model": "offline-model",
+            "output": output,
+            "usage": {
+                "input_tokens": 100, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                "output_tokens": 10, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 110,
+            },
+        }
+
+    completion = ResponsesCompletion.__new__(ResponsesCompletion)
+    completion.client = SimpleNamespace(max_retries=0, responses=SimpleNamespace(create=create))
+    completion.deployment, completion.effort, completion.max_output_tokens = "offline-model", "medium", 1000
+    completion.pricing_usd_per_million = {"input": 2, "cached_input": 0.5, "cache_write": 2, "output": 8}
+    completion.pricing_basis = "synthetic_test"
+    completion.last_usage, completion.call_records, completion.usage_callback = {}, [], None
+    with monkeypatch.context() as model_boundary:
+        for name in ("load_cowork_reference", "normalize_cowork_reference", "reference_from_normalized",
+                     "compare_reference", "compare_answer_key"):
+            model_boundary.setattr(quality_scoring, name, no_reference_loading)
+        summary = run_quality_batch(
+            store, "isolation", "owner", "tool-reference-isolation", execution_id="offline",
+            completion=completion, ford_image_blob="documents/catalog.png",
+            before_call=lambda context: phases.append(context["phase"]),
+            tool_loop_enabled=True,
+            tool_prices={"search_usd": 0.0125, "browse_usd": 0.0125, "di_usd_per_page": 0.01},
+        )
+
+    assert phases == ["extract", "refine", "judge", "extract", "refine", "tool_loop", "tool_loop", "judge"]
+    assert summary["model_calls"] == len(captured) == len(completion.call_records) == 8
+    assert [request["text"]["format"]["name"] for request in captured] == [
+        "QualityExtraction", "QualityExtraction", "QualityJudgment", "QualityExtraction", "QualityExtraction",
+        "ToolConclusion", "ToolConclusion", "QualityJudgment",
+    ]
+    for request in captured:
+        assert request["instructions"] and request["text"]["format"]["schema"]
+        assert request["text"]["format"]["strict"] is True
+        assert request["extra_body"]["prompt_cache_key"]
+        assert request["extra_body"]["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+        prefix_part = request["extra_body"]["input"][0]["content"][0]
+        assert prefix_part["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        assert json.loads(prefix_part["text"])["definitions"]
+        assert_no_reference(request)
+        assert_no_reference(json.dumps(request, default=str))
+    for request in captured[:3]:
+        images = [
+            entry["image_url"] for entry in request["extra_body"]["input"][0]["content"]
+            if entry["type"] == "input_image"
+        ]
+        assert len(images) == 1
+        assert base64.b64decode(images[0].split(",", 1)[1]) == clean_image
+    first_tool, continuation, native_judge = captured[5:]
+    for request in (first_tool, continuation):
+        assert {tool["name"] for tool in request["tools"]} == {
+            "search_vendor_rows", "read_pdf_page", "web_search", "browse", "fetch_pdf",
+        }
+        assert all(tool["strict"] and tool["parameters"] for tool in request["tools"])
+        assert request["parallel_tool_calls"] is False
+        assert request["include"] == ["reasoning.encrypted_content"]
+    pending_packet = json.loads(first_tool["input"][0]["content"])
+    assert pending_packet["pass1_status"]["Valve Type"] == "unresolved"
+    assert len(first_tool["input"]) == 1
+    assert continuation["input"][1:3] == [reasoning, vendor_call]
+    assert continuation["extra_body"]["input"][1:] == continuation["input"][1:]
+    retrieved = continuation["input"][3]
+    assert retrieved["type"] == "function_call_output" and retrieved["call_id"] == vendor_call["call_id"]
+    delivered = json.loads(retrieved["output"])["evidence"]
+    assert len(delivered) == 1 and delivered[0]["source_tier"] == "vendor_table"
+    assert native_judge["tools"] == [] and native_judge["reasoning"] == {"effort": "low"}
+    judge_packet = json.loads(native_judge["input"][0]["content"])
+    assert [candidate["attribute_id"] for candidate in judge_packet["candidates"]] == ["Valve Type"]
+    assert judge_packet["candidates"][0]["evidence_ids"] == [delivered[0]["evidence_id"]]
+    assert not any(key.startswith("scoring/") for key in store.reads)
+    assert "documents/vendor.xlsx" in store.reads
+    result = read_json(store, summary["products"][0]["result_key"])[0]
+    assert_no_reference(result)
+    valve = next(attribute for attribute in result["attributes"] if attribute["attribute_id"] == "Valve Type")
+    assert len(valve["candidates"]) == 1
+    grounded = valve["candidates"][0]
+    assert grounded["value"] == "angle valve" and grounded["judge_status"] == "accepted"
+    assert grounded["grounding"]["quote"]["method"] == "vendor_cells"
+    assert grounded["grounding"]["judge_cache"]["votes"][0]["decision"] == "accepted"
+    loop_summary = next(entry for entry in result["quality_diagnostics"] if entry["operation"] == "tool_loop_summary")
+    assert loop_summary["status"] == "completed" and loop_summary["steps"] == 4
+    assert sorted(loop_summary["requested_attributes"]) == sorted(pending_packet["pass1_status"])
+    assert loop_summary["cost_complete"] is True and loop_summary["tool_loop_cost_usd"] > 0
 
 
 @pytest.mark.parametrize("encoding", ["nested_json", "cache_prefix", "image", "workbook", "base64"])

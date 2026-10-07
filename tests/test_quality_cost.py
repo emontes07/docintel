@@ -1,7 +1,7 @@
 import pytest
 
 from backend.batch_store import SQLiteStore
-from backend.quality_cost import CostLimitExceeded, QualityCostMeter
+from backend.quality_cost import CostLimitExceeded, QualityCostMeter, maximum_tool_cost
 
 
 def test_meter_charges_actual_calls_compute_and_carries_a_retry(tmp_path):
@@ -39,6 +39,51 @@ def test_invalid_cost_is_not_silently_coerced(tmp_path):
         meter.record({"operation": "model", "estimated_cost_usd": -1})
     with pytest.raises(ValueError, match="Unknown usage"):
         meter.record({"operation": "unexpected"})
+
+
+def test_next_tool_maximum_obeys_both_existing_global_caps(tmp_path):
+    meter = QualityCostMeter(SQLiteStore(tmp_path / "cost"), "b", "r",
+                             run_base_cost_usd="9.80", overnight_prior_cost_usd="30", clock=lambda: 0)
+    meter.before_call({"maximum_cost_usd": ".19"})
+    with pytest.raises(CostLimitExceeded):
+        meter.before_call({"maximum_cost_usd": ".21"})
+    assert meter.summary()["model_calls"] == 0
+
+
+def test_tool_maximum_prices_complete_effective_request_and_opaque_reasoning():
+    from decimal import Decimal
+
+    prices = {"input": 2, "cache_write": 2.5, "output": 10}
+    request = {"max_output_tokens": 16000, "input": [{"role": "user", "content": "product"}],
+               "instructions": "instructions", "tools": [{"name": "search"}],
+               "text": {"schema": {"description": "complete schema"}}}
+    baseline = maximum_tool_cost({"operation": "model", "request": request}, prices, {})
+    assert baseline >= Decimal(".16")
+    cached = {**request, "extra_body": {"input": [
+        {"role": "user", "content": "shared source " * 1000},
+        {"type": "reasoning", "encrypted_content": "opaque"},
+    ]}}
+    full = maximum_tool_cost({"operation": "model", "request": cached}, prices, {})
+    assert full > baseline + Decimal(".04")
+    assert maximum_tool_cost({"operation": "model", "request": cached},
+                             {**prices, "cached_input": 0}, {}) == full
+    with pytest.raises(CostLimitExceeded, match="pricing"):
+        maximum_tool_cost({"operation": "model", "request": request}, {**prices, "output": None}, {})
+    with pytest.raises(CostLimitExceeded, match="image/file"):
+        maximum_tool_cost({"operation": "model", "request": {
+            **request, "input": [{"type": "input_image", "image_url": "data:..."}],
+        }}, prices, {})
+
+
+def test_tool_maximum_uses_configured_web_prices_and_actual_ocr_page_bound():
+    from decimal import Decimal
+
+    rates = {"search_usd": ".013", "browse_usd": ".014", "di_usd_per_page": ".02"}
+    assert maximum_tool_cost({"operation": "web_search"}, {}, rates) == Decimal(".013")
+    assert maximum_tool_cost({"operation": "web_browse"}, {}, rates) == Decimal(".014")
+    assert maximum_tool_cost({"operation": "document_intelligence", "requested_pages": 5}, {}, rates) == Decimal(".10")
+    with pytest.raises(CostLimitExceeded):
+        maximum_tool_cost({"operation": "document_intelligence"}, {}, rates)
 
 
 @pytest.mark.parametrize("operation", ["web_search", "webiq_search", "web_browse", "webiq_browse"])
