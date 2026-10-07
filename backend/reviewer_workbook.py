@@ -8,6 +8,9 @@ import ipaddress
 import json
 import re
 import unicodedata
+from io import BytesIO
+from zipfile import ZipFile, ZIP_DEFLATED
+import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
@@ -21,6 +24,7 @@ REVIEW_COLUMNS = [
     "Product ID", "MPN", "Attribute", "Decision", "Correction", "Correction unit", "Reason",
     "Status", "Next action", "Proposed value", "Unit", "Evidence basis",
     "Supporting quote", "Evidence", "Source URL", "Retrieved at", "Applicability",
+    "Origin", "Normalization or justification", "Judge status", "Judge reason", "Reviewer explanation",
 ]
 DECISIONS = ("Approve", "Correct", "Reject")
 
@@ -43,12 +47,14 @@ def reviewer_status(attribute: AttributeResult, result: EnrichmentResult | _Pres
         return "Existing value retained", "No replacement proposed; confirm the existing value if needed."
     if attribute.status == "conflict":
         return "Conflicting evidence — review needed", "Resolve the cited conflicting evidence; record a supported correction and reason."
+    if attribute.status == "definition_clarification_needed":
+        return "Definition needs clarification", "A found candidate is retained; confirm the requested definition and unit before approval."
     if attribute.candidates:
+        if any(candidate.judge_status == "judge_disputed" for candidate in attribute.candidates):
+            return "Judge disputed — review required", "The grounded proposal was retained; resolve the judge's stated concern using the cited evidence."
         if all(candidate.evidence_basis == "inferred_from_description" for candidate in attribute.candidates):
             return "Descriptive inference — review required", "Confirm the whole-product claim; descriptive wording is not certification."
         return "Proposal ready for review", "Check the supporting quotation and product applicability before deciding."
-    if attribute.status == "definition_clarification_needed":
-        return "Definition needs clarification", "Confirm the requested definition and unit before evaluating a value."
     if attribute.status == "retrieval_failed":
         return "Source unavailable", "Provide an accessible, applicable source for this attribute."
     if attribute.status == "extraction_failed":
@@ -85,6 +91,7 @@ def _url(value: str) -> str:
 
 def _display(value) -> str:
     text = "" if value is None else str(value)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
     text = re.sub(r"(?i)\b(?:sha256:)?[a-f0-9]{64}\b", "[private reference]", text)
     text = re.sub(r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b", "[private reference]", text)
     text = re.sub(r"(?:batchblob|file|az|blob)://\S+", "[internal source]", text)
@@ -112,7 +119,7 @@ def _candidate_location(candidate: Candidate, evidence: Evidence) -> str:
     except json.JSONDecodeError:
         return "; ".join(filter(None, (location, "cell details unavailable")))
     cells = row.get("cells", []) if isinstance(row, dict) else []
-    quote = candidate.supporting_quote.strip()
+    quote = (candidate.supporting_quote or "").strip()
     if len(quote) >= 2 and quote[0] == quote[-1] and quote[0] in "\"'":
         quote = quote[1:-1]
 
@@ -156,7 +163,8 @@ def _build_package(
     columns remain blank unless a real ReviewDecision already exists.
     """
     rows = [list(REVIEW_COLUMNS)]
-    evidence_rows = [["Product ID", "MPN", "Attribute", "Proposed value", "Unit", "Source", "Source tier", "Location", "Quote", "Source URL", "Retrieved at", "Applicability", "Evidence basis"]]
+    evidence_rows = [["Product ID", "MPN", "Attribute", "Proposed value", "Unit", "Source", "Source tier", "Location", "Quote", "Source URL", "Retrieved at", "Applicability", "Evidence basis", "Origin", "Judge status", "Judge reason"]]
+    question_rows = [["Product ID", "MPN", "Attribute", "Question", "Response"]]
     bindings = []
     status_counts = {}
     seen = set()
@@ -175,6 +183,11 @@ def _build_package(
                 else reviewer_status(attribute, result)
             )
             status_counts[status] = status_counts.get(status, 0) + 1
+            if attribute.review is None and status not in {"Existing value retained", "Proposal ready for review"}:
+                question_rows.append([
+                    product.item_id, product.mpn, attribute.attribute_id,
+                    _display(attribute.definition_clarification or attribute.reviewer_explanation or action), "",
+                ])
             proposals, units, bases, quotes, labels, urls, retrieved, applicability = [], [], [], [], [], [], [], []
             for index, candidate in enumerate(attribute.candidates):
                 proposals.append(_display(candidate.value))
@@ -203,6 +216,7 @@ def _build_package(
                         product.item_id, product.mpn, attribute.attribute_id,
                         _display(candidate.value), _display(candidate.unit), label, evidence.source_tier, _candidate_location(candidate, evidence),
                         _display(candidate.supporting_quote), url, date, scope, candidate.evidence_basis,
+                        candidate.origin, candidate.judge_status, _display(candidate.judge_reason),
                     ])
             review = attribute.review
             rows.append([
@@ -213,6 +227,11 @@ def _build_package(
                 "\n".join(dict.fromkeys(units)), "\n".join(dict.fromkeys(bases)), "\n".join(dict.fromkeys(quotes)),
                 "\n".join(dict.fromkeys(labels)), "\n".join(dict.fromkeys(urls)),
                 "\n".join(dict.fromkeys(retrieved)), "\n".join(dict.fromkeys(applicability)),
+                "\n".join(dict.fromkeys(c.origin for c in attribute.candidates)),
+                "\n".join(_display(c.normalization_rule or c.justification) for c in attribute.candidates),
+                "\n".join(c.judge_status for c in attribute.candidates),
+                "\n".join(_display(c.judge_reason) for c in attribute.candidates),
+                _display(attribute.reviewer_explanation or action),
             ])
             binding = {
                 "Product ID": product.item_id, "MPN": product.mpn, "Attribute": attribute.attribute_id,
@@ -247,11 +266,23 @@ def _build_package(
         ["Descriptive inference", "inferred_from_description requires human review and is not certification or literal Boolean evidence."],
         ["Privacy", "Attempt identifiers, storage paths, source hashes and technical diagnostics are retained only in a separate private binding."],
     ]
-    workbook = export_workbook({
+    sheets = {
         "Review": rows, "Evidence": evidence_rows, "Instructions": instructions,
         "Summary": [["Metric", "Value"], ["Products", summary["products"]], ["Attributes", summary["attributes"]],
                     *[[status, count] for status, count in status_counts.items()]],
-    })
+    }
+    quality = any(isinstance(result, EnrichmentResult) and result.quality_run_id for result in results)
+    if quality:
+        sheets["Questions"] = question_rows
+        instructions.append(["Questions", "Resolve the listed definition, evidence or review questions. Responses remain blank until supplied by a reviewer; per-call diagnostics are in the separate technical export."])
+        for sheet in sheets.values():
+            for row in sheet:
+                for index, value in enumerate(row):
+                    if len(str(value)) > 32000:
+                        row[index] = str(value)[:31900] + "\n[Display shortened; complete evidence retained in the machine result.]"
+    workbook = export_workbook(sheets)
+    if quality:
+        workbook = _decision_dropdown(workbook, len(rows))
     return ReviewerPackage(
         workbook=workbook,
         private_binding={
@@ -269,6 +300,27 @@ def build_reviewer_package(
 ) -> ReviewerPackage:
     """Build a sanitized package for already-selected results without writing files."""
     return _build_package(results, source_labels=source_labels, attempt_metadata=attempt_metadata)
+
+
+def _decision_dropdown(workbook: bytes, row_count: int) -> bytes:
+    """In-memory list validation; decisions stay blank and no cell formula is added."""
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    stream = BytesIO()
+    with ZipFile(BytesIO(workbook)) as source, ZipFile(stream, "w", ZIP_DEFLATED) as target:
+        for entry in source.infolist():
+            content = source.read(entry.filename)
+            if entry.filename == "xl/worksheets/sheet1.xml" and row_count > 1:
+                root = ET.fromstring(content)
+                validations = ET.SubElement(root, f"{{{namespace}}}dataValidations", count="1")
+                validation = ET.SubElement(
+                    validations, f"{{{namespace}}}dataValidation", type="list", allowBlank="1",
+                    showErrorMessage="1", errorTitle="Choose a decision",
+                    error="Select Approve, Correct or Reject, or leave blank.", sqref=f"D2:D{row_count}",
+                )
+                ET.SubElement(validation, f"{{{namespace}}}formula1").text = '"Approve,Correct,Reject"'
+                content = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            target.writestr(entry, content)
+    return stream.getvalue()
 
 
 def build_snapshot_reviewer_package(snapshot: dict) -> ReviewerPackage:
@@ -295,7 +347,10 @@ def build_snapshot_reviewer_package(snapshot: dict) -> ReviewerPackage:
             candidate = Candidate.model_validate({name: value for name, value in supplied.items() if name in Candidate.model_fields})
             if candidate.attribute_id != slot["attribute_id"]:
                 raise ValueError("Snapshot candidate belongs to a different attribute")
-            definition.validate_value(candidate.value, candidate.unit)
+            if definition.unit_resolved:
+                definition.validate_value(candidate.value, candidate.unit)
+            else:
+                definition.model_copy(update={"unit_resolved": True, "unit": candidate.unit}).validate_value(candidate.value, candidate.unit)
             for entry in supplied["evidence"]:
                 evidence = Evidence.model_validate(entry)
                 if evidence.evidence_id in indexed and indexed[evidence.evidence_id] != evidence:

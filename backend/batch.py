@@ -426,15 +426,41 @@ class BatchService:
         record = self.get(batch_id, actor)
         columns = list(record["items"][0]["original"])
         inputs = [columns, *[[item["original"].get(column, "") for column in columns] for item in record["items"]]]
-        results = [["Row", "Item ID", "Vendor", "MPN", "Attribute", "Status", "Candidate index", "Proposed value", "Unit", "Evidence IDs", "Qualifications", "Review status", "Reviewed value", "Reviewed unit", "Reviewer", "Reviewed at", "Reason", "Error", "Source tiers", "Supporting quote", "Model confidence (not measured accuracy)", "Evidence verification JSON", "Evidence basis", "Inference rule"]]
+        results = [["Row", "Item ID", "Vendor", "MPN", "Attribute", "Status", "Candidate index", "Proposed value", "Unit", "Evidence IDs", "Qualifications", "Review status", "Reviewed value", "Reviewed unit", "Reviewer", "Reviewed at", "Reason", "Error", "Source tiers", "Supporting quote", "Model confidence (not measured accuracy)", "Evidence verification JSON", "Evidence basis", "Inference rule", "Origin", "Normalization rule", "Justification", "Judge status", "Judge reason", "Reviewer explanation", "Rejected candidates"]]
         evidence_rows = [["Row", "Evidence ID", "Source ID", "Locator", "Version", "Excerpt", "Observed at", "Source tier", "Applicability", "Approved attributes", "Discovery method"]]
         errors = [["Row", "State", "Error", "Warnings", "Definition clarifications", "Validation diagnostics"]]
-        diagnostics_sheet = [["Row", "Diagnostic", "Part", "Parts", "Sanitized diagnostic JSON"]]
+        diagnostics_sheet = [["Row", "Diagnostic", "Part", "Parts", "Sanitized diagnostic JSON", "Model", "Tier", "Phase", "Input tokens", "Reasoning tokens", "Output tokens", "Cost USD", "Status", "Note", "Run ID", "Call ID", "Operation", "Cached input tokens", "Usage reported", "Error type", "Deployment", "Cost Run ID", "Cache write tokens", "Pricing basis", "Execution ID"]]
         attempts_sheet = [["Row", "Attempt", "State", "Result key", "Machine SHA256", "Error", "Started at", "Finished at", "Proposals", "Extraction error"]]
         attempt_records = [["Row", "Attempt", "Part", "Parts", "Attempt record JSON"]]
         provenance = [["Row", "Execution method", "Machine SHA256", "Source provenance", "Consumption reservations and usage", "Attribute coverage", "Inference provenance"]]
         telemetry_sheet = [list(TECHNICAL_COLUMNS)]
         telemetry_results = []
+        exported_calls = set()
+
+        def quality_diagnostic(row, diagnostic, *, run_id=None, item_key=None, part="", parts=""):
+            operation = diagnostic.get("operation", "model")
+            run_id = diagnostic.get("run_id") or run_id
+            call_id = diagnostic.get("call_id")
+            if operation != "image_input":
+                identity = (run_id, call_id) if call_id else (
+                    run_id, diagnostic.get("item_key") or item_key, diagnostic.get("item_id"),
+                    operation, diagnostic.get("tier"), diagnostic.get("phase"), diagnostic.get("call_index"),
+                )
+                if identity in exported_calls:
+                    return
+                exported_calls.add(identity)
+            diagnostics_sheet.append([
+                row, "Image input" if operation == "image_input" else "Quality model call" if operation == "model" else "Quality web call",
+                part, parts, "", diagnostic.get("model"), diagnostic.get("tier"), diagnostic.get("phase"),
+                diagnostic.get("input_tokens"), diagnostic.get("reasoning_tokens"),
+                diagnostic.get("output_tokens"), diagnostic.get("cost_usd"), diagnostic.get("status"), diagnostic.get("reason"),
+                run_id, call_id, operation, diagnostic.get("cached_input_tokens"), diagnostic.get("usage_reported"),
+                diagnostic.get("error_type") or diagnostic.get("meter_error"), diagnostic.get("deployment"),
+                diagnostic.get("cost_run_id") or run_id,
+                diagnostic.get("cache_write_tokens"), diagnostic.get("pricing_basis"),
+                diagnostic.get("execution_id"),
+            ])
+
         for item in record["items"]:
             try:
                 detail = self.detail(batch_id, item["item_key"], actor)
@@ -485,6 +511,10 @@ class BatchService:
                 results.append([item["row"], item["original"]["PIMITEM Number"], item["original"]["Vendor Name"], item["original"]["MPN"], "", detail["state"], "", "", "", "", "", "pending", "", "", "", "", "", detail.get("error", "")])
                 continue
             parsed = EnrichmentResult.model_validate(machine)
+            quality_diagnostics = [*parsed.quality_diagnostics, *parsed.input_diagnostics]
+            for index, diagnostic in enumerate(quality_diagnostics, 1):
+                quality_diagnostic(item["row"], diagnostic, run_id=parsed.quality_run_id, item_key=item["item_key"],
+                                   part=index, parts=len(quality_diagnostics))
             telemetry_results.append(parsed)
             telemetry_sheet.extend(technical_rows(parsed.telemetry, row=item["row"]))
             for evidence in machine["evidence"]:
@@ -502,6 +532,26 @@ class BatchService:
                     verification = attribute.get("verification", [])
                     results[-1].append(json.dumps(verification[index], ensure_ascii=True) if index < len(verification) else "")
                     results[-1].extend([candidate.get("evidence_basis", "literal") if candidate else "", candidate.get("inference_rule")])
+                    results[-1].extend([
+                        candidate.get("origin"), candidate.get("normalization_rule"), candidate.get("justification"),
+                        candidate.get("judge_status"), candidate.get("judge_reason"), attribute.get("reviewer_explanation"),
+                        json.dumps(attribute.get("rejected_candidates", []), ensure_ascii=True),
+                    ])
+        usage_prefix = f"quality-runs/{batch_id}/"
+        by_key = {item["item_key"]: item for item in record["items"]}
+        by_product = {item["manifest"]["product"]["item_id"]: item for item in record["items"]
+                      if item.get("manifest") and item["manifest"].get("product", {}).get("item_id")}
+        for key in self.store.keys(usage_prefix):
+            segments = key[len(usage_prefix):].split("/")
+            if len(segments) != 3 or segments[1] != "usage" or not re.fullmatch(r"\d+\.json", segments[2]):
+                continue
+            try:
+                diagnostic, _ = read_json(self.store, key)
+            except Missing:
+                continue
+            item = by_key.get(diagnostic.get("item_key")) or by_product.get(diagnostic.get("item_id")) or {}
+            quality_diagnostic(item.get("row", ""), diagnostic, run_id=segments[0], item_key=item.get("item_key"),
+                               part=diagnostic.get("sequence", diagnostic.get("call_index", "")))
         definition_columns = list(record["original_definitions"][0])
         reviews_sheet = [["Row", "Attribute", "Decision", "Selected candidate index", "Corrected value", "Corrected unit", "Reviewer", "Identity status", "Reviewed at", "Reason"]]
         for item in record["items"]:

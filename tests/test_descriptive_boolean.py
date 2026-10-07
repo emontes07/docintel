@@ -405,6 +405,7 @@ def test_export_keeps_flag_rule_quote_and_null_literal_value_verification():
     result = offline_result()
     store = Mock()
     store.read_bytes.side_effect = Missing("fixture")
+    store.keys.return_value = []
     service = BatchService(store)
     original = {"PIMITEM Number": "fixture", "Vendor Name": "Synthetic", "MPN": "TEST-1"}
     service.get = Mock(return_value={

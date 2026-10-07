@@ -12,6 +12,8 @@ _HEADERS = {
     "no", "number", "item", "item no", "description", "material", "size",
     "meter connx size", "meter connection size", "part number", "quantity", "qty",
     "a", "b", "c", "d", "rev", "ecr",
+    "valve size", "inlet size", "outlet size", "length", "height",
+    "approx wt lbs", "selected submitted items",
 }
 _FREE_TEXT = re.compile(r"\b(?:note|part number|title|wetted parts)\b", re.IGNORECASE)
 _DRAWING_CONTEXT = re.compile(
@@ -21,7 +23,7 @@ _DRAWING_CONTEXT = re.compile(
 
 
 def label(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]", "", " ".join(text.casefold().split())).strip()
+    return " ".join(re.sub(r"[^a-z0-9 ]", "", " ".join(text.casefold().split())).split())
 
 
 def pure_header(text: str) -> bool:
@@ -62,7 +64,7 @@ class PdfItem:
         return entry
 
 
-def pdf_items(evidence: list[Evidence]) -> list[PdfItem]:
+def pdf_items(evidence: list[Evidence], *, preserve_model_headers: bool = False) -> list[PdfItem]:
     """Keep originals untouched; header interpretation never becomes value evidence."""
     tables: dict[tuple, dict[int, dict[int, Evidence]]] = defaultdict(lambda: defaultdict(dict))
     paragraphs = []
@@ -121,7 +123,8 @@ def pdf_items(evidence: list[Evidence]) -> list[PdfItem]:
         headers: dict[int, Evidence] = {}
         previous_row = None
         for row_number, cells in sorted(rows.items()):
-            if previous_row is not None and row_number != previous_row + 1:
+            if (previous_row is not None and row_number != previous_row + 1
+                    and not (preserve_model_headers and any(label(h.text) == "part number" for h in headers.values()))):
                 headers = {}
             previous_row = row_number
             if not cells:

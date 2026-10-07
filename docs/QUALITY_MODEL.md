@@ -121,3 +121,63 @@ Fake responses should expose the usual `status`, `output`, and `usage` fields
 ```sh
 .venv/bin/python -m pytest tests/test_quality_model.py -q
 ```
+
+## Product quality extraction
+
+`backend.quality_worker` loads the existing owner-scoped batch and cached PDF and
+vendor evidence; it does not request new Document Intelligence analyses. Its
+default first step checks Mueller Operating Head Style against the vendor row,
+then processes all products in the same execution. `QUALITY_SMOKE_ONLY=true`
+selects just that check; `QUALITY_SMOKE_FIRST=false` omits it on a subsequent run.
+The original Ford PDF page is rendered in memory and supplied alongside its text.
+
+Each product/tier packet contains the manifest, all attribute definitions and
+product-scoped evidence. Catalog rows are selected by the model/part-number column,
+including removal of variants not present in the batch and their duplicated
+paragraphs. Shared component tables and family prose remain qualified evidence.
+Explicit empty source attribute scopes retain their existing no-eligibility
+meaning. Evidence references and source locations are preserved.
+
+The tier order is PDF, vendor, manufacturer web, then other web, with unresolved
+attributes alone advancing. Each tier permits extraction, one targeted second
+pass, and a joint low-effort judge, at most three model calls. The first Mueller
+vendor smoke occupies an extraction slot rather than adding a fourth call.
+Proposals retain literal/derived/inferred origins, normalization or inference
+justification, quotes, judge disagreements, conflicts and actionable reviewer
+notes. Unit aliases use the same equivalences for normalization and grounding
+(inch notation, psi/pounds per square inch, degree notation, and mm spellings);
+alias-only matches record `unit_alias_v1`. A temperature degree sign does not
+establish an angle unit. Pressure candidates remain visible without resolving the
+definition question, and descriptive Lead-Free inferences require human review.
+Documented derived abbreviation mappings include FIP/FNPT, MIP/MNPT, EPDM and
+LLB (low lead brass). LLB also supports the base material brass, but plain brass
+does not establish low-lead content. An arbitrary normalization explanation
+cannot authorize an invented value.
+Labeled Boolean yes/no/true/false answers retain literal support. Descriptive
+Lead-Free candidates are always relabeled inferred with a review justification,
+even if the model calls them literal or derived; an explicit negative answer
+cannot be reinterpreted as a positive descriptive inference.
+
+The worker connects all provider usage to one `QualityCostMeter`. Set
+`QUALITY_RUN_BASE_COST_USD` to this logical run's build/base spending,
+`QUALITY_OVERNIGHT_PRIOR_COST_USD` to earlier logical runs' spending, and
+`QUALITY_WORKER_USD_PER_SECOND` to the disclosed active compute rate.
+`QUALITY_COST_RUN_ID` defaults to the execution's `QUALITY_RUN_ID`; reuse a cost
+run ID when manually restarting the same logical run, while giving each execution
+a distinct run ID. Existing model/web charges then reload rather than reset.
+Reusing the same `QUALITY_RUN_ID` also creates a new unique execution ID with
+immutable execution snapshots and continued usage numbering; its root summary
+is cumulative, not a second cost to add to individual execution snapshots.
+`QUALITY_WEB_SEARCH_USD_PER_CALL` and `QUALITY_WEB_BROWSE_USD_PER_CALL` select
+the disclosed WebIQ prices. Do not include earlier executions' usage again in
+the base amount. Each execution summary includes the final meter snapshot;
+unknown provider usage/cost remains unknown, never reported as free.
+
+Web gap-fill uses `/search/web`, paid `/browse`, then independent retrieval of
+the original page. Search and Browse default to USD 0.0125 per attempt; direct
+HTTP retrieval has no WebIQ fee. Pending/unavailable Browse responses are recorded
+without automatic polling or substitution of discovery snippets as evidence.
+Per product/execution, at most 12 searches and six paid Browse attempts are made.
+The worker prints the same persisted meter as `{"quality_cost": ...}` on exit,
+including failures. Customer review packages contain five sheets
+(Review/Evidence/Instructions/Summary/Questions); call Diagnostics are technical-only.
