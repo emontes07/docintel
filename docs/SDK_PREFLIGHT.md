@@ -226,6 +226,15 @@ lock uses OpenAI 1.91.0/httpx whereas the preparation host may use OpenAI
 3.3.1/httpx2: compare the image to its lock, not to the preparation host.
 Synthetic test bindings are not deployed-image evidence.
 
+`scripts.image_sdk_smoke.capture` is the explicit operator bridge: it verifies
+the published digest is installed on the stopped API/worker pair, sends the
+complete measured planning requests to a separate API-console process, and
+retains only the returned native metadata. It invokes the image producer for
+all twelve model, four discovery and six prospective page requests, then calls
+the four-product image-proof validator. This inspection neither discovers a
+page nor invokes a model; prospective web inputs are still planning envelopes.
+It never starts the worker, enables processing or changes a reservation.
+
 Focused offline regression suite:
 
 ```bash
