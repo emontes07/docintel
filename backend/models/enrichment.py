@@ -12,7 +12,7 @@ from backend.telemetry import ItemTelemetry
 AttributeValue = str | int | float | bool
 SourceTier = Literal["internal_pdf", "vendor_table", "manufacturer_web", "approved_web"]
 EvidenceBasis = Literal["literal", "inferred_from_description"]
-DescriptiveBooleanRule = Literal["lead_free_description_v1"]
+DescriptiveBooleanRule = Literal["lead_free_description_v1", "quoted_feature_presence_v1"]
 DESCRIPTIVE_BOOLEAN_FLAG = "inferred_from_description — requires review"
 LEAD_FREE_DESCRIPTION_RULE: DescriptiveBooleanRule = "lead_free_description_v1"
 
@@ -142,6 +142,19 @@ class Candidate(Contract):
         if self.evidence_basis == "literal":
             if self.inference_rule is not None:
                 raise ValueError("Literal candidates cannot carry a descriptive inference rule")
+        elif self.inference_rule == "quoted_feature_presence_v1":
+            if (self.attribute_id not in {"Locking Feature", "Padlock Wing"}
+                    or self.origin != "inferred" or self.value is not True
+                    or self.unit is not None or not self.supporting_quote
+                    or not self.supporting_quote.strip() or not self.justification
+                    or not self.justification.strip()):
+                raise ValueError("Quoted feature inference requires a justified, quoted, unitless feature True proposal")
+            flag = (
+                f"{DESCRIPTIVE_BOOLEAN_FLAG}. Rule: {self.inference_rule}. "
+                "Feature wording interpreted as Boolean; confirm exact-product applicability."
+            )
+            if not self.qualification or not self.qualification.startswith(flag):
+                self.qualification = flag + (f" {self.qualification}" if self.qualification else "")
         elif (
             not is_lead_free_attribute(self.attribute_id) or self.value is not True
             or self.unit is not None or not self.supporting_quote or not self.supporting_quote.strip()

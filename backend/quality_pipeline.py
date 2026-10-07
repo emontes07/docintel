@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 from pydantic import Field
 
 from backend.evidence_verification import Fragment, match_text, normalized, value_windows, windows
-from backend.extract import _boolean_answer
+from backend.extract import _boolean_answer, _safe_description
 from backend.models.enrichment import (
     AttributeDefinition, AttributeResult, AttributeValue, Candidate, Contract,
     EnrichmentResult, Evidence, Manifest, RetrievalOutcome, SourceTier, is_lead_free_attribute,
@@ -40,8 +40,14 @@ Every literal value must appear in its cited quote. Derived values require an
 explicit normalization_rule; inferred values require a clear justification.
 Use expected units (value and unit separately); preserve pressure candidates even
 when the definition needs clarification. Never invent a missing unit mapping.
-Only Lead-Free true may be inferred: low-lead/lead-free product wording, LLB,
+Lead-Free true may be inferred from low-lead/lead-free product wording, LLB,
 NL/-NL, NSF/ANSI 372 or AB1953; these are review-only, not certification.
+Locking Feature true may be inferred from explicit LOCKWING/for-locking wording;
+Padlock Wing true requires its affirmative "padlock wing for locking" description.
+Quote the complete assertion, not a header alone. These require review and
+justification. Never infer a feature from absence, alternatives,
+optional accessories, negation, or a different feature. Other Boolean values
+require a literal labeled yes/no.
 Do not map component materials to whole-product material, drawing dimensions to
 connection sizes, unrelated models to this product, or absent facts to false.
 Supply one short reviewer_explanation per candidate. Optional image is the
@@ -54,7 +60,7 @@ attribute definition, literal/derived/inferred origin, normalization, units and
 the cited supporting quote. Do not create new values. Return one decision per
 candidate_id, accepted or judge_disputed, and an actionable reason. A reasonable
 but uncertain interpretation is judge_disputed, not silently dropped. Inferred
-Lead-Free descriptions always require human review, even if accepted."""
+descriptions always require human review, even if accepted."""
 
 
 class QualityProposal(Contract):
@@ -232,6 +238,16 @@ def ground_candidate(proposal: QualityProposal, definition: AttributeDefinition,
     origin = proposal.origin
     justification = proposal.justification
     lead_marker = _LEAD.search(proposal.supporting_quote)
+    feature_pattern = {
+        "Locking Feature": r"\blockwing\b|\bfor\s+locking\b",
+        "Padlock Wing": r"\bpadlock[\s-]+wing\s+for\s+locking\b",
+    }.get(definition.attribute_id)
+    feature_marker = (
+        re.search(feature_pattern, proposal.supporting_quote, re.I)
+        if value is True and unit is None and feature_pattern is not None
+        and _safe_description(proposal.supporting_quote)
+        else None
+    )
     if isinstance(value, bool) and _literal_boolean(value, proposal):
         origin = "derived" if rule else "literal"
     elif is_lead_free_attribute(definition.attribute_id) and value is True and lead_marker:
@@ -241,12 +257,19 @@ def ground_candidate(proposal: QualityProposal, definition: AttributeDefinition,
             f"The quoted {lead_marker.group(0)!r} marker suggests Lead-Free; "
             "confirm exact-product applicability and certification. Requires review."
         )
+    elif feature_marker:
+        origin = "inferred"
+        rule = None
+        justification = justification or (
+            f"The quoted {feature_marker.group(0)!r} wording explicitly describes "
+            f"{definition.attribute_id}; interpreting it as True requires human review."
+        )
     if origin == "inferred":
-        if (not is_lead_free_attribute(definition.attribute_id) or value is not True or unit is not None
+        if not feature_marker and (not is_lead_free_attribute(definition.attribute_id) or value is not True or unit is not None
                 or not justification or not lead_marker
                 or _literal_boolean(False, proposal)
                 or _NEGATED_LEAD.search(proposal.supporting_quote)):
-            raise ValueError("Only qualified Lead-Free true descriptive inference is supported; supply its rationale and quoted marker.")
+            raise ValueError("Only qualified Lead-Free true descriptive inference or explicit supported feature assertions are allowed; supply the rationale and complete quoted assertion.")
         value_match = None
     else:
         if origin == "derived" and not rule:
@@ -274,7 +297,11 @@ def ground_candidate(proposal: QualityProposal, definition: AttributeDefinition,
                     origin = "derived"
     qualification = None
     if origin == "inferred":
-        qualification = "Descriptive Lead-Free inference only; requires human review and is not certification."
+        qualification = (
+            "Descriptive feature inference only; requires human review."
+            if feature_marker else
+            "Descriptive Lead-Free inference only; requires human review and is not certification."
+        )
     if not definition.unit_resolved:
         qualification = ((qualification + " ") if qualification else "") + "Found candidate retained; definition/unit requires clarification."
     return Candidate(
@@ -282,7 +309,8 @@ def ground_candidate(proposal: QualityProposal, definition: AttributeDefinition,
         supporting_quote=proposal.supporting_quote, origin=origin, normalization_rule=rule,
         justification=justification, confidence=proposal.confidence, qualification=qualification,
         evidence_basis="inferred_from_description" if origin == "inferred" else "literal",
-        inference_rule="lead_free_description_v1" if origin == "inferred" else None,
+        inference_rule=("quoted_feature_presence_v1" if feature_marker else "lead_free_description_v1")
+        if origin == "inferred" else None,
         reviewer_explanation=proposal.reviewer_explanation or f"Check {definition.attribute_id} against the cited product evidence.",
         grounding={"quote": quote.model_dump(mode="json"), "value": value_match.model_dump(mode="json") if value_match else None,
                    "rule": rule, "original_value": proposal.value, "original_unit": proposal.unit,
@@ -370,7 +398,9 @@ def _sentence(attribute: AttributeResult) -> str:
         if any(c.judge_status != "accepted" for c in attribute.candidates):
             return "A grounded proposal is retained despite judge disagreement; review the cited evidence and judge reason."
         if any(c.origin == "inferred" for c in attribute.candidates):
-            return "The descriptive Lead-Free inference requires human review and does not establish certification."
+            if is_lead_free_attribute(attribute.attribute_id):
+                return "The descriptive Lead-Free inference requires human review and does not establish certification."
+            return "The quoted feature description supports a review-only Boolean proposal; confirm it applies to this exact product."
         return attribute.candidates[0].reviewer_explanation or "The grounded proposal was accepted by the judge; human approval remains pending."
     if attribute.rejected_candidates:
         return "No acceptable proposal remains: " + str(attribute.rejected_candidates[-1]["reason"])
