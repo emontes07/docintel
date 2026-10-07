@@ -19,7 +19,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from pydantic import Field
 
-from backend.evidence_verification import Fragment, match_text, value_windows, windows
+from backend.evidence_verification import Fragment, match_text, normalized, value_windows, windows
+from backend.extract import _boolean_answer
 from backend.models.enrichment import (
     AttributeDefinition, AttributeResult, AttributeValue, Candidate, Contract,
     EnrichmentResult, Evidence, Manifest, RetrievalOutcome, SourceTier, is_lead_free_attribute,
@@ -174,9 +175,21 @@ _NEGATED_LEAD = re.compile(
 )
 
 
+def _literal_boolean(value: bool, proposal: QualityProposal) -> bool:
+    labels = [normalized(proposal.attribute_id)[0]]
+    if is_lead_free_attribute(proposal.attribute_id):
+        labels.extend([["lead", "free"], ["leadfree"], ["no", "lead"]])
+    return any(_boolean_answer(normalized(proposal.supporting_quote)[0], label, value) for label in labels)
+
+
 def _value_match(value, proposal, selected, evidence, cited):
     spans = value_windows(evidence, cited)
     rational = [[replace(part, vendor=True) for part in span] for span in spans]
+    if isinstance(value, bool):
+        if not _literal_boolean(value, proposal):
+            return None
+        return next((match_text(answer, spans) for answer in (("true", "yes") if value else ("false", "no"))
+                     if match_text(answer, spans)), None)
     value_match = match_text(str(value), spans + rational)
     quote_span = [[Fragment(selected[0], proposal.supporting_quote, vendor=True)]]
     quote_value = match_text(str(value), quote_span)
@@ -184,17 +197,6 @@ def _value_match(value, proposal, selected, evidence, cited):
         return value_match
     if proposal.origin != "derived" or not proposal.normalization_rule:
         return None
-    if isinstance(value, bool):
-        aliases = ["true", "yes"] if value else ["false", "no"]
-        found = next((match_text(alias, quote_span) for alias in aliases if match_text(alias, quote_span)), None)
-        if found:
-            return found
-        words = re.findall(r"[a-z]+", proposal.attribute_id.casefold())
-        words = [word for word in words if word not in {"feature", "and", "or"}]
-        text = proposal.supporting_quote.casefold()
-        negated = bool(re.search(r"\b(?:not|no|without)\b", text))
-        if words and all(re.search(rf"\b{re.escape(word)}\b", text) for word in words) and value != negated:
-            return match_text(proposal.supporting_quote, windows(evidence, cited))
     aliases = {"fip": "female iron pipe", "fnpt": "female national pipe thread",
                "mip": "male iron pipe", "mnpt": "male national pipe thread",
                "epdm": "ethylene propylene diene monomer", "llb": "low lead brass"}
@@ -228,9 +230,21 @@ def ground_candidate(proposal: QualityProposal, definition: AttributeDefinition,
         raise ValueError("Supporting quote is not a normalized substring of the cited row/page/cell; copy its actual text.")
     value, unit, rule = normalize_value(proposal, definition)
     origin = proposal.origin
+    justification = proposal.justification
+    lead_marker = _LEAD.search(proposal.supporting_quote)
+    if isinstance(value, bool) and _literal_boolean(value, proposal):
+        origin = "derived" if rule else "literal"
+    elif is_lead_free_attribute(definition.attribute_id) and value is True and lead_marker:
+        origin = "inferred"
+        rule = None
+        justification = justification or (
+            f"The quoted {lead_marker.group(0)!r} marker suggests Lead-Free; "
+            "confirm exact-product applicability and certification. Requires review."
+        )
     if origin == "inferred":
         if (not is_lead_free_attribute(definition.attribute_id) or value is not True or unit is not None
-                or not proposal.justification or not _LEAD.search(proposal.supporting_quote)
+                or not justification or not lead_marker
+                or _literal_boolean(False, proposal)
                 or _NEGATED_LEAD.search(proposal.supporting_quote)):
             raise ValueError("Only qualified Lead-Free true descriptive inference is supported; supply its rationale and quoted marker.")
         value_match = None
@@ -266,12 +280,13 @@ def ground_candidate(proposal: QualityProposal, definition: AttributeDefinition,
     return Candidate(
         attribute_id=definition.attribute_id, value=value, unit=unit, evidence_ids=list(dict.fromkeys(proposal.evidence_ids)),
         supporting_quote=proposal.supporting_quote, origin=origin, normalization_rule=rule,
-        justification=proposal.justification, confidence=proposal.confidence, qualification=qualification,
+        justification=justification, confidence=proposal.confidence, qualification=qualification,
         evidence_basis="inferred_from_description" if origin == "inferred" else "literal",
         inference_rule="lead_free_description_v1" if origin == "inferred" else None,
         reviewer_explanation=proposal.reviewer_explanation or f"Check {definition.attribute_id} against the cited product evidence.",
         grounding={"quote": quote.model_dump(mode="json"), "value": value_match.model_dump(mode="json") if value_match else None,
-                   "rule": rule, "original_value": proposal.value, "original_unit": proposal.unit},
+                   "rule": rule, "original_value": proposal.value, "original_unit": proposal.unit,
+                   "original_origin": proposal.origin, "original_normalization_rule": proposal.normalization_rule},
     )
 
 

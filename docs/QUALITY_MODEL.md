@@ -153,6 +153,10 @@ Documented derived abbreviation mappings include FIP/FNPT, MIP/MNPT, EPDM and
 LLB (low lead brass). LLB also supports the base material brass, but plain brass
 does not establish low-lead content. An arbitrary normalization explanation
 cannot authorize an invented value.
+Labeled Boolean yes/no/true/false answers retain literal support. Descriptive
+Lead-Free candidates are always relabeled inferred with a review justification,
+even if the model calls them literal or derived; an explicit negative answer
+cannot be reinterpreted as a positive descriptive inference.
 
 The worker connects all provider usage to one `QualityCostMeter`. Set
 `QUALITY_RUN_BASE_COST_USD` to this logical run's build/base spending,

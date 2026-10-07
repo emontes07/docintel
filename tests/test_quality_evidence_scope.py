@@ -122,3 +122,50 @@ def test_documented_abbreviations_can_expand_without_inventing_values(quoted, ex
     assert ground_candidate(proposal, definition, [source]).value == expanded
     with pytest.raises(ValueError, match="value is not grounded"):
         ground_candidate(proposal.model_copy(update={"value": "invented stainless steel"}), definition, [source])
+
+
+@pytest.mark.parametrize(("value", "answer"), [(True, "Yes"), (True, "True"), (False, "No"), (False, "False")])
+def test_explicit_labeled_boolean_answers_remain_literal(value, answer):
+    text = "Lead-Free: " + answer
+    source = Evidence(
+        evidence_id="E1", source_id="source", source_tier="internal_pdf", content_kind="source_excerpt",
+        source_locator="https://example.com/catalog#page=1&paragraph=0", source_version="v1",
+        text=text, observed_at=NOW,
+    )
+    definition = AttributeDefinition(attribute_id="Lead-Free", description="", value_type="boolean")
+    candidate = ground_candidate(QualityProposal(
+        attribute_id="Lead-Free", value=value, evidence_ids=["E1"], supporting_quote=text,
+    ), definition, [source])
+    assert candidate.origin == "literal"
+    assert candidate.evidence_basis == "literal"
+
+
+@pytest.mark.parametrize("origin", ["literal", "derived", "inferred"])
+def test_description_cannot_bypass_lead_free_review_by_changing_origin(origin):
+    source = Evidence(
+        evidence_id="E1", source_id="source", source_tier="internal_pdf", content_kind="source_excerpt",
+        source_locator="https://example.com/catalog#page=1&paragraph=0", source_version="v1",
+        text="Lead-free brass valve", observed_at=NOW,
+    )
+    candidate = ground_candidate(QualityProposal(
+        attribute_id="Lead-Free", value=True, evidence_ids=["E1"], supporting_quote=source.text,
+        origin=origin, normalization_rule="Convert description to Boolean." if origin == "derived" else None,
+    ), AttributeDefinition(attribute_id="Lead-Free", description="", value_type="boolean"), [source])
+    assert candidate.origin == "inferred"
+    assert candidate.evidence_basis == "inferred_from_description"
+    assert candidate.justification and "requires review" in candidate.qualification.lower()
+
+
+@pytest.mark.parametrize("origin", ["literal", "derived", "inferred"])
+def test_explicit_negative_lead_answer_cannot_be_reinterpreted_as_positive_description(origin):
+    source = Evidence(
+        evidence_id="E1", source_id="source", source_tier="internal_pdf", content_kind="source_excerpt",
+        source_locator="https://example.com/catalog#page=1&paragraph=0", source_version="v1",
+        text="Lead-Free: No", observed_at=NOW,
+    )
+    with pytest.raises(ValueError):
+        ground_candidate(QualityProposal(
+            attribute_id="Lead-Free", value=True, evidence_ids=["E1"], supporting_quote=source.text,
+            origin=origin, normalization_rule="Convert description." if origin == "derived" else None,
+            justification="Lead-Free wording.",
+        ), AttributeDefinition(attribute_id="Lead-Free", description="", value_type="boolean"), [source])
