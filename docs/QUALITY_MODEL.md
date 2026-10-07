@@ -83,6 +83,13 @@ repair, Markdown stripping, partial-output acceptance, or Chat Completions fallb
 
 ## Usage records and errors
 
+The quality verifier retains explicit `LOCKWING` and "padlock wing for locking"
+descriptions as review-only feature-True inferences, not literal yes/no answers.
+The closed `quoted_feature_presence_v1` rule applies only to Locking Feature
+and Padlock Wing; `LOCKWING` alone does not prove Padlock Wing. Negation,
+alternatives, optional/accessory descriptions and inference from absence remain
+unsupported. A judge decision is recorded separately from human approval.
+
 `last_usage` starts as `{}` and describes the latest attempted provider request.
 `call_records` retains independent copies of every record. A synchronous optional
 callback receives another JSON-serializable copy. Records contain actual model

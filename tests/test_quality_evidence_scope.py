@@ -156,6 +156,52 @@ def test_description_cannot_bypass_lead_free_review_by_changing_origin(origin):
     assert candidate.justification and "requires review" in candidate.qualification.lower()
 
 
+@pytest.mark.parametrize("attribute,text", [
+    ("Locking Feature", "LOCKWING"),
+    ("Locking Feature", "Padlock wing for locking the valve in a closed position"),
+    ("Padlock Wing", "Padlock wing for locking the valve in a closed position"),
+])
+@pytest.mark.parametrize("origin", ["literal", "derived", "inferred"])
+def test_reproduced_feature_descriptions_are_review_only_inferences(attribute, text, origin):
+    source = Evidence(
+        evidence_id="E1", source_id="source", source_tier="internal_pdf", content_kind="source_excerpt",
+        source_locator="https://example.com/catalog#page=1&paragraph=0", source_version="v1",
+        text=text, observed_at=NOW,
+    )
+    candidate = ground_candidate(QualityProposal(
+        attribute_id=attribute, value=True, evidence_ids=["E1"], supporting_quote=text, origin=origin,
+    ), AttributeDefinition(attribute_id=attribute, description="", value_type="boolean"), [source])
+    assert candidate.origin == "inferred"
+    assert candidate.evidence_basis == "inferred_from_description"
+    assert candidate.inference_rule == "quoted_feature_presence_v1"
+    assert candidate.justification and "requires review" in candidate.qualification.lower()
+    assert candidate.judge_status == "not_judged"
+
+
+@pytest.mark.parametrize("attribute,text,value", [
+    ("Padlock Wing", "LOCKWING", True),
+    ("Padlock Wing", "Padlock Wing: N", True),
+    ("Locking Feature", "Locking Feature", True),
+    ("Locking Feature", "No LOCKWING", True),
+    ("Locking Feature", "Optional LOCKWING", True),
+    ("Locking Feature", "LOCKWING or flat head", True),
+    ("Padlock Wing", "Replacement padlock wing for locking the valve", True),
+    ("Padlock Wing", "Padlock wing for locking the valve in a closed position", False),
+    ("Flanged Outlet", "Female pipe thread", False),
+])
+def test_feature_inference_does_not_broaden_absence_roles_or_alternatives(attribute, text, value):
+    source = Evidence(
+        evidence_id="E1", source_id="source", source_tier="internal_pdf", content_kind="source_excerpt",
+        source_locator="https://example.com/catalog#page=1&paragraph=0", source_version="v1",
+        text=text, observed_at=NOW,
+    )
+    with pytest.raises(ValueError):
+        ground_candidate(QualityProposal(
+            attribute_id=attribute, value=value, evidence_ids=["E1"], supporting_quote=text,
+            origin="inferred", justification="Proposed interpretation.",
+        ), AttributeDefinition(attribute_id=attribute, description="", value_type="boolean"), [source])
+
+
 @pytest.mark.parametrize("origin", ["literal", "derived", "inferred"])
 def test_explicit_negative_lead_answer_cannot_be_reinterpreted_as_positive_description(origin):
     source = Evidence(
