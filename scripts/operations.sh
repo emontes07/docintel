@@ -81,8 +81,10 @@ docintel_get() {
 
 docintel_console_export() (
   : "${QUALITY_OWNER:?Set QUALITY_OWNER to the existing batch owner}"
-  local transcript="$2.console.log" remote
-  trap 'rm -f -- "$transcript"' EXIT
+  local transcript="${2%.part}.console.$$.${RANDOM}.log" remote
+  (umask 077; set -o noclobber; : > "$transcript") || return
+  chmod 600 "./$transcript" || return
+  printf 'Console export diagnostic: %s\n' "$transcript" >&2
   remote=$(.venv/bin/python scripts/console_export.py command "$1" "$QUALITY_OWNER") || return
   local command=(az containerapp exec --subscription "$subscription" --resource-group "$group" --name "$api" --command "$remote" --only-show-errors)
   if [[ "$(uname -s)" == Darwin ]]; then

@@ -50,8 +50,10 @@ cookies/tokens out of Git, image contexts, logs and shell tracing.
 When API credentials are unavailable, `EXPORT_MODE=console` with `QUALITY_OWNER`
 uses existing Azure administrative app-exec permission, native `az containerapp
 exec`, and system `script` for its terminal. It calls `BatchService.export` for
-that batch/owner, decodes the workbook with the local `.venv` Python, and removes
-the transient console transcript. It adds no grant or endpoint and is not a
+that batch/owner, decodes the workbook with the local `.venv` Python, and preserves
+a uniquely named console diagnostic log with mode `0600`, including failures.
+These logs are not authority receipts; list deletion candidates and ask before
+removing any. It adds no grant or endpoint and is not a
 claim of end-user API authentication; perform that smoke with the genuine
 browser session. The default remains HTTP cookie/header export.
 `export` first performs an authenticated owner-scoped batch read, then downloads the

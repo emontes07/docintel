@@ -256,7 +256,7 @@ def test_console_decoder_never_replaces_export_with_incomplete_output(tmp_path, 
 
 @pytest.mark.parametrize("platform", ["Darwin", "Linux"])
 @pytest.mark.parametrize("failure", ["", "console"])
-def test_console_export_uses_native_exec_and_removes_private_transcript(invoke, exports_directory, platform, failure):
+def test_console_export_uses_native_exec_and_preserves_private_transcript(invoke, exports_directory, platform, failure):
     workbook = synthetic_workbook()
     output = exports_directory / "batch-001.xlsx"
     output.write_bytes(b"previous")
@@ -264,7 +264,7 @@ def test_console_export_uses_native_exec_and_removes_private_transcript(invoke, 
         "EXPORT_MODE": "console", "QUALITY_OWNER": "tenant/owner", "TEST_OS": platform,
         "WORKBOOK_BASE64": base64.b64encode(workbook).decode(),
     })
-    assert len(calls) == 1 and calls[0].startswith("script ")
+    assert len(calls) == 1 and calls[0].startswith("script "), result.stderr
     assert "containerapp" in calls[0] and "exec" in calls[0] and "ca-backend-docintel-dev-erik3" in calls[0]
     assert "--only-show-errors" in calls[0]
     if failure:
@@ -274,6 +274,10 @@ def test_console_export_uses_native_exec_and_removes_private_transcript(invoke, 
         assert result.returncode == 0, result.stderr
         assert output.read_bytes() == workbook
     assert not list(exports_directory.glob("*.part*"))
+    transcripts = list(exports_directory.glob("*.console.*.log"))
+    assert len(transcripts) == 1
+    assert transcripts[0].stat().st_mode & 0o777 == 0o600
+    assert "Connected" in transcripts[0].read_text()
 
 
 @pytest.mark.parametrize("token,origin", [
