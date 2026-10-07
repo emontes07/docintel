@@ -166,6 +166,7 @@ def test_start_runs_exactly_one_new_worker_execution(invoke):
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "caj-quality-execution"
     assert len(calls) == 1 and calls[0].startswith("az <containerapp> <job> <start>")
+    assert "<--container-name> <caj-docintel-batch-dev-erik3>" in calls[0]
     assert "<--env-vars> <QUALITY_RUN_ID=quality-001> <QUALITY_BATCH_ID=batch-001> <QUALITY_OWNER=tenant/owner>" in calls[0]
     assert "<QUALITY_WEB_ENABLED=false> <QUALITY_FORD_IMAGE_BLOB=rendered/ford.png>" in calls[0]
     assert "<QUALITY_SMOKE_ONLY=true>" in calls[0]
@@ -184,6 +185,7 @@ def test_cost_reads_structured_worker_logs_without_starting_another_execution(in
     assert result.returncode == 0 and result.stdout.strip() == '{"known_run_cost_usd":1.25}'
     assert len(calls) == 1
     assert calls[0].startswith("az <containerapp> <job> <logs> <show>")
+    assert "<--container> <caj-docintel-batch-dev-erik3>" in calls[0]
     assert "<--execution> <caj-quality-execution> <--tail> <100>" in calls[0]
 
 

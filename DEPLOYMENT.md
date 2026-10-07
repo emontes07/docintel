@@ -28,6 +28,9 @@ uses one replica, one completion and zero automatic retries. `start RUN_ID`
 starts exactly one manual execution with `QUALITY_RUN_ID`; it does not
 build, deploy, reset state or automatically retry a failed/uncertain start.
 It prints the execution name for the cost/log command.
+Both commands select the existing job container `caj-docintel-batch-dev-erik3`:
+native CLI start requires that selection to apply environment overrides, and
+native log retrieval requires its container argument.
 
 ## Runtime and authenticated export
 

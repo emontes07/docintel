@@ -56,7 +56,7 @@ docintel_start() {
   if [[ -n "${QUALITY_FORD_IMAGE_BLOB:-}" ]]; then environment+=("QUALITY_FORD_IMAGE_BLOB=$QUALITY_FORD_IMAGE_BLOB"); fi
   if [[ -n "${QUALITY_SMOKE_ONLY:-}" ]]; then environment+=("QUALITY_SMOKE_ONLY=$QUALITY_SMOKE_ONLY"); fi
   az containerapp job start --subscription "$subscription" --resource-group "$group" --name "$job" \
-    --env-vars "${environment[@]}" --query name --output tsv
+    --container-name "$job" --env-vars "${environment[@]}" --query name --output tsv
 }
 
 docintel_get() {
@@ -131,5 +131,5 @@ docintel_cost() {
   [[ $# == 1 ]] || { docintel_usage >&2; return 2; }
   docintel_run_id "$1"
   az containerapp job logs show --subscription "$subscription" --resource-group "$group" --name "$job" \
-    --execution "$1" --tail 100
+    --container "$job" --execution "$1" --tail 100
 }
