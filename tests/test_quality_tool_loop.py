@@ -1076,11 +1076,17 @@ def test_manufacturer_search_can_authorize_new_manufacturer_url_without_callback
     "https://user:password@new-supplier.example/current-product",
 ])
 def test_public_discovery_still_rejects_unsafe_urls(url):
-    from backend.core.websearch import ExternalEvidenceError
     infrastructure = web()
     infrastructure.search.side_effect = [[], [url]]
-    with pytest.raises((loop.ToolLoopError, ExternalEvidenceError)):
-        run(completion(public_discovery_turns()), scope=public_scope(), web=infrastructure)
+    turns = public_discovery_turns()
+    adapter = completion([turns[0], turns[1], turns[-1]])
+    result = run(adapter, scope=public_scope(), web=infrastructure)
+    assert result.status == "completed" and not result.evidence
+    output = next(json.loads(item["output"]) for item in adapter.client.responses.create.call_args.kwargs["input"]
+                  if item.get("type") == "function_call_output" and item["call_id"] == "public")
+    assert output["status"] == "no_results" and output["urls"] == []
+    assert output["rejected_discovery"][0]["url"] == url
+    assert output["rejected_discovery"][0]["status"] == "rejected"
     infrastructure.browse.assert_not_called()
     infrastructure.page_fetch.assert_not_called()
 
@@ -1449,3 +1455,548 @@ def test_even_internal_availability_markers_from_hooks_are_fatal(stage):
         run(adapter, web=infrastructure, **options)
     assert caught.value is failure and failure.tool_loop_result.status == "failed"
     adapter.client.responses.create.assert_called_once()
+
+
+@pytest.mark.parametrize("discovery_scope", ["manufacturer", "approved"])
+def test_mixed_invalid_and_safe_discovery_results_continue_without_fetching_rejections(monkeypatch, discovery_scope):
+    infrastructure = web()
+    safe = URL if discovery_scope == "manufacturer" else NEW_PUBLIC_URL
+    rejected = [safe.replace("https:", "http:"), safe + "?tracking=synthetic"]
+    infrastructure.search.side_effect = (
+        [[rejected[0], safe, rejected[1]]] if discovery_scope == "manufacturer"
+        else [[], [rejected[0], safe, rejected[1]]]
+    )
+    monkeypatch.setattr(loop, "_public_addresses", Mock(return_value=[("synthetic-global-address",)]))
+    turns = [] if discovery_scope == "manufacturer" else [
+        response(tool("web_search", call_id="manufacturer", scope="manufacturer", attribute_id="Material")),
+    ]
+    turns += [
+        response(tool("web_search", call_id="mixed", scope=discovery_scope, attribute_id="Material")),
+        response(tool("browse", call_id="safe", url=safe, attribute_id="Material")),
+        response(message()),
+    ]
+    adapter = completion(turns)
+    result = run(adapter, scope=public_scope(), web=infrastructure)
+    assert result.status == "completed"
+    mixed = next(json.loads(item["output"]) for item in adapter.client.responses.create.call_args.kwargs["input"]
+                 if item.get("type") == "function_call_output" and item["call_id"] == "mixed")
+    assert mixed["urls"] == [safe] and mixed["evidence"] == []
+    assert [entry["url"] for entry in mixed["rejected_discovery"]] == rejected
+    assert all(entry["status"] == "rejected" and entry["reason"] for entry in mixed["rejected_discovery"])
+    diagnostic = next(entry for entry in result.diagnostics
+                      if entry["operation"] == "web_search" and entry["context"]["search_scope"] == discovery_scope)
+    assert diagnostic["rejected_discovery"] == mixed["rejected_discovery"]
+    assert diagnostic["status"] == "succeeded" and diagnostic["cost_usd"] == .0125
+    infrastructure.browse.assert_called_once_with(safe)
+    infrastructure.page_fetch.assert_called_once_with(safe)
+    assert [entry.source_locator for entry in result.evidence] == [safe]
+
+
+def test_local_tool_projection_is_compact_but_full_evidence_and_grounding_are_unchanged():
+    local = evidence().model_copy(update={
+        "qualification": "Synthetic exact-product qualification",
+        "provider_retrieved_at": NOW, "source_published_at": NOW, "attribute_ids": ["Material", "Resolved"],
+    })
+    original = local.model_dump(mode="json")
+    grounding = Mock(side_effect=ground_candidate)
+    judging = Mock(side_effect=judge)
+    adapter = completion([response(tool()), response(message([proposal()]))])
+    result = run(adapter, [local], ground_candidate=grounding, judge_candidates=judging)
+    output = next(json.loads(item["output"]) for item in adapter.client.responses.create.call_args.kwargs["input"]
+                  if item.get("type") == "function_call_output")
+    retained = {"evidence_id", "source_id", "source_tier", "source_locator", "text", "qualification"}
+    assert output["evidence"] == [{key: original[key] for key in retained}]
+    assert local.model_dump(mode="json") == original
+    assert result.evidence[0].model_dump(mode="json") == original
+    assert grounding.call_args.args[2][0].model_dump(mode="json") == original
+    assert judging.call_args.args[1][0].model_dump(mode="json") == original
+    assert result.submissions[0].candidate.evidence_ids == [local.evidence_id]
+    assert result.submissions[0].candidate.judge_status == "accepted"
+
+
+@pytest.mark.parametrize("url", [
+    "https://fordmeterbox.com",
+    "https://FORDMETERBOX.COM/synthetic-product",
+    "https://fordmeterbox.com:443/synthetic-product",
+    "https://fordmeterbox.com/synthetic-product#fragment",
+    "https://[malformed/synthetic-product",
+    "/relative-product",
+])
+def test_noncanonical_and_malformed_discovery_urls_are_not_rewritten(url):
+    infrastructure = web()
+    infrastructure.search.return_value = [url, URL]
+    adapter = completion([
+        response(tool("web_search", scope="manufacturer", attribute_id="Material")),
+        response(message()),
+    ])
+    meter = Mock(side_effect=price)
+    result = run(adapter, web=infrastructure, usage_callback=meter)
+    assert result.status == "completed" and not result.evidence
+    output = next(json.loads(item["output"]) for item in adapter.client.responses.create.call_args.kwargs["input"]
+                  if item.get("type") == "function_call_output")
+    assert output["urls"] == [URL]
+    assert output["rejected_discovery"][0]["url"] == url
+    assert output["rejected_discovery"][0]["code"] in {"unsafe_url", "noncanonical_url", "malformed_url"}
+    paid = next(call.args[0] for call in meter.call_args_list if call.args[0]["operation"] == "web_search")
+    assert paid["rejected_discovery"] == output["rejected_discovery"]
+    assert infrastructure.counts[PRODUCT.item_id]["search"] == 1
+    infrastructure.browse.assert_not_called()
+    infrastructure.page_fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("requested", ["http://fordmeterbox.com/synthetic-product", "https://fordmeterbox.com/"])
+def test_discovery_rejection_does_not_authorize_direct_or_normalized_tool_urls(requested):
+    infrastructure = web()
+    infrastructure.search.return_value = ["http://fordmeterbox.com/synthetic-product", "https://fordmeterbox.com", URL]
+    adapter = completion([
+        response(tool("web_search", scope="manufacturer", attribute_id="Material")),
+        response(tool("browse", call_id="rejected", url=requested, attribute_id="Material")),
+    ])
+    with pytest.raises((loop.ToolLoopError, ExternalEvidenceError)) as caught:
+        run(adapter, scope=public_scope(), web=infrastructure)
+    assert caught.value.tool_loop_result.status == "failed"
+    assert len(next(d for d in caught.value.tool_loop_result.diagnostics
+                    if d["operation"] == "web_search")["rejected_discovery"]) == 2
+    infrastructure.browse.assert_not_called()
+    infrastructure.page_fetch.assert_not_called()
+
+
+def test_discovery_scope_rejections_are_explicit_and_cacheable_without_recharging():
+    unapproved = URL + "/unapproved"
+    infrastructure = web()
+    infrastructure.search.return_value = [OTHER_URL, unapproved, URL]
+    adapter = completion([
+        response(tool("web_search", scope="manufacturer", attribute_id="Material")),
+        response(tool("web_search", call_id="cached", scope="manufacturer", attribute_id="Material")),
+        response(message()),
+    ])
+    result = run(adapter, web=infrastructure)
+    outputs = [json.loads(item["output"]) for item in adapter.client.responses.create.call_args.kwargs["input"]
+               if item.get("type") == "function_call_output"]
+    assert outputs[0] == outputs[1]
+    assert outputs[0]["urls"] == [URL]
+    assert [e["code"] for e in outputs[0]["rejected_discovery"]] == ["outside_search_scope", "source_not_approved"]
+    cached = next(d for d in result.diagnostics if d["operation"] == "web_search_cache")
+    assert cached["rejected_discovery"] == outputs[0]["rejected_discovery"] and cached["cost_usd"] == 0
+    assert result.cost_usd == Decimal(".0296")
+    infrastructure.search.assert_called_once()
+    assert infrastructure.counts[PRODUCT.item_id]["search"] == 1
+
+
+@pytest.mark.parametrize("failure", [
+    CostLimitExceeded("Parent approval budget stop"),
+    loop.ToolAccountingError("Parent approval accounting stop"),
+    ValueError("Parent approval persistence failure"),
+    loop.ToolLoopError("Parent approval programming failure"),
+])
+def test_discovery_url_rejection_does_not_swallow_parent_approval_failures(failure):
+    infrastructure = web()
+    def approve(_manifest, _url):
+        raise failure
+    scope = loop.ProductSourceScope(PRODUCT, frozenset({"e1"}), ("fordmeterbox.com",), approve_url=approve)
+    adapter = completion([response(tool("web_search", scope="manufacturer", attribute_id="Material"))])
+    with pytest.raises(type(failure)) as caught:
+        run(adapter, web=infrastructure, scope=scope)
+    assert caught.value is failure and failure.tool_loop_result.status == "failed"
+    infrastructure.browse.assert_not_called()
+    adapter.client.responses.create.assert_called_once()
+
+
+def test_discovery_rejections_preserve_shared_twelve_search_six_browse_limits():
+    infrastructure = web()
+    infrastructure.counts[PRODUCT.item_id] = {"search": 11, "browse": 5, "direct_page": 0}
+    infrastructure.search.return_value = ["http://fordmeterbox.com/invalid", URL]
+    scope = loop.ProductSourceScope(
+        PRODUCT, frozenset({"e1"}), ("fordmeterbox.com",), approved_urls=frozenset({URL, PDF_URL}),
+    )
+    adapter = completion([
+        response(tool("web_search", scope="manufacturer", attribute_id="Material")),
+        response(tool("browse", call_id="last-browse", url=URL, attribute_id="Material")),
+        response(tool("web_search", call_id="cached-search", scope="manufacturer", attribute_id="Material")),
+        response(tool("browse", call_id="capped-browse", url=PDF_URL, attribute_id="Material")),
+        response(message()),
+    ])
+    result = run(adapter, web=infrastructure, scope=scope)
+    assert result.status == "completed"
+    assert infrastructure.counts[PRODUCT.item_id] == {"search": 12, "browse": 6, "direct_page": 1}
+    infrastructure.search.assert_called_once()
+    infrastructure.browse.assert_called_once_with(URL)
+    infrastructure.page_fetch.assert_called_once_with(URL)
+    capped = next(d for d in result.diagnostics if d["operation"] == "web_browse_cap")
+    assert capped["cost_usd"] == 0
+    subsequent = run(completion([
+        response(tool("web_search", scope="manufacturer", attribute_id="Material")), response(message()),
+    ]), web=infrastructure, scope=scope)
+    assert subsequent.status == "completed"
+    assert any(d["operation"] == "web_search_cap" and d["cost_usd"] == 0 for d in subsequent.diagnostics)
+    assert infrastructure.counts[PRODUCT.item_id] == {"search": 12, "browse": 6, "direct_page": 1}
+    infrastructure.search.assert_called_once()
+
+
+def test_compact_vendor_projection_keeps_full_row_text_identity_and_scope():
+    current = evidence("row-approved", "Body: brass.", "vendor_table").model_copy(update={
+        "qualification": "Synthetic vendor row qualification",
+    })
+    neighbor = evidence("row-neighbor", "Neighbor: unrelated value.", "vendor_table")
+    adapter = completion([
+        response(tool("search_vendor_rows", attribute_id="Material")),
+        response(message()),
+    ])
+    result = run(adapter, [current, neighbor], scope=loop.ProductSourceScope(PRODUCT, frozenset({current.evidence_id})))
+    output = next(json.loads(item["output"]) for item in adapter.client.responses.create.call_args.kwargs["input"]
+                  if item.get("type") == "function_call_output")
+    expected = current.model_dump(mode="json", include={
+        "evidence_id", "source_id", "source_tier", "source_locator", "text", "qualification",
+    })
+    assert output["evidence"] == [expected]
+    assert result.evidence[0].model_dump(mode="json") == current.model_dump(mode="json")
+    assert neighbor.evidence_id not in str(adapter.client.responses.create.call_args_list)
+
+
+def test_compact_web_projection_retains_provenance_and_grounding_uses_full_evidence():
+    infrastructure = web()
+    original_page = page(URL)
+    source = "quality-tool-web-" + hashlib.sha256(URL.encode()).hexdigest()[:16]
+    evidence_id = source + ":" + original_page.content_hash
+    grounding = Mock(side_effect=ground_candidate)
+    adapter = completion([
+        response(tool("browse", url=URL, attribute_id="Material")),
+        response(message([proposal(evidence_id)])),
+    ])
+    result = run(adapter, web=infrastructure, ground_candidate=grounding)
+    output = next(json.loads(item["output"]) for item in adapter.client.responses.create.call_args.kwargs["input"]
+                  if item.get("type") == "function_call_output")
+    retained = {"evidence_id", "source_id", "source_tier", "source_locator", "text", "qualification", "provider_retrieved_at"}
+    full = result.evidence[0].model_dump(mode="json")
+    assert output["evidence"] == [{key: full[key] for key in retained}]
+    assert full["source_version"] == "sha256:" + original_page.content_hash
+    assert full["observed_at"] and full["discovery_method"] == "webiq"
+    assert output["evidence"][0]["provider_retrieved_at"] == "2026-10-07T00:00:00Z"
+    assert output["evidence"][0]["evidence_id"] == evidence_id
+    assert grounding.call_args.args[2][0].model_dump(mode="json") == full
+    assert result.submissions[0].candidate.evidence_ids == [evidence_id]
+    assert result.submissions[0].candidate.judge_status == "accepted"
+
+
+def test_compact_pdf_projection_retains_exact_qualification_and_source_cache(monkeypatch):
+    infrastructure, parser, _ = pdf_web(monkeypatch, text="TEST-123 Body: brass.")
+    adapter = completion([
+        response(tool("fetch_pdf", url=PDF_URL, attribute_id="Material")),
+        response(tool("fetch_pdf", call_id="cached", url=PDF_URL, attribute_id="Material")),
+        response(message()),
+    ])
+    result = run(adapter, web=infrastructure)
+    outputs = [json.loads(item["output"])["evidence"][0]
+               for item in adapter.client.responses.create.call_args.kwargs["input"]
+               if item.get("type") == "function_call_output"]
+    assert outputs[0] == outputs[1]
+    full = result.evidence[0].model_dump(mode="json")
+    assert outputs[0] == {key: full[key] for key in {
+        "evidence_id", "source_id", "source_tier", "source_locator", "text", "qualification", "provider_retrieved_at",
+    }}
+    assert "PDF provenance:" in outputs[0]["qualification"]
+    assert full["source_version"].startswith("sha256:") and full["observed_at"]
+    assert infrastructure.counts[PRODUCT.item_id]["direct_page"] == 1
+    parser.extract_pdf_bytes.assert_not_called()
+
+
+@pytest.mark.parametrize("max_steps", [15, 4])
+def test_tool_requests_reuse_shared_rules_and_prioritize_attribute_names_only(max_steps):
+    from backend.quality_pipeline import EVIDENCE_RULES
+    priorities = ["Port Type", "Material Standard", "Compatible Meter Size", "Flanged Outlet"]
+    names = ["Nominal Size", "Ball Coating", *priorities]
+    product = Manifest(product=PRODUCT, attributes=[
+        AttributeDefinition(attribute_id=name, description="Synthetic definition", value_type="string")
+        for name in names
+    ])
+    statuses: dict[str, loop.Status] = {name: "unresolved" for name in names}
+    statuses["Material Standard"] = "disputed"
+    adapter = completion([response(message())])
+    result = loop.run_tool_loop(
+        product, [], adapter, pass1_status=statuses,
+        scope=loop.ProductSourceScope(PRODUCT, frozenset()),
+        ground_candidate=ground_candidate, judge_candidates=judge,
+        maximum_cost=maximum, usage_callback=price, max_steps=max_steps,
+    )
+    assert result.status == "completed"
+    request = adapter.client.responses.create.call_args.kwargs
+    instructions = request["instructions"]
+    assert loop.EVIDENCE_RULES is EVIDENCE_RULES
+    assert instructions.count(EVIDENCE_RULES) == 1
+    priority_line = instructions.split(
+        "Among unresolved/disputed definitions, investigate these attribute names first:\n", 1,
+    )[1].splitlines()[0]
+    assert priority_line.removesuffix(".").split("; ") == priorities
+    assert "Skip resolved names or names absent from the pending definitions" in instructions
+    assert "no expected values or evidence" in instructions
+    packet = json.loads(request["input"][0]["content"])
+    assert [definition["attribute_id"] for definition in packet["attributes"]] == sorted(names)
+    assert packet["pass1_status"] == statuses
+    assert packet["local_sources"] == []
+    assert all(not definition["allowed_values"] and not definition["examples"] for definition in packet["attributes"])
+    assert "REFERENCE_ONLY_VALUE" not in json.dumps(request, default=str)
+    if max_steps == 4:
+        assert request["tools"] == [] and request["tool_choice"] == "none"
+
+
+def test_priority_name_does_not_override_resolved_attribute_scope():
+    names = ["Port Type", "Material Standard"]
+    product = Manifest(product=PRODUCT, attributes=[
+        AttributeDefinition(attribute_id=name, description="Synthetic definition", value_type="string")
+        for name in names
+    ])
+    infrastructure = web()
+    adapter = completion([
+        response(tool("web_search", scope="manufacturer", attribute_id="Port Type")),
+    ])
+    with pytest.raises(loop.ToolLoopError, match="resolved or unknown"):
+        loop.run_tool_loop(
+            product, [], adapter, pass1_status={"Port Type": "resolved", "Material Standard": "unresolved"},
+            scope=loop.ProductSourceScope(PRODUCT, frozenset(), ("fordmeterbox.com",)),
+            ground_candidate=ground_candidate, judge_candidates=judge, web=infrastructure,
+            maximum_cost=maximum, usage_callback=price,
+        )
+    packet = json.loads(adapter.client.responses.create.call_args.kwargs["input"][0]["content"])
+    assert [definition["attribute_id"] for definition in packet["attributes"]] == ["Material Standard"]
+    assert packet["pass1_status"] == {"Material Standard": "unresolved"}
+    infrastructure.search.assert_not_called()
+
+
+def growing_history_maximum(context):
+    if context["operation"] != "model":
+        return maximum(context)
+    if context["phase"] == "judge":
+        return Decimal(".03")
+    request = context["request"]
+    inputs = request.get("extra_body", {}).get("input", request["input"])
+    opaque_bytes = sum(len(item.get("encrypted_content", "").encode()) for item in inputs
+                       if item.get("type") == "reasoning")
+    return Decimal(".05") + Decimal(opaque_bytes) * Decimal(".4") / Decimal(16 * 1024)
+
+
+@pytest.mark.parametrize("votes", [["accepted"], ["judge_disputed", "accepted", "accepted"]])
+def test_monetary_closeout_uses_fresh_complete_evidence_and_same_cached_judge(votes):
+    from backend.quality_judge import JudgeCache
+    cache = JudgeCache(namespace="fresh-monetary-closeout", policy="same-parent-policy")
+    cached_judge, observed_votes = parent_cached_judge(cache, votes)
+    reasons = [
+        {"id": "rs_first", "type": "reasoning", "summary": [], "encrypted_content": "a" * (16 * 1024)},
+        {"id": "rs_second", "type": "reasoning", "summary": [], "encrypted_content": "b" * (16 * 1024)},
+    ]
+    for cached in (False, True):
+        infrastructure = web()
+        adapter = completion([
+            response(reasons[0], tool()),
+            response(reasons[1], tool("browse", call_id="original-web", url=URL, attribute_id="Material")),
+            response(message([proposal()])),
+        ])
+        usage = Mock(side_effect=price)
+        before = Mock()
+        prefix = json.dumps(structured_prefix())
+        result = run(
+            adapter, web=infrastructure, judge_candidates=cached_judge,
+            maximum_cost=growing_history_maximum, usage_callback=usage, before_call=before,
+            initial_cost_usd=".3", prompt_cache_key="family", cache_prefix=prefix,
+        )
+        assert result.status == "completed" and result.submissions[0].candidate.judge_status == "accepted"
+        assert len(observed_votes) == len(votes)
+        assert result.steps == 6 + (0 if cached else len(votes)) <= 15
+        assert result.cost_usd == Decimal(".3296") + (0 if cached else Decimal(".02") * len(votes))
+        assert result.cost_usd <= 1 and adapter.client.responses.create.call_count == 3
+        requests = [call.kwargs for call in adapter.client.responses.create.call_args_list]
+        assert reasons[0] in requests[1]["extra_body"]["input"]
+        assert any(item.get("type") == "function_call_output" for item in requests[1]["extra_body"]["input"])
+        fresh = requests[-1]
+        assert fresh["tools"] == [] and fresh["tool_choice"] == "none"
+        assert fresh.get("extra_body") == {"prompt_cache_key": "family"}
+        assert "previous_response_id" not in fresh
+        assert len(fresh["input"]) == 1 and fresh["input"][0]["role"] == "user"
+        packet = json.loads(fresh["input"][0]["content"])
+        assert set(packet) == {"product", "attributes", "structured_definitions", "pass1_status", "evidence"}
+        assert packet["product"] == PRODUCT.model_dump(mode="json")
+        expected_evidence = []
+        for item in result.evidence:
+            fields = {"evidence_id", "source_id", "source_tier", "source_locator", "text", "qualification"}
+            if item.source_tier in {"manufacturer_web", "approved_web"}:
+                fields.add("provider_retrieved_at")
+            expected_evidence.append(item.model_dump(mode="json", include=fields))
+        assert packet["evidence"] == expected_evidence and len(expected_evidence) == 2
+        assert all(item.source_version and item.observed_at for item in result.evidence)
+        assert "rs_first" not in json.dumps(fresh, default=str) and "rs_second" not in json.dumps(fresh, default=str)
+        denied = [d for d in result.diagnostics if d["operation"] == "model" and d["step"] is None]
+        assert len(denied) == 1 and denied[0]["cost_usd"] == 0
+        assert denied[0]["maximum_cost_usd"] == .85 and denied[0]["status"] == "stopped"
+        closeout = next(d for d in result.diagnostics if d.get("fresh_context"))
+        assert closeout["mode"] == "terminal_closeout" and closeout["closeout_reason"]
+        assert closeout["step"] == 6 and closeout["maximum_cost_usd"] == .05
+        model_usage = [call.args[0] for call in usage.call_args_list if call.args[0]["operation"] == "model"]
+        assert len(model_usage) == 3 + (0 if cached else len(votes))
+        assert before.call_count == usage.call_count
+        infrastructure.page_fetch.assert_called_once()
+
+
+def test_monetary_closeout_too_small_budget_sends_neither_request():
+    adapter = completion()
+    bounds = Mock(side_effect=growing_history_maximum)
+    before, usage = Mock(), Mock(side_effect=price)
+    result = run(adapter, maximum_cost=bounds, before_call=before, usage_callback=usage, initial_cost_usd=".99")
+    assert result.status == "budget_stopped" and result.steps == 0 and result.cost_usd == Decimal(".99")
+    adapter.client.responses.create.assert_not_called()
+    before.assert_not_called()
+    usage.assert_not_called()
+    assert bounds.call_count == 2
+    assert len(result.diagnostics) == 2
+    assert result.diagnostics[-1]["fresh_context"] and result.diagnostics[-1]["cost_usd"] == 0
+
+
+def first_opaque_tool_response():
+    return response(
+        {"id": "rs_budget", "type": "reasoning", "summary": [], "encrypted_content": "r" * (16 * 1024)},
+        tool(),
+    )
+
+
+def test_monetary_closeout_still_requires_global_admission():
+    failure = CostLimitExceeded("Synthetic global monetary stop")
+    def global_before(context):
+        if context.get("fresh_context"):
+            raise failure
+    usage = Mock(side_effect=price)
+    adapter = completion([first_opaque_tool_response()])
+    with pytest.raises(CostLimitExceeded) as caught:
+        run(adapter, maximum_cost=growing_history_maximum, before_call=global_before,
+            usage_callback=usage, initial_cost_usd=".7")
+    assert caught.value is failure and failure.tool_loop_result.status == "failed"
+    assert failure.tool_loop_result.steps == 2
+    assert failure.tool_loop_result.diagnostics[-1]["fresh_context"]
+    assert failure.tool_loop_result.diagnostics[-1]["step"] is None
+    adapter.client.responses.create.assert_called_once()
+    usage.assert_called_once()
+
+
+def test_unavailable_estimator_is_not_a_recoverable_product_bound_denial():
+    failure = ValueError("Synthetic unavailable cost bound")
+    def unavailable_bound(context):
+        if context["operation"] == "model" and any(
+            item.get("type") == "reasoning" for item in context["request"]["input"]
+        ):
+            raise failure
+        return growing_history_maximum(context)
+    adapter = completion([first_opaque_tool_response()])
+    with pytest.raises(ValueError) as caught:
+        run(adapter, maximum_cost=unavailable_bound, initial_cost_usd=".7")
+    assert caught.value is failure and failure.tool_loop_result.status == "failed"
+    assert not any(entry.get("fresh_context") for entry in failure.tool_loop_result.diagnostics)
+    adapter.client.responses.create.assert_called_once()
+
+
+def test_fresh_monetary_closeout_provider_failure_is_never_retried():
+    failure = ValueError("Synthetic provider failure")
+    adapter = completion([first_opaque_tool_response(), failure])
+    with pytest.raises(loop.ToolAccountingError) as caught:
+        run(adapter, maximum_cost=growing_history_maximum, initial_cost_usd=".7")
+    assert caught.value.__cause__ is failure
+    result = caught.value.tool_loop_result
+    assert result.status == "failed" and result.cost_complete is False
+    assert adapter.client.responses.create.call_count == 2
+    assert sum(bool(entry.get("fresh_context")) for entry in result.diagnostics) == 1
+
+
+def test_fresh_monetary_closeout_cannot_execute_tools():
+    infrastructure = web()
+    adapter = completion([
+        first_opaque_tool_response(),
+        response(tool("browse", call_id="forbidden", url=URL, attribute_id="Material")),
+    ])
+    with pytest.raises(QualityModelResponseError, match="closeout") as caught:
+        run(adapter, web=infrastructure, maximum_cost=growing_history_maximum, initial_cost_usd=".7")
+    result = caught.value.tool_loop_result
+    assert result.status == "failed" and result.steps == 3
+    assert result.diagnostics[-1]["fresh_context"] and result.diagnostics[-1]["status"] == "response_invalid"
+    assert adapter.client.responses.create.call_count == 2
+    infrastructure.browse.assert_not_called()
+    infrastructure.page_fetch.assert_not_called()
+
+
+def test_history_based_step_closeout_can_fall_back_without_consuming_judge_reserve():
+    from backend.quality_judge import JudgeCache
+    cached_judge, votes = parent_cached_judge(
+        JudgeCache(namespace="step-and-money-closeout", policy="same-parent-policy"),
+        ["judge_disputed", "accepted", "accepted"],
+    )
+    adapter = completion([first_opaque_tool_response(), response(message([proposal()]))])
+    result = run(adapter, judge_candidates=cached_judge, maximum_cost=growing_history_maximum,
+                 initial_cost_usd=".7", max_steps=6)
+    assert result.status == "completed" and result.steps == 6 and len(votes) == 3
+    assert result.cost_usd == Decimal(".7714")
+    denied = next(entry for entry in result.diagnostics if entry["operation"] == "model" and entry["step"] is None)
+    assert denied["mode"] == "terminal_closeout" and denied["remaining_steps"] == 4
+    fresh = next(entry for entry in result.diagnostics if entry.get("fresh_context"))
+    assert fresh["remaining_steps"] == 4 and fresh["step"] == 3
+
+
+def test_unaffordable_fresh_evidence_is_not_truncated_or_sent():
+    local = evidence(text="Body: brass.\n" + "complete source context " * 512)
+    admissions = []
+    def bounded_evidence(context):
+        if context["operation"] == "model":
+            request = context["request"]
+            packet = json.loads(request["input"][0]["content"])
+            if "evidence" in packet:
+                admissions.append(packet)
+                return Decimal(".1")
+        return growing_history_maximum(context)
+    adapter = completion([first_opaque_tool_response()])
+    usage = Mock(side_effect=price)
+    result = run(adapter, [local], maximum_cost=bounded_evidence, usage_callback=usage, initial_cost_usd=".9")
+    assert result.status == "budget_stopped" and result.steps == 2 and result.cost_usd == Decimal(".9057")
+    assert len(admissions) == 1 and admissions[0]["evidence"][0]["text"] == local.text
+    assert result.evidence[0].model_dump(mode="json") == local.model_dump(mode="json")
+    assert len([entry for entry in result.diagnostics if entry["operation"] == "model" and entry["step"] is None]) == 2
+    adapter.client.responses.create.assert_called_once()
+    usage.assert_called_once()
+
+
+@pytest.mark.parametrize("stage", ["before", "maximum"])
+def test_monetary_closeout_marker_from_external_hooks_is_not_recoverable(stage):
+    failure = loop._MonetaryCloseout("Synthetic external hook stop")
+    def fail(_context):
+        raise failure
+    adapter = completion()
+    options = {"before_call": fail} if stage == "before" else {"maximum_cost": fail}
+    with pytest.raises(loop._MonetaryCloseout) as caught:
+        run(adapter, **options)
+    assert caught.value is failure and failure.tool_loop_result.status == "failed"
+    assert not any(entry.get("fresh_context") for entry in failure.tool_loop_result.diagnostics)
+    adapter.client.responses.create.assert_not_called()
+
+
+def test_real_sdk_sends_only_clean_fresh_terminal_input_after_monetary_denial():
+    requests = []
+    outputs = iter([first_opaque_tool_response(), response(message([proposal()]))])
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=next(outputs))
+    client = AzureOpenAI(
+        base_url="https://synthetic.openai.azure.com/openai/v1", api_key="offline", api_version="v1",
+        max_retries=0, http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        result = run(
+            completion(client=client), maximum_cost=growing_history_maximum, initial_cost_usd=".7",
+            prompt_cache_key="family", cache_prefix=json.dumps(structured_prefix()),
+        )
+    finally:
+        client.close()
+    assert result.status == "completed" and result.submissions[0].candidate.judge_status == "accepted"
+    assert len(requests) == 2 and result.cost_usd == Decimal(".7114")
+    assert requests[0]["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+    fresh = requests[1]
+    assert fresh["tools"] == [] and fresh["tool_choice"] == "none"
+    assert "prompt_cache_options" not in fresh and "previous_response_id" not in fresh
+    assert len(fresh["input"]) == 1 and fresh["input"][0]["role"] == "user"
+    assert isinstance(fresh["input"][0]["content"], str)
+    packet = json.loads(fresh["input"][0]["content"])
+    assert packet["evidence"][0]["evidence_id"] == "e1"
+    assert packet["evidence"][0]["text"] == evidence().text
+    assert packet["evidence"][0]["source_locator"] == evidence().source_locator

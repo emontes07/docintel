@@ -86,6 +86,20 @@ def test_tool_maximum_uses_configured_web_prices_and_actual_ocr_page_bound():
         maximum_tool_cost({"operation": "document_intelligence"}, {}, rates)
 
 
+def test_tool_cost_does_not_count_transport_escaping_as_model_tokens():
+    def estimate(content):
+        return maximum_tool_cost({
+            "operation": "model", "request": {
+                "max_output_tokens": 16000, "tools": [],
+                "input": [{"role": "user", "content": content}],
+            },
+        }, {"input": 2, "cache_write": 2.5, "output": 10}, {})
+
+    assert estimate('"' * 1024) == estimate("a" * 1024)
+    assert estimate("\\" * 1024) == estimate("a" * 1024)
+    assert estimate("\u00e9" * 512) == estimate("a" * 1024)
+
+
 @pytest.mark.parametrize("operation", ["web_search", "webiq_search", "web_browse", "webiq_browse"])
 def test_provider_aliases_charge_the_same_meter(tmp_path, operation):
     meter = QualityCostMeter(SQLiteStore(tmp_path / "cost"), "b", "r")

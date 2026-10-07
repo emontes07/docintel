@@ -132,6 +132,17 @@ class QualityCostMeter:
         return entry
 
 
+def _model_text_bytes(value) -> int:
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, dict):
+        return 4 + sum(len(key.encode("utf-8")) + _model_text_bytes(entry) + 8
+                       for key, entry in value.items())
+    if isinstance(value, list):
+        return 4 + sum(_model_text_bytes(entry) + 4 for entry in value)
+    return len(json.dumps(value, allow_nan=False).encode("utf-8"))
+
+
 def maximum_tool_cost(context: dict, model_prices: dict, prices: dict) -> Decimal:
     operation = context["operation"]
     if operation in {"web_search", "web_browse", "document_intelligence"}:
@@ -158,10 +169,11 @@ def maximum_tool_cost(context: dict, model_prices: dict, prices: dict) -> Decima
     inputs = request.get("input", [])
     if not isinstance(inputs, list):
         raise CostLimitExceeded("Tool request must expose its complete input history")
-    # UTF-8 bytes overbound text tokens. Replay may contain compressed reasoning;
-    # also budget the entire prior output limit for each opaque reasoning item.
+    # Count model-visible text, not additional HTTP JSON escaping around it.
+    # Replay may contain compressed reasoning, so also budget the entire prior
+    # output limit for each opaque reasoning item.
     reasoning = sum(item.get("type") == "reasoning" for item in inputs if isinstance(item, dict))
-    tokens = len(encoded.encode("utf-8")) + 1024 + 256 * (len(inputs) + len(request.get("tools", [])))
+    tokens = _model_text_bytes(request) + 1024 + 256 * (len(inputs) + len(request.get("tools", [])))
     tokens += reasoning * limit
     input_rate = max(_amount(model_prices["input"]), _amount(model_prices["cache_write"]))
     return (tokens * input_rate + limit * _amount(model_prices["output"])) / 1_000_000

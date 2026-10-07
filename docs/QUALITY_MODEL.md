@@ -98,6 +98,18 @@ fatal. With four steps left, the model must conclude without tools, leaving room
 for majority judging. Search/Browse share the first pass's 12/6 per-product limits.
 Tool-produced candidates are labeled in technical grounding metadata; rechecking
 an identical candidate does not duplicate it.
+Tool evidence sent to the model omits redundant machine-only metadata, while the
+full original Evidence objects remain in grounding, judging, results and caches.
+The cost estimate counts UTF-8 model text plus framing/schema/reasoning allowance,
+not additional HTTP JSON escaping. Invalid search-result URLs are recorded as
+rejected discovery entries and are never fetched; a bad lead does not invalidate
+the other safe results. Invalid model-supplied tool URLs remain errors.
+Both extraction and tools share the same type/origin/derivation rules. Tool
+priorities name attributes only, never reference answers.
+If growing continuation history would exceed the remaining product budget, one
+fresh no-tools terminal request can use all compact delivered evidence instead.
+It retains quotes and provenance and must still fit the same step/product/global
+limits; an unaffordable terminal request is not sent.
 
 Tool proposals use the same structured grounder, applicability map, persistent
 judge cache and low-effort majority judging. Disputes and partial submissions stay
