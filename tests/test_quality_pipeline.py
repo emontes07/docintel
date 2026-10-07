@@ -45,7 +45,7 @@ def manifest(attributes=None):
     )
 
 
-def evidence(text="Body: BRASS.", tier="internal_pdf", key="e1"):
+def evidence(text="Part number: AV11-333W-NL. Body: BRASS.", tier="internal_pdf", key="e1"):
     return Evidence(
         evidence_id=key, source_id="source", source_locator="https://example.com/catalog#page=1&paragraph=0",
         source_version="sha256:" + "a" * 64, source_tier=tier, content_kind="source_excerpt", text=text,
@@ -109,6 +109,69 @@ def test_reviewer_confidence_is_separate_from_model_probability():
     assert sheets["Review"][0]["Decision"] == ""
 
 
+def test_structured_enum_other_is_display_only_and_still_needs_quoted_value():
+    from backend.quality_definitions import derive_definition
+    from backend.quality_pipeline import ground_structured_candidate
+
+    definition = AttributeDefinition(
+        attribute_id="Primary Material", description="Body material", value_type="string",
+        type_guidance="Enumerated", allowed_values=["bronze"],
+    )
+    specification = derive_definition(definition.model_dump())
+    packet = product_packet(manifest([definition]), [evidence()], "internal_pdf", ["Primary Material"])
+    assert packet["structured_definitions"][0]["expected_type"] == "Enumerated"
+    assert packet["structured_definitions"][0]["allowed_values"] == ["bronze"]
+    assert packet["citation_applicability"]["E1"] == "exact"
+    candidate = ground_structured_candidate(QualityProposal(**proposal(value="Other: brass")), definition, [evidence()], specification)
+    assert candidate.value == "Other: brass"
+    assert candidate.supporting_quote == "body brass"
+    assert candidate.grounding["definition_normalization"]["source_bearing_texts"] == ["brass"]
+    with pytest.raises(ValueError, match="not grounded"):
+        ground_structured_candidate(QualityProposal(**proposal(value="Other: polycarbonate")), definition, [evidence()], specification)
+
+
+def test_structured_multiselect_preserves_members_and_rejects_an_unquoted_member():
+    from backend.quality_definitions import derive_definition
+    from backend.quality_pipeline import ground_structured_candidate
+
+    definition = AttributeDefinition(
+        attribute_id="Primary Material", description="Materials explicitly present", value_type="string",
+        type_guidance="Multi-Select", allowed_values=["BRASS", "EPDM"],
+    )
+    source = evidence("Part number: AV11-333W-NL. Body: BRASS. Seal: EPDM.")
+    specification = derive_definition(definition.model_dump())
+    candidate = ground_structured_candidate(QualityProposal(**proposal(
+        value="BRASS; EPDM", supporting_quote="Body: BRASS. Seal: EPDM.",
+    )), definition, [source], specification)
+    assert candidate.value == "BRASS; EPDM"
+    assert len(candidate.grounding["multiselect_members"]) == 2
+    with pytest.raises(ValueError, match="not grounded"):
+        ground_structured_candidate(QualityProposal(**proposal(
+            value="BRASS; Other: titanium", supporting_quote="Body: BRASS. Seal: EPDM.",
+        )), definition, [source], specification)
+
+
+def test_unconfirmed_drawing_remains_visible_with_low_confidence_and_question():
+    product = manifest().product.model_copy(update={"vendor": "Mueller", "mpn": "014255 215N"})
+    current = manifest().model_copy(update={"product": product})
+    drawing = evidence("Part number: H14255N. Body: BRASS.")
+    vendor = evidence(json.dumps({"sheet": "Vendor", "row": 2, "cells": [
+        {"cell": "A2", "column": "MPN", "value": "014255 215N"},
+        {"cell": "B2", "column": "Drawing", "value": "H14250"},
+    ]}), "vendor_table", "vendor")
+    vendor.source_id = "vendor"
+    vendor.source_locator = "https://example.com/vendor.xlsx#sheet=Vendor&row=2"
+    result = run_product(current, [drawing, vendor], Completion([[proposal()]]), run_id="map")
+    candidate = result.attributes[0].candidates[0]
+    assert candidate.judge_status == "accepted"
+    assert candidate.grounding["applicability"]["status"] == "family-unconfirmed"
+    sheets = read_workbook(build_reviewer_package([result]).workbook)
+    assert sheets["Review"][0]["Confidence"] == "Low"
+    assert "family-unconfirmed" in sheets["Review"][0]["Applicability"]
+    questions = " ".join(row["Question"] for row in sheets["Questions"])
+    assert "H14250" in questions and "H14255N" in questions
+
+
 def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdicts():
     definitions = manifest().attributes + [
         AttributeDefinition(attribute_id="Valve Type", description="", value_type="string"),
@@ -130,7 +193,7 @@ def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdi
         [proposal(), proposal(attribute_id="Valve Type", value="angle valve", supporting_quote="angle valve")],
         [proposal(evidence_ids=["vendor"], supporting_quote="BRASS")],
     ])
-    result = run_product(manifest(definitions), [evidence("Body: BRASS. Angle valve."), vendor],
+    result = run_product(manifest(definitions), [evidence("Part number: AV11-333W-NL. Body: BRASS. Angle valve."), vendor],
                          client, run_id="fallback")
     packet = next(packet for schema, packet, _ in client.calls
                   if schema == QualityExtraction and packet["active_tier"] == "vendor_table")
@@ -612,8 +675,9 @@ def test_ford_image_fault_is_per_item_and_text_results_survive(monkeypatch, mode
     ford = EnrichmentResult.model_validate(BatchService(store).detail("batch", "row-2", "owner")["machine_result"])
     other = EnrichmentResult.model_validate(BatchService(store).detail("batch", "row-3", "owner")["machine_result"])
     assert ford.attributes[0].candidates[0].value == other.attributes[0].candidates[0].value == "brass"
-    assert sum(d["operation"] == "model" for d in ford.quality_diagnostics) == 2 and not other.input_diagnostics
-    diagnostic = ford.input_diagnostics[0]
+    assert sum(d["operation"] == "model" for d in ford.quality_diagnostics) == 2
+    assert not any(d.get("operation") == "image_input" for d in other.input_diagnostics)
+    diagnostic = next(d for d in ford.input_diagnostics if d.get("operation") == "image_input")
     assert diagnostic["status"] == status and diagnostic["text_only"] is (mode != "present")
     assert diagnostic["target_mpn"] == ford.manifest.product.mpn
     assert all(bool(kwargs["images"]) is (mode == "present") for _, _, kwargs in client.calls[:2])
@@ -1020,6 +1084,7 @@ def test_web_usage_has_run_identity_and_is_exported_even_without_model_calls(mon
     assert [call["call_id"] for call in summary["usage"]] == ["web-run:0001", "web-run:0002"]
     assert [call["call_id"] for call in contexts] == ["web-run:0001", "web-run:0002"]
     rows = read_workbook(BatchService(store).export("batch", "owner"))["Diagnostics"]
+    rows = [row for row in rows if row["Operation"] == "web_search"]
     assert len(rows) == 2
     assert all(row["Run ID"] == "web-run" and row["Operation"] == "web_search" for row in rows)
     assert all(row["Row"] == "2" for row in rows)
@@ -1144,6 +1209,7 @@ def test_cache_write_usage_and_price_basis_survive_meter_and_exports(priced):
     assert summary["cost"]["model_cost_usd"] == pytest.approx(.002 if priced else 0)
     assert summary["cost"]["unpriced_model_calls"] == (0 if priced else 2)
     technical = read_workbook(BatchService(store).export("batch", "owner"))["Diagnostics"]
+    technical = [row for row in technical if row["Operation"] == "model"]
     assert all(row["Cache write tokens"] == "15" and row["Pricing basis"] == basis for row in technical)
     result = EnrichmentResult.model_validate(BatchService(store).detail("batch", "row-2", "owner")["machine_result"])
     public = read_workbook(build_reviewer_package([result]).workbook)
@@ -1185,6 +1251,7 @@ def test_same_run_manual_retry_appends_usage_and_immutable_execution_results():
     detail = BatchService(store).detail("batch", "row-2", "owner")
     assert len(detail["attempt_history"]) == 3
     rows = read_workbook(BatchService(store).export("batch", "owner"))["Diagnostics"]
+    rows = [row for row in rows if row["Operation"] == "model"]
     assert len(rows) == 4 and len({row["Call ID"] for row in rows}) == 4
     assert {row["Execution ID"] for row in rows} == {"execution-one", "execution-two"}
 

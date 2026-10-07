@@ -212,6 +212,47 @@ def _exact(left: Mapping, right: Mapping) -> bool:
     return type(left["value"]) is type(right["value"]) and _equal(left, right)
 
 
+def _definition_source_candidate(candidate: Mapping) -> Mapping:
+    """Project validated enum labels for scoring without changing retained values."""
+    grounding = candidate.get("grounding")
+    metadata = grounding.get("definition_normalization") if isinstance(grounding, Mapping) else None
+    if not isinstance(metadata, Mapping):
+        return candidate
+    kind, rule = metadata.get("expected_type"), metadata.get("rule")
+    rules = {
+        "Enumerated": {"unlisted_as_other_pending_definition_v1", "exact_enum_or_explicit_other_v1"},
+        "Multi-Select": {"unlisted_as_other_pending_definition_v1", "exact_members_semicolon_space_v1"},
+    }
+    if not isinstance(kind, str) or kind not in rules or not isinstance(rule, str) or rule not in rules[kind]:
+        return candidate
+    recorded_rule = candidate.get("normalization_rule")
+    original = metadata.get("original_proposal")
+    if (
+        not isinstance(recorded_rule, str) or rule not in {part.strip() for part in recorded_rule.split(";")}
+        or not isinstance(original, Mapping) or original.get("attribute_id") != candidate.get("attribute_id")
+        or not isinstance(original.get("value"), str) or not original["value"].strip()
+    ):
+        return candidate
+    parts, value = metadata.get("source_bearing_texts"), candidate.get("value")
+    if (
+        not isinstance(value, str) or not isinstance(parts, list) or not parts
+        or any(not isinstance(part, str) or not part.strip() for part in parts)
+    ):
+        return candidate
+    if kind == "Enumerated":
+        if len(parts) != 1 or value != "Other: " + parts[0]:
+            return candidate
+    else:
+        members = value.split("; ")
+        if (
+            len(members) != len(parts) or any(";" in part for part in parts)
+            or not any(member == "Other: " + part for member, part in zip(members, parts))
+            or any(member not in (part, "Other: " + part) for member, part in zip(members, parts))
+        ):
+            return candidate
+    return {**candidate, "value": "; ".join(parts)}
+
+
 def compare_reference(
     definitions: Sequence[Mapping[str, Any]],
     proposals: Sequence[Mapping[str, Any]],
@@ -224,8 +265,12 @@ def compare_reference(
     ``six_class`` requires an available reference and emits only the six
     COMPARISON_CLASSES. Exact value/unit equality is ``agree``; supported case,
     whitespace, numeric, inch-unit and typed Boolean presentation changes are
-    ``format-only difference``. A substantive conflict on either side is always
-    ``differ`` when both sides have values, even if the same conflict is shared.
+    ``format-only difference``. Validated enum ``Other: `` labels may also be
+    projected to their recorded source-bearing texts, only with a recognized
+    definition rule, a matching candidate rule token, and an exact label/text
+    correspondence. Literal labels and reference values are never stripped.
+    A substantive conflict on either side is always ``differ`` when both sides
+    have values, even if the same conflict is shared.
     Legacy callers retain their existing five classes and unavailable state.
     """
     if comparison_schema not in {"legacy", "six_class"}:
@@ -251,13 +296,14 @@ def compare_reference(
         if six_class:
             generated = [entry for entry in generated if not _not_found(entry["value"])]
             baseline = [entry for entry in baseline or [] if not _not_found(entry["value"])]
-        docintel_conflict = _conflicted(generated, kind)
+        compared = [_definition_source_candidate(entry) for entry in generated] if six_class and kind == "string" else generated
+        docintel_conflict = _conflicted(compared, kind)
         cowork_conflict = _conflicted(baseline or [], kind)
         if baseline is None:
             comparison = "reference_unavailable"
         elif generated and baseline:
             # Equal sets, not "one matching candidate", so conflicts cannot inflate agreement.
-            equivalent = _sets_agree(generated, baseline, lambda left, right: values_agree(left, right, kind))
+            equivalent = _sets_agree(compared, baseline, lambda left, right: values_agree(left, right, kind))
             if six_class:
                 comparison = (
                     "differ" if docintel_conflict or cowork_conflict else

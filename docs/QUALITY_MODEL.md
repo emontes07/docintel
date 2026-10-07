@@ -101,6 +101,32 @@ instruction or citation. The offline scorer separately supports `agree`,
 `both-not-found`; tests capture actual extraction/refinement/judge arguments
 (including images and serialized payloads) to detect reference leakage.
 
+### Applicability and structured definitions
+
+Each product has a source and citation-level map: `exact`, `family-confirmed`,
+or `family-unconfirmed`, with printed identity/linkage quotations and locations.
+An exact source summary cannot upgrade every generic paragraph. Family confirmation
+requires an exact product row naming the matching family/drawing; H14250 and
+H14255N are not aliases. Unconfirmed values remain visible with Low confidence
+and a plain-language Questions row. They do not stop attribute-level fallback.
+The judge checks quote support and the declared derivation, not whether to
+override this map. Complete maps are retained in results and technical Diagnostics;
+compact classifications accompany model citations without repeating full documents.
+
+Approved definition metadata supplies Boolean, Enumerated, Multi-Select, Text,
+and Number/unit instructions. Original definition rows are matched by node and
+attribute. Example strings are preserved as examples, never promoted to a
+whitelist or evidence. Explicit invalid types/options/units are rejected. Missing
+guidance is different: unlisted enum values remain under `Other:`, and found
+numeric values/units remain visible for clarification. Multi-Select uses `; `
+separators; each member must independently ground in the cited quotation.
+Component labels and qualifiers are retained where declared; unresolved component
+permissions preserve source-groundable text with a review question, rather than
+claiming whole-product applicability or silently dropping it. Reviewer Confidence,
+Applicability and Questions remain distinct from model probability and approval.
+Six-class scoring recognizes validated `Other:` display metadata as formatting;
+it does not remove arbitrary source text or reconcile substantive synonyms.
+
 Manufacturer PDF retrieval uses pinned public HTTPS on Mueller/Ford domains,
 `pdftotext` first, then cached DI only for a textless PDF of at most five pages.
 Only the worker injects the DI client. Successful byte-hash caches are reused;

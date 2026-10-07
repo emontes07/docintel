@@ -413,6 +413,9 @@ def test_reviewer_literal_support_is_not_hidden_by_earlier_descriptive_candidate
     assert "inferred_from_description" in sheets["Review"][0]["Evidence basis"]
     assert "literal" in sheets["Review"][0]["Evidence basis"]
     assert "requires review" in sheets["Review"][0]["Applicability"]
+    result.quality_run_id = "synthetic-quality"
+    quality_sheets = read_workbook(build_reviewer_package([result]).workbook)
+    assert any("does not include an attribute definition" in row["Question"] for row in quality_sheets["Questions"])
 
 
 def snapshot_for_review():

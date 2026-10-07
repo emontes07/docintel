@@ -511,6 +511,7 @@ def run_quality_batch(
                 images=image if ford else None, usage_callback=persist_usage,
                 before_call=before_usage, retrieval=retrieval,
                 judge_cache=judge_cache, shared_ids=shared[source_family(evidence)],
+                definition_rows=record.get("original_definitions"),
                 initial_candidates={"vendor_table": [
                     Candidate.model_validate(candidate) for candidate in smoke["candidates"]
                 ]} if reuse_smoke else None,

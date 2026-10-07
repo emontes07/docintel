@@ -110,7 +110,10 @@ def judge_candidates(
     def vote(selected: dict[str, Candidate]) -> None:
         ids = {f"C{index + 1}": key for index, key in enumerate(selected)}
         request = {**packet, "candidates": [
-            {"candidate_id": cid, **selected[key].model_dump(mode="json")} for cid, key in ids.items()
+            {"candidate_id": cid, **selected[key].model_dump(mode="json", include={
+                "attribute_id", "value", "unit", "supporting_quote", "evidence_ids", "origin",
+                "normalization_rule", "justification", "qualification",
+            })} for cid, key in ids.items()
         ]}
         try:
             judged = call(request, QualityJudgment)

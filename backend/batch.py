@@ -159,7 +159,10 @@ def validate_batch(manifest_bytes, attribute_bytes, attribute_reference, registr
             if key in parsed_definitions or key in definition_errors:
                 raise ValueError("Duplicate definition for node/attribute")
             guidance = row["potential_attribute_data_type"]
-            value_type = row.get("value_type") or {"Boolean": "boolean", "Numeric": "number", "String": "string", "Enumerated": "string", "Multi-Select": "string"}.get(guidance)
+            value_type = row.get("value_type") or {
+                "Boolean": "boolean", "Numeric": "number", "Number": "number", "Number+unit": "number",
+                "String": "string", "Text": "string", "Enumerated": "string", "Multi-Select": "string",
+            }.get(guidance)
             if not value_type:
                 raise ValueError("An explicit value_type is required for unknown type guidance")
             unit_resolved = value_type not in {"number", "integer"} or "unit" in row
