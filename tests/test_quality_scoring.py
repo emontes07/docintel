@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 from typing import Any, cast
 
@@ -294,3 +295,118 @@ def test_six_class_reference_only_slots_and_unavailable_reference():
         compare_reference(DEFINITIONS, [], None, comparison_schema="six_class")
     with pytest.raises(ValueError, match="Unknown"):
         compare_reference(DEFINITIONS, [], {}, comparison_schema=cast(Any, "typo"))
+
+
+def other_label_candidate(parts, *, kind="Enumerated", rule="unlisted_as_other_pending_definition_v1"):
+    return candidate(
+        "; ".join("Other: " + part for part in parts), origin="derived", normalization_rule=rule,
+        grounding={"definition_normalization": {
+            "expected_type": kind, "rule": rule, "source_bearing_texts": parts,
+            "questions": ["Confirm approved options."],
+            "original_proposal": {"attribute_id": "Size", "value": "; ".join(parts), "unit": None},
+        }},
+    )
+
+
+def six_class_against(proposal, value, **reference_updates):
+    return compare_reference(
+        DEFINITIONS, [proposal], {("P1", "Size"): [{"value": value, **reference_updates}]},
+        comparison_schema="six_class",
+    )
+
+
+@pytest.mark.parametrize(("kind", "parts", "rule"), [
+    ("Enumerated", ["Brass"], "unlisted_as_other_pending_definition_v1"),
+    ("Enumerated", ["Copper; Iron"], "unlisted_as_other_pending_definition_v1"),
+    ("Enumerated", ["Brass"], "exact_enum_or_explicit_other_v1"),
+    ("Multi-Select", ["Copper", "Iron"], "unlisted_as_other_pending_definition_v1"),
+    ("Multi-Select", ["Copper", "Iron"], "exact_members_semicolon_space_v1"),
+])
+def test_validated_other_labels_are_format_only(kind, parts, rule):
+    proposal = other_label_candidate(parts, kind=kind, rule=rule)
+    proposal["normalization_rule"] = "earlier_grounding_rule_v1; " + rule
+    original = deepcopy(proposal)
+    result = six_class_against(proposal, "; ".join(parts))
+    assert result["counts"] == {"format-only difference": 1}
+    assert result["rows"][0]["docintel"] == [original]
+    assert proposal == original
+
+
+@pytest.mark.parametrize(("field", "invalid"), [
+    ("expected_type", "Text"),
+    ("expected_type", "Boolean"),
+    ("rule", "invented_other_stripping_rule"),
+    ("rule", "exact_members_semicolon_space_v1"),
+    ("source_bearing_texts", ["Bronze"]),
+    ("source_bearing_texts", ["Brass", "Iron"]),
+    ("source_bearing_texts", []),
+    ("source_bearing_texts", [""]),
+    ("source_bearing_texts", "Brass"),
+    ("source_bearing_texts", [True]),
+    ("original_proposal", None),
+])
+def test_inconsistent_definition_metadata_cannot_authorize_label_removal(field, invalid):
+    proposal = other_label_candidate(["Brass"])
+    proposal["grounding"]["definition_normalization"][field] = invalid
+    assert six_class_against(proposal, "Brass")["counts"] == {"differ": 1}
+
+
+@pytest.mark.parametrize("rule", [None, "", "another_rule", "prefix_unlisted_as_other_pending_definition_v1_suffix"])
+def test_definition_rule_must_be_recorded_as_a_complete_normalization_rule(rule):
+    proposal = other_label_candidate(["Brass"])
+    proposal["normalization_rule"] = rule
+    assert six_class_against(proposal, "Brass")["counts"] == {"differ": 1}
+
+
+@pytest.mark.parametrize("grounding", [None, {}, {"definition_normalization": None}, "untrusted text"])
+def test_literal_other_is_not_stripped_without_normalization_provenance(grounding):
+    proposal = candidate("Other: Brass", grounding=grounding)
+    assert six_class_against(proposal, "Brass")["counts"] == {"differ": 1}
+    assert six_class_against(proposal, "Other: Brass")["counts"] == {"agree": 1}
+
+
+@pytest.mark.parametrize(("parts", "reference"), [
+    (["low lead brass"], "brass"),
+    (["FIP"], "Female Iron Pipe"),
+    (["Copper", "Iron"], "Iron; Copper"),
+    (["Copper", "Copper"], "Copper"),
+    (["Other: Brass"], "Brass"),
+])
+def test_presentation_metadata_does_not_infer_synonyms_sort_deduplicate_or_strip_twice(parts, reference):
+    proposal = other_label_candidate(parts, kind="Multi-Select" if len(parts) > 1 else "Enumerated")
+    assert six_class_against(proposal, reference)["counts"] == {"differ": 1}
+
+
+def test_other_labels_preserve_units_and_do_not_normalize_reference_metadata():
+    proposal = other_label_candidate(["1"])
+    proposal["unit"] = "in"
+    assert six_class_against(proposal, "1", unit="mm")["counts"] == {"differ": 1}
+    reference = other_label_candidate(["Brass"])
+    result = compare_reference(
+        DEFINITIONS, [candidate("Brass")], {("P1", "Size"): [reference]}, comparison_schema="six_class",
+    )
+    assert result["counts"] == {"differ": 1}
+
+
+def test_only_label_changes_not_shared_source_values_affect_conflict_detection():
+    labelled = other_label_candidate(["Brass"])
+    reference = {("P1", "Size"): [{"value": "Brass"}]}
+    matching = compare_reference(
+        DEFINITIONS, [labelled, candidate("Brass")], reference, comparison_schema="six_class",
+    )
+    assert matching["counts"] == {"format-only difference": 1}
+    assert matching["rows"][0]["docintel_conflict"] is False
+    conflicting = compare_reference(
+        DEFINITIONS, [labelled, candidate("Bronze")], reference, comparison_schema="six_class",
+    )
+    assert conflicting["counts"] == {"differ": 1}
+    assert conflicting["rows"][0]["docintel_conflict"] is True
+    assert len(conflicting["rows"][0]["docintel"]) == 2
+
+
+def test_other_label_normalization_is_six_class_only():
+    proposal = other_label_candidate(["Brass"])
+    assert not values_agree(proposal, {"value": "Brass"})
+    assert compare_reference(
+        DEFINITIONS, [proposal], {("P1", "Size"): [{"value": "Brass"}]},
+    )["counts"] == {"disagree": 1}

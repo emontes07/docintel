@@ -59,6 +59,11 @@ def reviewer_status(attribute: AttributeResult, result: EnrichmentResult | _Pres
             return "Judge disputed — review required", "The grounded proposal was retained; resolve the judge's stated concern using the cited evidence."
         if all(candidate.evidence_basis == "inferred_from_description" for candidate in attribute.candidates):
             return "Descriptive inference — review required", "Confirm the whole-product claim; descriptive wording is not certification."
+        if any(_candidate_details(candidate, "applicability").get("status") == "family-unconfirmed"
+               for candidate in attribute.candidates):
+            return "Source applicability needs confirmation", "Confirm that the cited source covers this product before approving; see Questions."
+        if any(_candidate_details(candidate, "definition_normalization").get("questions") for candidate in attribute.candidates):
+            return "Definition choices need confirmation", "Check the proposed Other value against approved choices; examples alone are not a final list."
         return "Proposal ready for review", "Check the supporting quotation and product applicability before deciding."
     if attribute.status == "retrieval_failed":
         return "Source unavailable", "Provide an accessible, applicable source for this attribute."
@@ -103,6 +108,17 @@ def _display(value) -> str:
     text = re.sub(r"(?<![:/\w])/(?:[A-Za-z0-9_.-]+/)+\S+|[A-Za-z]:\\\S+", "[internal source]", text)
     text = re.sub(r"https?://[^\s<>\"']+", "[source link withheld]", text)
     return re.sub(r"(?i)extraction failed", "processing needs attention", text)
+
+
+def _candidate_details(candidate: Candidate, key: str) -> dict:
+    details = (candidate.grounding or {}).get(key)
+    return details if isinstance(details, dict) else {}
+
+
+def _definition_question(question: str) -> str:
+    return _display(question).replace("allowed_values:", "Approved choices:").replace(
+        "allow_component_detail:", "Component detail:"
+    ).replace("component_labels:", "Component wording:")
 
 
 def _proposed_display(value, *, vendor: bool = False) -> str:
@@ -189,6 +205,13 @@ def _build_package(
         product = result.manifest.product
         indexed = {entry.evidence_id: entry for entry in result.evidence}
         mapping = build_applicability_map(result.manifest, result.evidence)
+        source_questions = dict.fromkeys(
+            entry.reviewer_question for source in mapping.values() for entry in source.evidence.values()
+            if entry.status == "family-unconfirmed" and entry.reviewer_question
+        )
+        question_rows.extend([
+            product.item_id, product.mpn, "Source applicability", _display(question), "",
+        ] for question in source_questions)
         for attribute in result.attributes:
             identity = (product.item_id, attribute.attribute_id)
             if identity in seen:
@@ -206,9 +229,15 @@ def _build_package(
                     _display(attribute.definition_clarification or attribute.reviewer_explanation or action), "",
                 ])
             proposals, units, bases, quotes, labels, urls, retrieved, applicability, confidence = [], [], [], [], [], [], [], [], []
+            definition_questions = set()
             for index, candidate in enumerate(attribute.candidates):
-                confidence_label = candidate_applicability(candidate, mapping, result.evidence).confidence
+                scope_details = candidate_applicability(candidate, mapping, result.evidence)
+                confidence_label = scope_details.confidence
                 confidence.append(confidence_label)
+                definition_questions.update(
+                    question for question in _candidate_details(candidate, "definition_normalization").get("questions", [])
+                    if isinstance(question, str)
+                )
                 proposed_value = _proposed_display(
                     candidate.value, vendor=any(indexed[key].source_tier == "vendor_table" for key in candidate.evidence_ids),
                 )
@@ -227,7 +256,7 @@ def _build_package(
                     url = _url(evidence.source_locator) if evidence.source_tier in {"manufacturer_web", "approved_web"} else ""
                     date = evidence.provider_retrieved_at.isoformat() if evidence.provider_retrieved_at else "Not recorded"
                     scope = _display("\n".join(dict.fromkeys(filter(None, [
-                        evidence.qualification, candidate.qualification,
+                        scope_details.status, evidence.qualification, candidate.qualification,
                     ])))) or "Confirm exact product applicability."
                     labels.append(label)
                     if url:
@@ -241,11 +270,16 @@ def _build_package(
                         candidate.origin, candidate.judge_status, _display(candidate.judge_reason), confidence_label,
                     ])
             review = attribute.review
+            question_rows.extend([
+                product.item_id, product.mpn, attribute.attribute_id, _definition_question(question), "",
+            ] for question in sorted(definition_questions))
+            definition = next(d for d in result.manifest.attributes if d.attribute_id == attribute.attribute_id)
+            separator = "; " if definition.type_guidance == "Multi-Select" else "\n"
             rows.append([
                 product.item_id, product.mpn, attribute.attribute_id,
                 review.decision.capitalize() if review else "", _display(review.corrected_value) if review else "",
                 _display(review.corrected_unit) if review else "", _display(review.reason) if review else "",
-                status, action, "\n".join(proposals) or _proposed_display(result.manifest.existing_values.get(attribute.attribute_id)),
+                status, action, separator.join(proposals) or _proposed_display(result.manifest.existing_values.get(attribute.attribute_id)),
                 "\n".join(dict.fromkeys(units)), "\n".join(dict.fromkeys(bases)), "\n".join(dict.fromkeys(quotes)),
                 "\n".join(dict.fromkeys(labels)), "\n".join(dict.fromkeys(urls)),
                 "\n".join(dict.fromkeys(retrieved)), "\n".join(dict.fromkeys(applicability)),

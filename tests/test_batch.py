@@ -77,6 +77,20 @@ def intake_contract(definition_rows, *, definition_headers=None, selection="defi
     return validate_batch(manifest, attributes, "definitions.xlsx", registry or [])
 
 
+@pytest.mark.parametrize("guidance,expected,unit", [
+    ("Text", "string", ""), ("Number", "number", "in"), ("Number+unit", "number", "PSI"),
+])
+def test_explicit_structured_definition_type_names(guidance, expected, unit):
+    result = intake_contract(
+        [["Valve", "Size", guidance, unit]],
+        definition_headers=["node", "potential_attribute_name", "potential_attribute_data_type", "unit"],
+    )
+    assert result["valid"]
+    definition = result["items"][0]["manifest"]["attributes"][0]
+    assert definition["value_type"] == expected and definition["type_guidance"] == guidance
+    assert definition["unit"] == (unit or None)
+
+
 def test_intake_legacy_batch_inputs_and_blocked_source_registry_remain_valid():
     from backend.batch import validate_batch
     registry = [{
