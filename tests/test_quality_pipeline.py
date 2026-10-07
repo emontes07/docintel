@@ -81,6 +81,46 @@ def proposal(**updates):
             "evidence_ids": ["e1"], "origin": "literal", **updates}
 
 
+def test_fallback_receives_prior_judge_feedback_only_for_unresolved_attributes():
+    definitions = manifest().attributes + [
+        AttributeDefinition(attribute_id="Valve Type", description="", value_type="string"),
+    ]
+    vendor = evidence(json.dumps({"sheet": "Vendor", "row": 2, "cells": [
+        {"cell": "B2", "column": "Body material", "value": "BRASS"},
+    ]}), tier="vendor_table", key="vendor")
+    vendor.source_locator = "https://example.com/vendor.xlsx#sheet=Vendor&row=2"
+
+    class Feedback(Completion):
+        def complete_structured(self, system, user, schema, **kwargs):
+            result = super().complete_structured(system, user, schema, **kwargs)
+            if schema == QualityJudgment and json.loads(user)["active_tier"] == "internal_pdf":
+                result.decisions[0].decision = "judge_disputed"
+                result.decisions[0].reason = "Use target-specific vendor evidence instead of this family drawing."
+            return result
+
+    client = Feedback([
+        [proposal(), proposal(attribute_id="Valve Type", value="angle valve", supporting_quote="angle valve")],
+        [proposal(evidence_ids=["vendor"], supporting_quote="BRASS")],
+    ])
+    result = run_product(manifest(definitions), [evidence("Body: BRASS. Angle valve."), vendor],
+                         client, run_id="fallback")
+    packet = next(packet for schema, packet, _ in client.calls
+                  if schema == QualityExtraction and packet["active_tier"] == "vendor_table")
+    assert packet["unresolved_attributes"] == ["Primary Material"]
+    assert [entry["attribute_id"] for entry in packet["prior_tier_review"]] == ["Primary Material"]
+    previous = packet["prior_tier_review"][0]["candidates"][0]
+    assert previous["judge_status"] == "judge_disputed"
+    assert previous["judge_reason"] == "Use target-specific vendor evidence instead of this family drawing."
+    assert previous["evidence_ids"] == ["e1"]
+    assert len(packet["evidence"]) == 2
+    assert len(client.calls) == 4
+    assert [candidate.judge_status for candidate in result.attributes[0].candidates] == [
+        "judge_disputed", "accepted",
+    ]
+    assert all("prior_tier_review" not in packet for schema, packet, _ in client.calls
+               if schema == QualityJudgment)
+
+
 def test_three_call_bound_judges_both_passes_and_retains_disagreement():
     definitions = manifest().attributes + [AttributeDefinition(attribute_id="Valve Type", description="", value_type="string")]
     client = Completion([[proposal()], [proposal(attribute_id="Valve Type", value="angle valve", supporting_quote="angle valve")]], disputed=True)

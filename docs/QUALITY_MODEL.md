@@ -40,6 +40,12 @@ defaults**, and the appropriate context-tier rates must be selected by the calle
 
 ## Usage
 
+Fallback extraction receives prior-tier candidates and judge explanations only
+for still-unresolved attributes. This feedback helps it seek better active-tier
+citations; it is not new evidence or permission to relax grounding. The joint
+judge still receives the original product packet and current candidates without
+prior-tier verdicts, so the new decision is not prescribed by the earlier one.
+
 ```python
 from pydantic import BaseModel
 from backend.core.quality_model import ResponsesCompletion
