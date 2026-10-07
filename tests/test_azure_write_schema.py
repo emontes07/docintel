@@ -121,6 +121,26 @@ def test_declared_types_formats_and_enums_are_enforced(field, value, reason):
         schema.build_payload("jobs", properties={"configuration": configuration})
 
 
+@pytest.mark.parametrize("transport,expected", [("Auto", "auto"), ("AUTO", "auto"), ("Http", "http"), ("Http2", "http2"), ("Tcp", "tcp")])
+def test_captured_cli_ingress_enum_is_projected_to_canonical_wire_value(transport, expected):
+    captured = {"external": True, "targetPort": 8080, "transport": transport,
+                "targetPortHttpScheme": None, "traffic": [{"latestRevision": True, "weight": 100}]}
+    before = copy.deepcopy(captured)
+    projected = release.writable_ingress(captured)
+    assert projected["transport"] == expected and captured == before
+    payload = schema.build_payload("containerApps", location="eastus",
+                                   properties={"configuration": {"ingress": projected}})
+    schema.validate_request("PATCH", url("containerApps"), payload)
+    payload["properties"]["configuration"]["ingress"]["transport"] = transport
+    with pytest.raises(schema.WriteSchemaError, match="enum"):
+        schema.validate_request("PATCH", url("containerApps"), payload)
+
+
+def test_unknown_captured_ingress_transport_is_not_normalized_into_valid_value():
+    with pytest.raises(schema.WriteSchemaError, match="enum"):
+        release.writable_ingress({"transport": "Unknown"})
+
+
 @pytest.mark.parametrize("value", [2 ** 31, "8080", True])
 def test_nested_probe_port_type_and_format_are_derived(value):
     containers = [{"name": "worker", "probes": [{"httpGet": {"port": value}, "type": "Readiness"}]}]

@@ -493,6 +493,12 @@ def _project_value(schema, value):
             return result
         if isinstance(instance, list):
             return [project(node["items"], item) for item in instance]
+        if isinstance(instance, str) and "enum" in node and instance not in node["enum"]:
+            # CLI display casing can differ from the canonical write enum.
+            matches = [value for value in node["enum"]
+                       if isinstance(value, str) and value.casefold() == instance.casefold()]
+            if len(matches) == 1:
+                return matches[0]
         return copy.deepcopy(instance)
 
     result = project(schema, value)

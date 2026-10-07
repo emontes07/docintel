@@ -111,6 +111,19 @@ Claim-only state never satisfies readiness.
    `["track_b", "four_product", "write_schema", "pacing"]`.
    There is no historical f56 file whitelist. Any frontend change fails this
    backend-only continuation. Source staging is an explicit separate action.
+   A content-identical native enum correction can use an append-only
+   `four-product-source-selection.json`, following the existing row-rerun
+   selection pattern. It retains every baseline field except the reviewed
+   source revision/review and adds the original canonical baseline hash as
+   `supersedes_baseline_sha256`. The original baseline, source, gate, decision,
+   receipts and allowances remain untouched. The successor source is staged
+   under `four-product-v1/canonical-write-enums`; its new gate, decision and
+   merged CI must bind that exact source before readiness. This grants no
+   additional attempt and does not start or renew any clock.
+   Captured CLI ingress `transport: "Auto"` is projected to the pinned wire
+   enum `"auto"` without changing its meaning. Only unique case-insensitive
+   matches to an existing enum are projected; unknown values still fail and
+   direct outgoing wire validation remains case-exact.
 6. Run the real-worker/real-guard private gate on the **actual post-PREP** snapshot
    and independently approved scope. Then require merged CI for that same exact
    revision, authenticated owner/batch/image/amendment evidence, and create-once

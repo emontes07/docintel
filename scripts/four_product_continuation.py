@@ -91,6 +91,26 @@ def digest_file(candidate):
     return sha(release.private_json(candidate, max_bytes=64 * 1024 * 1024))
 
 
+def baseline_path(work):
+    original = path(work, "baseline")
+    selected = path(work, "source-selection")
+    if selected.exists():
+        previous, current = (release.private_json(candidate, max_bytes=64 * 1024 * 1024)
+                             for candidate in (original, selected))
+        require(set(current) == set(previous) | {"supersedes_baseline_sha256"}
+                and current["supersedes_baseline_sha256"] == digest_file(original)
+                and all(current.get(key) == value for key, value in previous.items()
+                        if key not in {"source_revision", "source_review"}),
+                "Superseding source selection must preserve the original baseline and allowances")
+        return selected
+    return original
+
+
+def source_work(work):
+    original = work / CHILD
+    return original / "canonical-write-enums" if baseline_path(work) != path(work, "baseline") else original
+
+
 def decode_records(snapshot):
     records = {}
     for key, entry in snapshot["records"].items():
@@ -1002,8 +1022,8 @@ def validate(work, config, decision):
             and (decision.get("webiq_secret_ref") is None or isinstance(decision["webiq_secret_ref"], str)
                  and re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,251}[a-z0-9])?", decision["webiq_secret_ref"])),
             "Exact reviewed four-product decision required")
-    baseline = release.private_json(path(work, "baseline"), max_bytes=64 * 1024 * 1024)
-    require(digest_file(path(work, "baseline")) == decision["baseline_sha256"], "Post-PREP baseline changed")
+    baseline = release.private_json(baseline_path(work), max_bytes=64 * 1024 * 1024)
+    require(digest_file(baseline_path(work)) == decision["baseline_sha256"], "Post-PREP baseline changed")
     verify_history(work, baseline["history"])
     require(baseline["source_revision"] == decision["source_revision"]
             and baseline["target"] == decision["target"]
@@ -1015,7 +1035,7 @@ def validate(work, config, decision):
             and baseline["approval_sha256"] == sha(approval), "Source/target/approval baseline changed")
     source_boundary(decision["source_revision"], baseline["source_review"])
     verify_running_source(decision["source_revision"])
-    child = work / CHILD
+    child = source_work(work)
     require(not child.is_symlink() and child.resolve() == child
             and release.verify_source(child)["revision"] == decision["source_revision"],
             "Exact staged source receipt changed")
@@ -1085,7 +1105,7 @@ def validate(work, config, decision):
         )},
         **({key: scope[key] for key in ("worker_slices", "slice_authorization")} if scope.get("worker_slices") else {}),
     ) == scope, "Private gate scope must reconstruct from exact actual post-PREP records")
-    ci = release.private_json(work / CHILD / "ci.json")
+    ci = release.private_json(source_work(work) / "ci.json")
     require(ci.get("revision") == decision["source_revision"] and ci.get("merged") is True
             and ci.get("base") == "main" and ci.get("checks") == row.CI_CHECKS,
             "Exact reviewed publication revision must have merged CI")
@@ -1214,13 +1234,13 @@ def live(work, decision, phase, minimum=0):
 def decision_from_gate(work, config, gate_name, capacity_approval, *, credential_source="owner_env_file",
                        secret_ref="webiq-gbbdemo"):
     require(Path(gate_name).name == gate_name, "Private gate must remain in retained root")
-    baseline = release.private_json(path(work, "baseline"))
+    baseline = release.private_json(baseline_path(work))
     approval, _, _ = original(work, config)
     gate = release.private_json(work / gate_name, max_bytes=64 * 1024 * 1024)
     return {
         "schema_version": 1, "approved": True, "approved_by": approval["approved_by"],
         "source_revision": baseline["source_revision"], "target": release.fingerprint(config),
-        "baseline_sha256": digest_file(path(work, "baseline")),
+        "baseline_sha256": digest_file(baseline_path(work)),
         "gate_file": gate_name, "gate_sha256": digest_file(work / gate_name),
         "scope_sha256": sha(gate["amendment_scope"]), "capacity_approval": capacity_approval,
         "policy": execution_policy(gate["amendment_scope"]), "credential_origin": "GBBdemo",
@@ -1230,14 +1250,14 @@ def decision_from_gate(work, config, gate_name, capacity_approval, *, credential
 
 def stage(work, config, revision):
     """Explicit local stage, separate from offline inspection/planning."""
-    baseline = release.private_json(path(work, "baseline"))
+    baseline = release.private_json(baseline_path(work))
     require(baseline["source_revision"] == revision and baseline["target"] == release.fingerprint(config),
             "Source stage must match the reviewed baseline")
     source_boundary(revision, baseline["source_review"])
     verify_running_source(revision)
-    require(not (work / CHILD).exists(), "Source stage is create-once")
-    release.stage(revision, work / CHILD)
-    release.build_context(work / CHILD)
+    require(not source_work(work).exists(), "Source stage is create-once")
+    release.stage(revision, source_work(work))
+    release.build_context(source_work(work))
 
 
 def remote_snapshot(work, config, decision, approval):
@@ -1283,7 +1303,7 @@ def publish(work, config, decision):
             })
             limits = window(work, decision, "publication", 900)
             result = release.execute_publication(
-                config, work / CHILD, "backend", decision["source_revision"], attempt,
+                config, source_work(work), "backend", decision["source_revision"], attempt,
                 expires=instant(limits["publication_expires_at"]), validate_upload_window=True,
                 on_preflight=preflight_recorder(work, decision, "backend-publication", {
                     "attempt_sha256": sha(release.private_json(attempt)),

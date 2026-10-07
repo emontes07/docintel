@@ -449,7 +449,7 @@ def test_actual_postprep_four_product_private_gate(monkeypatch):
         assert Path(output).name == output and output.startswith("four-product-")
         revision = helper.release.command(["git", "rev-parse", "HEAD"], cwd=helper.release.ROOT).decode().strip()
         helper.verify_running_source(revision)
-        baseline_receipt = private_file(root, "four-product-baseline.json")
+        baseline_receipt = private_file(root, helper.baseline_path(root).name)
         helper.source_boundary(revision, baseline_receipt["source_review"])
         helper.release.save_once(root / output, {
             "passed": True, "no_live_operations": True, "label": LABEL, "source_revision": revision,
