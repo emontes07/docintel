@@ -17,7 +17,7 @@ from backend.quality_pipeline import (
     QualityExtraction, QualityJudgment, QualityProposal, QualityUsageStop, ground_candidate, product_packet, run_product,
 )
 from backend.quality_worker import FORD_PDF_SHA256, CachedEvidenceLoader, QualitySmokeError, _image, run_quality_batch, scope_document
-from backend.reviewer_workbook import build_reviewer_package
+from backend.reviewer_workbook import build_reviewer_package, reviewer_status
 from backend.workbooks import read_workbook, write_workbook
 
 NOW = datetime(2026, 10, 7, tzinfo=timezone.utc)
@@ -81,7 +81,16 @@ def proposal(**updates):
             "evidence_ids": ["e1"], "origin": "literal", **updates}
 
 
-def test_fallback_receives_prior_judge_feedback_only_for_unresolved_attributes():
+def test_missing_pressure_candidate_is_not_described_as_a_found_value():
+    result = run_product(manifest([
+        AttributeDefinition(attribute_id="Pressure Rating", description="", value_type="number", unit_resolved=False),
+    ]), [], Completion(), run_id="pressure-question")
+    status, action = reviewer_status(result.attributes[0], result)
+    assert status == "Definition needs clarification"
+    assert "no verified candidate was found" in action.lower()
+
+
+def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdicts():
     definitions = manifest().attributes + [
         AttributeDefinition(attribute_id="Valve Type", description="", value_type="string"),
     ]
@@ -107,11 +116,7 @@ def test_fallback_receives_prior_judge_feedback_only_for_unresolved_attributes()
     packet = next(packet for schema, packet, _ in client.calls
                   if schema == QualityExtraction and packet["active_tier"] == "vendor_table")
     assert packet["unresolved_attributes"] == ["Primary Material"]
-    assert [entry["attribute_id"] for entry in packet["prior_tier_review"]] == ["Primary Material"]
-    previous = packet["prior_tier_review"][0]["candidates"][0]
-    assert previous["judge_status"] == "judge_disputed"
-    assert previous["judge_reason"] == "Use target-specific vendor evidence instead of this family drawing."
-    assert previous["evidence_ids"] == ["e1"]
+    assert "prior_tier_review" not in packet
     assert len(packet["evidence"]) == 2
     assert len(client.calls) == 4
     assert [candidate.judge_status for candidate in result.attributes[0].candidates] == [
