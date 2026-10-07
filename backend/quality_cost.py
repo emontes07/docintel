@@ -1,6 +1,7 @@
 """One usage-based monetary meter for the bounded quality run."""
 
 from decimal import Decimal
+import json
 import logging
 from time import monotonic
 
@@ -69,7 +70,9 @@ class QualityCostMeter:
 
     def before_call(self, context=None) -> None:
         current = self.summary()
-        if current["known_run_cost_usd"] >= 10 or current["known_overnight_cost_usd"] >= 40:
+        maximum = _amount((context or {}).get("maximum_cost_usd", 0))
+        if (Decimal(str(current["known_run_cost_usd"])) + maximum >= 10
+                or Decimal(str(current["known_overnight_cost_usd"])) + maximum >= 40):
             raise CostLimitExceeded(
                 f"Monetary cap reached: run ${current['known_run_cost_usd']:.4f}; "
                 f"overnight ${current['known_overnight_cost_usd']:.4f}"
@@ -127,3 +130,38 @@ class QualityCostMeter:
             overnight_cost_usd=current["known_overnight_cost_usd"],
         )
         return entry
+
+
+def maximum_tool_cost(context: dict, model_prices: dict, prices: dict) -> Decimal:
+    operation = context["operation"]
+    if operation in {"web_search", "web_browse", "document_intelligence"}:
+        rate = {"web_search": "search_usd", "web_browse": "browse_usd",
+                "document_intelligence": "di_usd_per_page"}[operation]
+        units = context.get("requested_pages") if operation == "document_intelligence" else 1
+        if type(units) is not int or units < 1 or rate not in prices:
+            raise CostLimitExceeded("Tool request has no complete page/price basis")
+        return _amount(prices[rate]) * units
+    if operation == "direct_page":
+        return Decimal(0)
+    if operation != "model":
+        raise ValueError(f"Unknown priced tool operation: {operation}")
+    if any(model_prices.get(name) is None for name in ("input", "cache_write", "output")):
+        raise CostLimitExceeded("Tool model input/write/output pricing is not configured")
+    request = dict(context["request"])
+    request.update(request.pop("extra_body", {}))
+    limit = request.get("max_output_tokens")
+    if type(limit) is not int or limit <= 0:
+        raise CostLimitExceeded("Tool request has no positive output-token limit")
+    encoded = json.dumps(request, ensure_ascii=False, allow_nan=False)
+    if '"input_image"' in encoded or '"input_file"' in encoded:
+        raise CostLimitExceeded("Tool cost estimation supports retrieved text, not image/file inputs")
+    inputs = request.get("input", [])
+    if not isinstance(inputs, list):
+        raise CostLimitExceeded("Tool request must expose its complete input history")
+    # UTF-8 bytes overbound text tokens. Replay may contain compressed reasoning;
+    # also budget the entire prior output limit for each opaque reasoning item.
+    reasoning = sum(item.get("type") == "reasoning" for item in inputs if isinstance(item, dict))
+    tokens = len(encoded.encode("utf-8")) + 1024 + 256 * (len(inputs) + len(request.get("tools", [])))
+    tokens += reasoning * limit
+    input_rate = max(_amount(model_prices["input"]), _amount(model_prices["cache_write"]))
+    return (tokens * input_rate + limit * _amount(model_prices["output"])) / 1_000_000

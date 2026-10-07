@@ -370,6 +370,8 @@ def run_quality_batch(
     cost_summary=None,
     execution_id: str | None = None,
     ocr_smoke: bool = False,
+    tool_loop_enabled: bool = False,
+    tool_prices: dict | None = None,
 ) -> dict:
     """Append new immutable results and preserve the complete previous state chain."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
@@ -512,15 +514,18 @@ def run_quality_batch(
                 before_call=before_usage, retrieval=retrieval,
                 judge_cache=judge_cache, shared_ids=shared[source_family(evidence)],
                 definition_rows=record.get("original_definitions"),
+                tool_loop_enabled=tool_loop_enabled, tool_prices=tool_prices,
                 initial_candidates={"vendor_table": [
                     Candidate.model_validate(candidate) for candidate in smoke["candidates"]
                 ]} if reuse_smoke else None,
                 initial_diagnostics=[entry for entry in usage_records if entry.get("phase") == "smoke"
                                      and entry.get("item_id") == manifest.product.item_id] if reuse_smoke else None,
             )
+            recorded_calls = {entry.get("call_id") for entry in result.quality_diagnostics if entry.get("call_id")}
             result.quality_diagnostics.extend(
                 entry for entry in usage_records
                 if entry.get("operation") != "model" and entry.get("item_id") == manifest.product.item_id
+                and entry.get("call_id") not in recorded_calls
             )
             if ford and image_diagnostic is not None:
                 result.input_diagnostics.append({
@@ -641,6 +646,8 @@ def main(argv=None) -> int:
             usage_callback=priced_usage, before_call=meter.before_call, cost_summary=cost_snapshot,
             execution_id=args.execution_id,
             ocr_smoke=os.environ.get("QUALITY_OCR_SMOKE", "false").lower() == "true",
+            tool_loop_enabled=os.environ.get("QUALITY_TOOL_LOOP_ENABLED", "false").lower() == "true",
+            tool_prices=prices,
         )
     finally:
         print(json.dumps({"quality_cost": meter.summary()}, ensure_ascii=True), flush=True)
