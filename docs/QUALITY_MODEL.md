@@ -45,6 +45,8 @@ product evidence packet. Prior-tier verdicts remain in results but are not fed
 back as model instructions: the bounded live experiment did not improve accepted
 coverage. A later tier can retain a separately cited value even if an earlier
 candidate for the same attribute was disputed.
+Reviewer wording distinguishes a retained pressure candidate from a pressure
+question with no verified value; both still require definition/unit clarification.
 
 ```python
 from pydantic import BaseModel

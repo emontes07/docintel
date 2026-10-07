@@ -48,7 +48,11 @@ def reviewer_status(attribute: AttributeResult, result: EnrichmentResult | _Pres
     if attribute.status == "conflict":
         return "Conflicting evidence — review needed", "Resolve the cited conflicting evidence; record a supported correction and reason."
     if attribute.status == "definition_clarification_needed":
-        return "Definition needs clarification", "A found candidate is retained; confirm the requested definition and unit before approval."
+        return "Definition needs clarification", (
+            "A found candidate is retained; confirm the requested definition and unit before approval."
+            if attribute.candidates else
+            "Confirm the requested definition and unit; no verified candidate was found."
+        )
     if attribute.candidates:
         if any(candidate.judge_status == "judge_disputed" for candidate in attribute.candidates):
             return "Judge disputed — review required", "The grounded proposal was retained; resolve the judge's stated concern using the cited evidence."

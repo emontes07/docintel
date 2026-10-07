@@ -17,7 +17,7 @@ from backend.quality_pipeline import (
     QualityExtraction, QualityJudgment, QualityProposal, QualityUsageStop, ground_candidate, product_packet, run_product,
 )
 from backend.quality_worker import FORD_PDF_SHA256, CachedEvidenceLoader, QualitySmokeError, _image, run_quality_batch, scope_document
-from backend.reviewer_workbook import build_reviewer_package
+from backend.reviewer_workbook import build_reviewer_package, reviewer_status
 from backend.workbooks import read_workbook, write_workbook
 
 NOW = datetime(2026, 10, 7, tzinfo=timezone.utc)
@@ -79,6 +79,15 @@ class Completion:
 def proposal(**updates):
     return {"attribute_id": "Primary Material", "value": "brass", "supporting_quote": "body brass",
             "evidence_ids": ["e1"], "origin": "literal", **updates}
+
+
+def test_missing_pressure_candidate_is_not_described_as_a_found_value():
+    result = run_product(manifest([
+        AttributeDefinition(attribute_id="Pressure Rating", description="", value_type="number", unit_resolved=False),
+    ]), [], Completion(), run_id="pressure-question")
+    status, action = reviewer_status(result.attributes[0], result)
+    assert status == "Definition needs clarification"
+    assert "no verified candidate was found" in action.lower()
 
 
 def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdicts():
