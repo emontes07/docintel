@@ -91,6 +91,7 @@ def _url(value: str) -> str:
 
 def _display(value) -> str:
     text = "" if value is None else str(value)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
     text = re.sub(r"(?i)\b(?:sha256:)?[a-f0-9]{64}\b", "[private reference]", text)
     text = re.sub(r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b", "[private reference]", text)
     text = re.sub(r"(?:batchblob|file|az|blob)://\S+", "[internal source]", text)
@@ -163,6 +164,7 @@ def _build_package(
     """
     rows = [list(REVIEW_COLUMNS)]
     evidence_rows = [["Product ID", "MPN", "Attribute", "Proposed value", "Unit", "Source", "Source tier", "Location", "Quote", "Source URL", "Retrieved at", "Applicability", "Evidence basis", "Origin", "Judge status", "Judge reason"]]
+    question_rows = [["Product ID", "MPN", "Attribute", "Question", "Response"]]
     bindings = []
     status_counts = {}
     seen = set()
@@ -181,6 +183,11 @@ def _build_package(
                 else reviewer_status(attribute, result)
             )
             status_counts[status] = status_counts.get(status, 0) + 1
+            if attribute.review is None and status not in {"Existing value retained", "Proposal ready for review"}:
+                question_rows.append([
+                    product.item_id, product.mpn, attribute.attribute_id,
+                    _display(attribute.definition_clarification or attribute.reviewer_explanation or action), "",
+                ])
             proposals, units, bases, quotes, labels, urls, retrieved, applicability = [], [], [], [], [], [], [], []
             for index, candidate in enumerate(attribute.candidates):
                 proposals.append(_display(candidate.value))
@@ -266,16 +273,8 @@ def _build_package(
     }
     quality = any(isinstance(result, EnrichmentResult) and result.quality_run_id for result in results)
     if quality:
-        diagnostics = [["Product ID", "MPN", "Model", "Tier", "Phase", "Input tokens", "Reasoning tokens", "Output tokens", "Cost USD", "Status", "Note"]]
-        for result in results:
-            if isinstance(result, EnrichmentResult):
-                for entry in [*result.quality_diagnostics, *result.input_diagnostics]:
-                    diagnostics.append([
-                        result.manifest.product.item_id, result.manifest.product.mpn,
-                        *[_display(entry.get(name)) for name in ("model", "tier", "phase", "input_tokens",
-                                                                "reasoning_tokens", "output_tokens", "cost_usd", "status", "reason")],
-                    ])
-        sheets["Diagnostics"] = diagnostics
+        sheets["Questions"] = question_rows
+        instructions.append(["Questions", "Resolve the listed definition, evidence or review questions. Responses remain blank until supplied by a reviewer; per-call diagnostics are in the separate technical export."])
         for sheet in sheets.values():
             for row in sheet:
                 for index, value in enumerate(row):

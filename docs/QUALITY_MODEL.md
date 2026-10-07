@@ -165,7 +165,19 @@ The worker connects all provider usage to one `QualityCostMeter`. Set
 `QUALITY_COST_RUN_ID` defaults to the execution's `QUALITY_RUN_ID`; reuse a cost
 run ID when manually restarting the same logical run, while giving each execution
 a distinct run ID. Existing model/web charges then reload rather than reset.
+Reusing the same `QUALITY_RUN_ID` also creates a new unique execution ID with
+immutable execution snapshots and continued usage numbering; its root summary
+is cumulative, not a second cost to add to individual execution snapshots.
 `QUALITY_WEB_SEARCH_USD_PER_CALL` and `QUALITY_WEB_BROWSE_USD_PER_CALL` select
 the disclosed WebIQ prices. Do not include earlier executions' usage again in
 the base amount. Each execution summary includes the final meter snapshot;
 unknown provider usage/cost remains unknown, never reported as free.
+
+Web gap-fill uses `/search/web`, paid `/browse`, then independent retrieval of
+the original page. Search and Browse default to USD 0.0125 per attempt; direct
+HTTP retrieval has no WebIQ fee. Pending/unavailable Browse responses are recorded
+without automatic polling or substitution of discovery snippets as evidence.
+Per product/execution, at most 12 searches and six paid Browse attempts are made.
+The worker prints the same persisted meter as `{"quality_cost": ...}` on exit,
+including failures. Customer review packages contain five sheets
+(Review/Evidence/Instructions/Summary/Questions); call Diagnostics are technical-only.

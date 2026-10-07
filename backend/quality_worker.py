@@ -15,12 +15,13 @@ import json
 import os
 import re
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from io import BytesIO
 from urllib.parse import quote
 
 from backend.batch import BatchService, digest, now
-from backend.batch_store import Missing, configured_store, read_json, write_json
+from backend.batch_store import Conflict, Missing, configured_store, read_json, write_json
 from backend.core.docintel import ParsedDocument
 from backend.core.vendor_tables import VendorTableConfig, read_vendor_table
 from backend.evidence_verification import Fragment, match_text
@@ -327,21 +328,55 @@ def run_quality_batch(
     smoke_only: bool = False,
     smoke_first: bool = False,
     cost_summary=None,
+    execution_id: str | None = None,
 ) -> dict:
     """Append new immutable results and preserve the complete previous state chain."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
         raise ValueError("QUALITY_RUN_ID must be a safe unique identifier")
+    execution_id = execution_id or uuid.uuid4().hex
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", execution_id):
+        raise ValueError("QUALITY_EXECUTION_ID must be a safe execution identifier")
     record = BatchService(store).get(batch_id, owner)
     prefix = f"quality-runs/{batch_id}/{run_id}"
-    write_json(store, prefix + "/started.json", {"run_id": run_id, "batch_id": batch_id, "owner": owner, "started_at": now(),
-                                               "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only})
+    execution_prefix = f"{prefix}/executions/{execution_id}"
+    started = {"run_id": run_id, "execution_id": execution_id, "batch_id": batch_id, "owner": owner, "started_at": now(),
+               "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only}
+    write_json(store, execution_prefix + "/started.json", started)
+    try:
+        write_json(store, prefix + "/started.json", started)
+    except Conflict:
+        pass
+    prior_usage_keys = [
+        key for key in store.keys(prefix + "/usage/")
+        if re.fullmatch(r"\d+\.json", key.rsplit("/", 1)[-1])
+    ]
+    prior_usage = [read_json(store, key)[0] for key in prior_usage_keys]
+    sequence_offset = max((int(key.rsplit("/", 1)[-1][:-5]) for key in prior_usage_keys), default=0)
+    try:
+        prior_summary, _ = read_json(store, prefix + "/summary.json")
+    except Missing:
+        prior_summary = {}
+
+    def latest(key, value):
+        try:
+            previous, version = read_json(store, key)
+        except Missing:
+            previous, version = None, None
+        if previous is not None and key == prefix + "/summary.json":
+            archive_id = previous.get("execution_id") or "legacy"
+            try:
+                write_json(store, f"{prefix}/executions/{archive_id}/summary.json", previous)
+            except Conflict:
+                pass
+        write_json(store, key, value, version)
+
     loader = CachedEvidenceLoader(store)
     usage_records, products = [], []
 
     def call_context(usage):
-        sequence = len(usage_records) + 1
+        sequence = sequence_offset + len(usage_records) + 1
         return {**usage, "run_id": run_id, "batch_id": batch_id, "sequence": sequence,
-                "call_id": f"{run_id}:{sequence:04d}"}
+                "execution_id": execution_id, "call_id": f"{run_id}:{sequence:04d}"}
 
     def before_usage(context):
         if before_call:
@@ -351,7 +386,8 @@ def run_quality_batch(
         entry = call_context(usage)
         entry["recorded_at"] = now()
         if entry.get("operation") == "model":
-            for field in ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_tokens", "cost_usd", "usage_reported"):
+            for field in ("input_tokens", "cached_input_tokens", "cache_write_tokens", "output_tokens",
+                          "reasoning_tokens", "cost_usd", "usage_reported", "pricing_basis"):
                 entry.setdefault(field, None)
         error = None
         try:
@@ -364,7 +400,7 @@ def run_quality_batch(
         entry.update(call_context(entry))
         usage_records.append(entry)
         print(json.dumps({"quality_usage": entry}, ensure_ascii=True), flush=True)
-        write_json(store, f"{prefix}/usage/{len(usage_records):04d}.json", entry)
+        write_json(store, f"{prefix}/usage/{entry['sequence']:04d}.json", entry)
         if error:
             raise error
         return entry
@@ -381,7 +417,8 @@ def run_quality_batch(
             completion = ResponsesCompletion()
         if smoke_only or smoke_first:
             smoke = run_model_smoke(record, loader, completion, run_id=run_id, usage_callback=persist_usage, before_call=before_usage)
-            write_json(store, prefix + "/smoke.json", smoke)
+            write_json(store, execution_prefix + "/smoke.json", smoke)
+            latest(prefix + "/smoke.json", smoke)
             smoke_recorded = True
         has_ford = any(source.get("sha256") == FORD_PDF_SHA256 for item in record["items"] for source in item.get("sources", []))
         image, image_diagnostic = image_input(store, ford_image_blob) if not smoke_only and has_ford else (None, None)
@@ -393,7 +430,7 @@ def run_quality_batch(
                 prior, revision = read_json(store, state_key)
             except Missing:
                 prior, revision = None, None
-            attempt = digest(f"quality-v1:{batch_id}:{run_id}:{item_key}".encode())
+            attempt = digest(f"quality-v1:{batch_id}:{run_id}:{execution_id}:{item_key}".encode())
             result_key = f"results/{batch_id}/{item_key}/attempts/{attempt}.json"
             start = now()
             evidence, retrieval, provenance = loader.load(item)
@@ -407,23 +444,29 @@ def run_quality_batch(
                 initial_diagnostics=[entry for entry in usage_records if entry.get("phase") == "smoke"
                                      and entry.get("item_id") == manifest.product.item_id] if reuse_smoke else None,
             )
+            result.quality_diagnostics.extend(
+                entry for entry in usage_records
+                if entry.get("operation") != "model" and entry.get("item_id") == manifest.product.item_id
+            )
             if ford and image_diagnostic is not None:
                 result.input_diagnostics.append({
                     **image_diagnostic, "item_id": manifest.product.item_id, "target_mpn": manifest.product.mpn,
                 })
             write_json(store, result_key, result.model_dump(mode="json"))
             status = "completed" if all(a.status in {"existing", "proposed"} for a in result.attributes) else "unresolved"
-            state = {"state": status, "run_id": run_id, "result_key": result_key, "started_at": start, "finished_at": now(),
+            state = {"state": status, "run_id": run_id, "execution_id": execution_id,
+                     "result_key": result_key, "started_at": start, "finished_at": now(),
                      "provenance": provenance, "reviewable_attributes": [a.attribute_id for a in result.attributes if a.candidates],
                      "quality_diagnostics": result.quality_diagnostics, "input_diagnostics": result.input_diagnostics}
             if prior is not None:
                 state["previous_attempt"] = prior
             write_json(store, state_key, state, revision)
             products.append({"item_key": item_key, "item_id": manifest.product.item_id, "mpn": manifest.product.mpn,
-                             "result_key": result_key, "state": status,
+                             "result_key": result_key, "state": status, "execution_id": execution_id,
                              "input_diagnostics": result.input_diagnostics,
                              "candidates": sum(len(a.candidates) for a in result.attributes)})
-            write_json(store, f"{prefix}/products/{item_key}.json", products[-1])
+            write_json(store, f"{execution_prefix}/products/{item_key}.json", products[-1])
+            latest(f"{prefix}/products/{item_key}.json", products[-1])
     except Exception as error:
         failure = error
         if (smoke_only or smoke_first) and smoke is None:
@@ -433,7 +476,8 @@ def run_quality_batch(
                      "observed_candidates": error.candidates if isinstance(error, QualitySmokeError) else [],
                      "reason": str(error) if isinstance(error, QualitySmokeError) else "Model request or usage recording failed; inspect persisted usage diagnostics."}
     if (smoke_only or smoke_first) and not smoke_recorded:
-        write_json(store, prefix + "/smoke.json", smoke)
+        write_json(store, execution_prefix + "/smoke.json", smoke)
+        latest(prefix + "/smoke.json", smoke)
     cost = None
     if cost_summary is not None:
         try:
@@ -441,13 +485,21 @@ def run_quality_batch(
         except Exception as error:
             failure = failure or error
             cost = {"status": "unavailable", "error": type(error).__name__}
-    summary = {"schema_version": 1, "run_id": run_id, "batch_id": batch_id, "owner": owner,
-               "state": "failed" if failure else "completed", "finished_at": now(), "products": products,
-               "usage": usage_records, "model_calls": sum(e.get("operation") == "model" for e in usage_records),
+    all_usage = [*prior_usage, *usage_records]
+    latest_products = {entry["item_key"]: entry for entry in prior_summary.get("products", [])}
+    latest_products.update({entry["item_key"]: entry for entry in products})
+    cumulative_products = [latest_products[item["item_key"]] for item in record["items"]
+                           if item["item_key"] in latest_products]
+    summary = {"schema_version": 1, "run_id": run_id, "execution_id": execution_id, "batch_id": batch_id, "owner": owner,
+               "state": "failed" if failure else "completed", "finished_at": now(), "products": cumulative_products,
+               "execution_products": products,
+               "usage": all_usage, "model_calls": sum(e.get("operation") == "model" for e in all_usage),
+               "execution_model_calls": sum(e.get("operation") == "model" for e in usage_records),
                "new_di_calls": 0, "error": type(failure).__name__ if failure else None,
                "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only, "smoke": smoke,
                "cost": cost}
-    write_json(store, prefix + "/summary.json", summary)
+    write_json(store, execution_prefix + "/summary.json", summary)
+    latest(prefix + "/summary.json", summary)
     if failure:
         raise failure
     return summary
@@ -458,6 +510,7 @@ def main(argv=None) -> int:
     parser.add_argument("--batch-id", default=os.environ.get("QUALITY_BATCH_ID"))
     parser.add_argument("--owner", default=os.environ.get("QUALITY_OWNER"))
     parser.add_argument("--run-id", default=os.environ.get("QUALITY_RUN_ID"))
+    parser.add_argument("--execution-id", default=os.environ.get("QUALITY_EXECUTION_ID"))
     parser.add_argument("--smoke-only", action="store_true", default=os.environ.get("QUALITY_SMOKE_ONLY", "false").lower() == "true",
                         help="Run only the one-call Mueller T1096 Lockwing model smoke; do not extract products.")
     parser.add_argument("--smoke-first", action=argparse.BooleanOptionalAction,
@@ -473,14 +526,14 @@ def main(argv=None) -> int:
     cost_run_id = os.environ.get("QUALITY_COST_RUN_ID") or args.run_id
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", cost_run_id):
         parser.error("QUALITY_COST_RUN_ID must be a safe run identifier")
-    meter = QualityCostMeter(
-        store, args.batch_id, cost_run_id,
-        run_base_cost_usd=os.environ.get("QUALITY_RUN_BASE_COST_USD", "0"),
-        overnight_prior_cost_usd=os.environ.get("QUALITY_OVERNIGHT_PRIOR_COST_USD", "0"),
-        worker_usd_per_second=os.environ.get("QUALITY_WORKER_USD_PER_SECOND", "0"),
-        search_usd=os.environ.get("QUALITY_WEB_SEARCH_USD_PER_CALL", "0.0125"),
-        browse_usd=os.environ.get("QUALITY_WEB_BROWSE_USD_PER_CALL", "0"),
-    )
+    prices = {
+        "run_base_cost_usd": os.environ.get("QUALITY_RUN_BASE_COST_USD", "0"),
+        "overnight_prior_cost_usd": os.environ.get("QUALITY_OVERNIGHT_PRIOR_COST_USD", "0"),
+        "worker_usd_per_second": os.environ.get("QUALITY_WORKER_USD_PER_SECOND", "0"),
+        "search_usd": os.environ.get("QUALITY_WEB_SEARCH_USD_PER_CALL", "0.0125"),
+        "browse_usd": os.environ.get("QUALITY_WEB_BROWSE_USD_PER_CALL", "0.0125"),
+    }
+    meter = QualityCostMeter(store, args.batch_id, cost_run_id, **prices)
 
     def priced_usage(entry):
         return {**meter.record(entry), "cost_run_id": cost_run_id}
@@ -488,22 +541,26 @@ def main(argv=None) -> int:
     def cost_snapshot():
         return {
             **meter.summary(), "cost_run_id": cost_run_id,
-            "worker_usd_per_second": float(meter.worker_rate),
+            "worker_usd_per_second": float(prices["worker_usd_per_second"]),
             "worker_rate_configured": "QUALITY_WORKER_USD_PER_SECOND" in os.environ,
-            "overnight_prior_cost_usd": float(meter.overnight_prior),
-            "web_search_usd_per_call": float(meter.search_rate),
-            "web_browse_usd_per_call": float(meter.browse_rate),
+            "overnight_prior_cost_usd": float(prices["overnight_prior_cost_usd"]),
+            "web_search_usd_per_call": float(prices["search_usd"]),
+            "web_browse_usd_per_call": float(prices["browse_usd"]),
             "compute_reconciliation": "Replace this elapsed worker compute estimate with measured execution-time cost; do not add both.",
         }
 
-    summary = run_quality_batch(
-        store, args.batch_id, args.owner, args.run_id,
-        web=QualityWeb() if not args.smoke_only and os.environ.get("QUALITY_WEB_ENABLED", "true").lower() == "true" else None,
-        ford_image_blob=os.environ.get("QUALITY_FORD_IMAGE_BLOB"),
-        smoke_only=args.smoke_only,
-        smoke_first=args.smoke_first and not args.smoke_only,
-        usage_callback=priced_usage, before_call=meter.before_call, cost_summary=cost_snapshot,
-    )
+    try:
+        summary = run_quality_batch(
+            store, args.batch_id, args.owner, args.run_id,
+            web=QualityWeb() if not args.smoke_only and os.environ.get("QUALITY_WEB_ENABLED", "true").lower() == "true" else None,
+            ford_image_blob=os.environ.get("QUALITY_FORD_IMAGE_BLOB"),
+            smoke_only=args.smoke_only,
+            smoke_first=args.smoke_first and not args.smoke_only,
+            usage_callback=priced_usage, before_call=meter.before_call, cost_summary=cost_snapshot,
+            execution_id=args.execution_id,
+        )
+    finally:
+        print(json.dumps({"quality_cost": meter.summary()}, ensure_ascii=True), flush=True)
     print(json.dumps(summary, ensure_ascii=True))
     return 0
 

@@ -329,7 +329,7 @@ def test_four_product_worker_appends_attempts_preserves_history_and_persists_usa
             client.responses.append([proposal(evidence_ids=[packet["evidence"][0]["evidence_id"]])])
         return Completion.complete_structured(client, system, user, schema, **kwargs)
     client.complete_structured = answer
-    summary = run_quality_batch(store, "batch", "owner", "first", completion=client)
+    summary = run_quality_batch(store, "batch", "owner", "first", completion=client, execution_id="first-execution")
     assert len(summary["products"]) == 4 and summary["model_calls"] == 8
     assert summary["new_di_calls"] == 0
     assert len(store.keys("quality-runs/batch/first/usage/")) == 8
@@ -344,7 +344,7 @@ def test_four_product_worker_appends_attempts_preserves_history_and_persists_usa
     assert store.data["batches/batch.json"] == old["batches/batch.json"]
     assert len(BatchService(store).detail("batch", "row-2", "owner")["attempt_history"]) == 3
     with pytest.raises(Conflict):
-        run_quality_batch(store, "batch", "owner", "first", completion=client)
+        run_quality_batch(store, "batch", "owner", "first", completion=client, execution_id="first-execution")
     exported = read_workbook(BatchService(store).export("batch", "owner"))
     assert exported["Diagnostics"][0]["Model"] == "quality-model"
     assert exported["Results"][0]["Judge status"] == "accepted"
@@ -405,8 +405,7 @@ def test_ford_image_fault_is_per_item_and_text_results_survive(monkeypatch, mode
     assert all(kwargs["images"] is None for _, _, kwargs in client.calls[2:])
     assert all(packet["target_mpn"] == ford.manifest.product.mpn for _, packet, _ in client.calls[:2])
     public = read_workbook(build_reviewer_package([ford, other]).workbook)
-    image_rows = [row for row in public["Diagnostics"] if row["Phase"] == "catalog_image"]
-    assert len(image_rows) == 1 and image_rows[0]["Status"] == status and image_rows[0]["Note"]
+    assert set(public) == {"Review", "Evidence", "Instructions", "Summary", "Questions"}
     technical = read_workbook(BatchService(store).export("batch", "owner"))
     assert any(row["Diagnostic"] == "Image input" and row["Status"] == status for row in technical["Diagnostics"])
 
@@ -519,15 +518,19 @@ def test_meter_failure_is_persisted_and_never_swallowed_as_model_failure():
     assert store.keys("quality-runs/batch/meter-failed/usage/") == ["quality-runs/batch/meter-failed/usage/0001.json"]
 
 
-def test_quality_reviewer_is_five_safe_sheets_with_blank_decisions_and_diagnostics():
+def test_quality_reviewer_is_five_safe_sheets_with_blank_decisions_and_questions():
     client = Completion([[proposal()]], disputed=True)
     result = run_product(manifest(), [evidence()], client, run_id="internal-run")
     package = build_reviewer_package([result])
     sheets = read_workbook(package.workbook)
-    assert set(sheets) == {"Review", "Evidence", "Instructions", "Summary", "Diagnostics"}
+    assert set(sheets) == {"Review", "Evidence", "Instructions", "Summary", "Questions"}
     row = sheets["Review"][0]
     assert row["Decision"] == row["Correction"] == row["Reason"] == ""
     assert row["Judge status"] == "judge_disputed" and row["Origin"] == "literal"
+    assert len(sheets["Questions"]) == 1
+    question = sheets["Questions"][0]
+    assert question["Product ID"] == row["Product ID"] and question["Attribute"] == row["Attribute"]
+    assert question["Question"] and question["Response"] == ""
     with ZipFile(BytesIO(package.workbook)) as archive:
         assert all("hyperlink" not in archive.read(name).decode().lower() for name in archive.namelist())
         document = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
@@ -760,6 +763,9 @@ def test_web_usage_has_run_identity_and_is_exported_even_without_model_calls(mon
     assert all(row["Run ID"] == "web-run" and row["Operation"] == "web_search" for row in rows)
     assert all(row["Row"] == "2" for row in rows)
     assert sum(float(row["Cost USD"]) for row in rows) == pytest.approx(.004)
+    result = EnrichmentResult.model_validate(read_json(store, summary["products"][0]["result_key"])[0])
+    public = read_workbook(build_reviewer_package([result]).workbook)
+    assert "Diagnostics" not in public and public["Questions"]
 
 
 def test_smoke_cli_env_does_not_initialize_web(monkeypatch):
@@ -823,5 +829,116 @@ def test_cli_shared_cost_scope_accumulates_executions_without_rebilling_build(mo
     assert outputs[-1]["cost"]["cost_run_id"] == "logical-run"
     assert outputs[-1]["cost"]["worker_rate_configured"] is True
     assert outputs[-1]["cost"]["worker_usd_per_second"] == .01
-    assert outputs[-1]["cost"]["web_browse_usd_per_call"] == 0
+    assert outputs[-1]["cost"]["web_browse_usd_per_call"] == .0125
     assert all(output["usage"][0]["cost_run_id"] == "logical-run" for output in outputs)
+
+
+def test_cli_flushes_elapsed_cost_when_worker_initialization_fails(monkeypatch, capsys):
+    from backend.quality_cost import QualityCostMeter
+    from backend.quality_worker import main
+    store = Store()
+    ticks = [0]
+    monkeypatch.delenv("QUALITY_COST_RUN_ID", raising=False)
+    monkeypatch.setenv("QUALITY_RUN_BASE_COST_USD", ".5")
+    monkeypatch.setenv("QUALITY_WORKER_USD_PER_SECOND", ".01")
+    monkeypatch.setenv("QUALITY_WEB_ENABLED", "false")
+    monkeypatch.setattr("backend.quality_worker.configured_store", lambda: store)
+    monkeypatch.setattr("backend.quality_cost.QualityCostMeter",
+                        lambda *args, **kwargs: QualityCostMeter(*args, **kwargs, clock=lambda: ticks[0]))
+    def fail_worker(*args, **kwargs):
+        ticks[0] += 10
+        raise RuntimeError("Cannot load stored batch")
+    monkeypatch.setattr("backend.quality_worker.run_quality_batch", fail_worker)
+    with pytest.raises(RuntimeError, match="Cannot load stored batch"):
+        main(["--batch-id", "batch", "--owner", "owner", "--run-id", "initialization-failure"])
+    cost = read_json(store, "quality-runs/batch/initialization-failure/cost.json")[0]
+    assert cost["model_calls"] == 0 and cost["worker_seconds"] == 10
+    assert cost["worker_cost_usd"] == pytest.approx(.1)
+    assert cost["known_run_cost_usd"] == pytest.approx(.6)
+    assert json.loads(capsys.readouterr().out)["quality_cost"] == cost
+
+
+@pytest.mark.parametrize("priced", [True, False])
+def test_cache_write_usage_and_price_basis_survive_meter_and_exports(priced):
+    from backend.quality_cost import QualityCostMeter
+    store, _ = seed_store(1)
+    basis = "Synthetic public rate estimate; not finalized billing"
+    class CachedUsage(Completion):
+        def complete_structured(self, *args, **kwargs):
+            response = super().complete_structured(*args, **kwargs)
+            self.last_usage.update(
+                cache_write_tokens=15, pricing_basis=basis, usage_reported=True,
+                cost_usd=.001 if priced else None, estimated_cost_usd=.001 if priced else None,
+            )
+            return response
+    meter = QualityCostMeter(store, "batch", "cache-pricing", clock=lambda: 0)
+    summary = run_quality_batch(
+        store, "batch", "owner", "cache-pricing",
+        completion=CachedUsage([[proposal(evidence_ids=["E1"])]]),
+        before_call=meter.before_call, usage_callback=meter.record, cost_summary=meter.summary,
+    )
+    assert summary["state"] == "completed" and summary["model_calls"] == 2
+    assert all(entry["cache_write_tokens"] == 15 and entry["pricing_basis"] == basis for entry in summary["usage"])
+    assert all(entry["cost_usd"] == (.001 if priced else None) for entry in summary["usage"])
+    assert summary["cost"]["model_cost_usd"] == pytest.approx(.002 if priced else 0)
+    assert summary["cost"]["unpriced_model_calls"] == (0 if priced else 2)
+    technical = read_workbook(BatchService(store).export("batch", "owner"))["Diagnostics"]
+    assert all(row["Cache write tokens"] == "15" and row["Pricing basis"] == basis for row in technical)
+    result = EnrichmentResult.model_validate(BatchService(store).detail("batch", "row-2", "owner")["machine_result"])
+    public = read_workbook(build_reviewer_package([result]).workbook)
+    assert "Diagnostics" not in public
+    result.attributes[0].reviewer_explanation = "Synthetic\x01explanation"
+    sanitized = read_workbook(build_reviewer_package([result]).workbook)
+    assert len(sanitized) == 5
+    assert sanitized["Review"][0]["Reviewer explanation"] == "Synthetic explanation"
+
+
+def test_same_run_manual_retry_appends_usage_and_immutable_execution_results():
+    from backend.quality_cost import QualityCostMeter
+    store, _ = seed_store(1)
+    summaries = []
+    first_records = None
+    for execution_id in ("execution-one", "execution-two"):
+        meter = QualityCostMeter(store, "batch", "retry-run", run_base_cost_usd=".5", clock=lambda: 0)
+        result = run_quality_batch(
+            store, "batch", "owner", "retry-run", execution_id=execution_id,
+            completion=Completion([[proposal(evidence_ids=["E1"])]]),
+            usage_callback=meter.record, before_call=meter.before_call, cost_summary=meter.summary,
+        )
+        summaries.append(result)
+        if first_records is None:
+            first_records = {key: value for key, value in store.data.items()
+                             if key.startswith("results/") or "/executions/execution-one/" in key or "/usage/" in key}
+    assert summaries[0]["execution_id"] == "execution-one"
+    assert summaries[1]["execution_id"] == "execution-two"
+    assert summaries[1]["execution_model_calls"] == 2 and summaries[1]["model_calls"] == 4
+    assert [entry["call_id"] for entry in summaries[1]["usage"]] == [
+        "retry-run:0001", "retry-run:0002", "retry-run:0003", "retry-run:0004",
+    ]
+    assert {entry["execution_id"] for entry in summaries[1]["usage"]} == {"execution-one", "execution-two"}
+    assert summaries[1]["cost"]["known_run_cost_usd"] == pytest.approx(.504)
+    assert all(store.data[key] == value for key, value in first_records.items())
+    assert summaries[0]["products"][0]["result_key"] != summaries[1]["products"][0]["result_key"]
+    assert read_json(store, "quality-runs/batch/retry-run/summary.json")[0] == summaries[1]
+    assert read_json(store, "quality-runs/batch/retry-run/executions/execution-one/summary.json")[0] == summaries[0]
+    detail = BatchService(store).detail("batch", "row-2", "owner")
+    assert len(detail["attempt_history"]) == 3
+    rows = read_workbook(BatchService(store).export("batch", "owner"))["Diagnostics"]
+    assert len(rows) == 4 and len({row["Call ID"] for row in rows}) == 4
+    assert {row["Execution ID"] for row in rows} == {"execution-one", "execution-two"}
+
+
+def test_failed_manual_retry_preserves_prior_run_product_references():
+    store, _ = seed_store(1)
+    first = run_quality_batch(
+        store, "batch", "owner", "retry-products", execution_id="successful",
+        completion=Completion([[proposal(evidence_ids=["E1"])]]),
+    )
+    with pytest.raises(QualitySmokeError, match="Mueller 213030"):
+        run_quality_batch(store, "batch", "owner", "retry-products", execution_id="failed",
+                          completion=Completion(), smoke_only=True)
+    latest = read_json(store, "quality-runs/batch/retry-products/summary.json")[0]
+    assert latest["state"] == "failed" and latest["execution_products"] == []
+    assert latest["products"] == first["products"]
+    assert latest["model_calls"] == 2 and latest["execution_model_calls"] == 0
+    assert read_json(store, "quality-runs/batch/retry-products/executions/successful/summary.json")[0] == first
