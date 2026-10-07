@@ -25,19 +25,21 @@ Azure CLI packer exclude local environments, private outputs and credentials.
 the job entrypoint to `/app/.venv/bin/python -m backend.quality_worker`.
 It retains existing identity, secrets, networking and API environment; the job
 uses one replica, one completion and zero automatic retries. `start RUN_ID`
-starts exactly one manual execution with `QUALITY_RUN_ID`; it does not
+persists the run environment with native `job update --set-env-vars`, then
+starts exactly one manual execution; it does not
 build, deploy, reset state or automatically retry a failed/uncertain start.
 It prints the execution name for the cost/log command.
-Both commands select the existing job container `caj-docintel-batch-dev-erik3`:
-native CLI start requires that selection to apply environment overrides, and
-native log retrieval requires its container argument.
+Execution-only `job start --env-vars` overrides were not applied by the deployed
+CLI/API combination, even with a container selection; the resource update avoids
+that unsupported path. Log retrieval explicitly selects the existing container
+`caj-docintel-batch-dev-erik3`.
 
 ## Runtime and authenticated export
 
 Keep existing Blob, managed-identity and Entra settings on both resources.
 Before `start`, set `QUALITY_BATCH_ID` and `QUALITY_OWNER` (`tenant/object-id`)
 to the existing owner-scoped batch. The wrapper supplies these and the run ID as
-execution environment. Optional `QUALITY_WEB_ENABLED`, `QUALITY_SMOKE_ONLY` and
+job environment. Optional `QUALITY_WEB_ENABLED`, `QUALITY_SMOKE_ONLY` and
 `QUALITY_FORD_IMAGE_BLOB` are forwarded when set; other resource settings remain
 unchanged. Use this environment contract, not `RealPilotGuard`, approval JSON or continuation files.
 Live source/model configuration belongs in existing environment/secret references,
