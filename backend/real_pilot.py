@@ -74,7 +74,7 @@ import os
 import re
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, localcontext
 from urllib.parse import urlsplit
 
@@ -107,6 +107,8 @@ GAPFILL_AUDIT_KEY = "operations/real-pilot-gapfill.json"
 FOUR_PRODUCT_KEY = "configuration/real-pilot-four-product.json"
 FOUR_PRODUCT_AUDIT_KEY = "operations/real-pilot-four-product.json"
 FOUR_PRODUCT_INFERENCE_INTERVAL_SECONDS = 31
+FOUR_PRODUCT_SLICES = [["row-2", "row-4"], ["row-3", "row-5"]]
+FOUR_PRODUCT_SLICE_FIELDS = {"worker_slices", "slice_authorization", "slice_authorization_sha256"}
 FOUR_PRODUCT_FIELDS = {
     "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
     "ledger_sha256", "prior_row_sha256", "prior_row_audit_sha256", "prior_execution_ids",
@@ -401,6 +403,44 @@ def validate_four_product(amendment, approval, batch, ledger, store):
     return copy.deepcopy(checker.four_product)
 
 
+def validate_four_product_slices(value, capacity, approved_by):
+    """The extra execution is only the explicitly approved second distinct slice."""
+    if "worker_slices" not in value:
+        if FOUR_PRODUCT_SLICE_FIELDS & set(value):
+            raise ValueError("Incomplete two-slice authority")
+        return 1
+    authority = value.get("slice_authorization")
+    if (value["worker_slices"] != FOUR_PRODUCT_SLICES
+            or not isinstance(authority, dict) or set(authority) != {
+                "schema_version", "approved", "approved_by", "capacity_request_file", "plan_sha256",
+                "additional_inference", "additional_input_tokens", "additional_output_tokens",
+                "original_worker_seconds", "additional_worker_execution_authorized_only_for_two_slices",
+                "additional_worker_seconds", "full_sequence_minimum_slack_seconds", "timing_fallback_order",
+                "all_other_scope_and_limits_unchanged", "no_retry_authority", "readiness_clock_started",
+                "user_confirmation",
+            } or authority.get("schema_version") != 1 or type(authority.get("schema_version")) is not int
+            or authority.get("approved") is not True or authority.get("approved_by") != approved_by
+            or authority.get("plan_sha256") != capacity["plan_sha256"]
+            or value.get("slice_authorization_sha256") != _sha256(authority)
+            or authority.get("capacity_request_file") != "four-product-capacity-request-v1.json"
+            or any(type(authority.get(key)) is not int or authority[key] != expected for key, expected in {
+                "original_worker_seconds": 600, "additional_worker_seconds": 600,
+                "additional_worker_execution_authorized_only_for_two_slices": 1,
+                "full_sequence_minimum_slack_seconds": 90,
+                **{key: capacity[key] for key in (
+                    "additional_inference", "additional_input_tokens", "additional_output_tokens")},
+            }.items())
+            or authority.get("all_other_scope_and_limits_unchanged") is not True
+            or authority.get("no_retry_authority") is not True or authority.get("readiness_clock_started") is not False
+            or authority.get("timing_fallback_order") != [
+                "reduce_start_spacing_only_where_service_rate_limits_allow",
+                "two_worker_slices_if_guard_supports_the_second_bounded_execution",
+                "all_four_internal_tiers_first_then_web_by_most_unresolved",
+            ] or not isinstance(authority.get("user_confirmation"), str) or not authority["user_confirmation"]):
+        raise ValueError("Two worker slices require the bound explicit additional-execution authority")
+    return 2
+
+
 def validate_four_product_duration(value):
     """An empirical, provider-latency-conditional forecast; never a token-rate estimate."""
     fields = {
@@ -440,6 +480,8 @@ class RealPilotGuard:
         self._execution_id = None
         self._operation_keys = {}
         self._last_gapfill_inference = None
+        self.active_slice_index = None
+        self.active_slice_item_keys = None
         try:
             approval = self._validate()
         except (ValueError, Missing):
@@ -472,7 +514,7 @@ class RealPilotGuard:
         if len(raw) > 262144:
             raise ValueError("Four-product amendment exceeds its metadata bound")
         value = json.loads(raw)
-        if not isinstance(value, dict) or set(value) != FOUR_PRODUCT_FIELDS:
+        if not isinstance(value, dict) or set(value) not in (FOUR_PRODUCT_FIELDS, FOUR_PRODUCT_FIELDS | FOUR_PRODUCT_SLICE_FIELDS):
             raise ValueError("Four-product amendment schema mismatch")
         selected = [item["item_key"] for item in self.batch["items"]]
         if (self.row_rerun is None or self.gapfill is not None
@@ -545,13 +587,14 @@ class RealPilotGuard:
                 or not re.fullmatch(r"[a-f0-9]{64}", capacity["plan_sha256"])):
             raise ValueError("An explicit exact measured capacity exception is required")
         _timestamp(capacity["approved_at"])
+        slice_count = validate_four_product_slices(value, capacity, approval["approved_by"])
         validate_four_product_duration(capacity["duration_assumptions"])
         for name in FOUR_PRODUCT_CAPACITY_FIELDS - {
                 "approved", "approved_by", "approved_at", "receipt_id", "plan_sha256", "duration_assumptions"}:
             _integer(capacity[name], name)
         if (capacity["max_requests"] != 12 or capacity["max_output_tokens"] != 24576
                 or not 1 <= capacity["max_input_tokens"] <= 8 * 27952 + 4 * 26000
-                or capacity["additional_executions"] != 1
+                or capacity["additional_executions"] != slice_count
                 or capacity["additional_inference"] != max(0, 12 - (
                     approval["limits"]["inference"] - baseline["attempted"]["inference"]))
                 or capacity["additional_input_tokens"] != max(0, capacity["max_input_tokens"] - (
@@ -564,6 +607,7 @@ class RealPilotGuard:
         if ((deadline - ready).total_seconds() != 5400
                 or ready < _timestamp(self.row_rerun["operating_expires_at"])
                 or not ready <= start < end <= deadline
+                or (slice_count == 2 and (end - start).total_seconds() > 1200)
                 or _timestamp(capacity["approved_at"]) > ready):
             raise ValueError("Four-product readiness requires prior capacity approval and fixed 90 minutes")
         from backend.core.websearch_policy import OptionalWebPolicy
@@ -595,7 +639,7 @@ class RealPilotGuard:
                   for name, price in value["web_prices"].items()}
         # Include the already-consumed 116.134448s build, rounded UP only once,
         # plus one new 2-vCPU/900s build and one 600s worker. No old forecasts.
-        fixed = _integer(value["fixed_cost_microdollars"], "fixed cost", minimum=221227)
+        fixed = _integer(value["fixed_cost_microdollars"], "fixed cost", minimum=221227 + 18000 * (slice_count - 1))
         model = self._cost(approval, "inference", capacity["max_input_tokens"], 24576, 0)
         web = int(((4 * prices["search"] + 6 * prices["web_retrieval"]) * 1000000).to_integral_value(rounding=ROUND_CEILING))
         if (fixed + model + web > 5000000
@@ -721,7 +765,7 @@ class RealPilotGuard:
                 or cache.get("document", {}).get("cache_key") != "sha256:" + receipt["source_sha256"]):
             raise ValueError("Four-product PREP cache/provenance association changed")
         self._verify_four_product_prep_continuation(approval, completed, receipt, ledger)
-        if value["fixed_cost_microdollars"] < 221227 + measured_cost:
+        if value["fixed_cost_microdollars"] < 221227 + measured_cost + (18000 if value.get("worker_slices") else 0):
             raise ValueError("Four-product fixed forecast must include verified actual PREP page cost")
 
     def _verify_four_product_prep_continuation(self, approval, completed, receipt, ledger):
@@ -1323,6 +1367,9 @@ class RealPilotGuard:
             if (selected is None or _sha256(selected) != _sha256(item)
                     or item["item_key"] not in self.active_recovery["selected_item_keys"]):
                 raise ValueError("Item is deferred or differs from the recovery binding")
+            if (self.four_product and self.four_product.get("worker_slices")
+                    and self.active_slice_item_keys is not None and item["item_key"] not in self.active_slice_item_keys):
+                raise ValueError("Product belongs to a different immutable worker slice")
 
     def check_recovery_cache(self, key):
         if self.active_recovery is not None:
@@ -1357,10 +1404,123 @@ class RealPilotGuard:
             states[key] = (raw, version)
         return states
 
+    def slice_record_key(self, index, name):
+        if index not in (0, 1) or name not in {"attempt", "prepared", "completed"}:
+            raise ValueError("Unknown four-product slice audit")
+        return f"operations/real-pilot-four-product-slices/{_sha256(self.four_product)}/slice-{index + 1}/{name}.json"
+
+    def _verify_slice_terminal(self, index, *, ledger=None):
+        value = self.four_product
+        attempt, _ = read_json(self.store, self.slice_record_key(index, "attempt"))
+        prepared, _ = read_json(self.store, self.slice_record_key(index, "prepared"))
+        completed, _ = read_json(self.store, self.slice_record_key(index, "completed"))
+        if (completed.get("status") != "succeeded"
+                or completed.get("amendment_sha256") != _sha256(value)
+                or completed.get("slice_index") != index
+                or completed.get("item_keys") != value["worker_slices"][index]
+                or completed.get("execution_id") != attempt.get("execution_id")
+                or completed.get("attempt_sha256") != _sha256(attempt)
+                or completed.get("prepared_sha256") != _sha256(prepared)
+                or prepared.get("attempt_sha256") != _sha256(attempt)
+                or completed.get("recovery_audit_sha256") != _sha256(read_json(self.store, FOUR_PRODUCT_AUDIT_KEY)[0])
+                or (ledger is not None and completed.get("ledger") != ledger)
+                or not _timestamp(attempt["started_at"]) <= _timestamp(completed["completed_at"])
+                   <= _timestamp(attempt["started_at"]) + timedelta(seconds=600)):
+            raise ValueError("Previous worker slice is not an immutable successful terminal execution")
+        for key in value["worker_slices"][index]:
+            state, _ = read_json(self.store, f"items/{self.batch['id']}/{key}.json")
+            result, _ = read_json(self.store, self.result_key(key))
+            if (state.get("state") not in {"completed", "unresolved"}
+                    or state.get("recovery_sha256") != _sha256(value)
+                    or completed["item_sha256"].get(key) != _sha256(state)
+                    or completed["result_sha256"].get(self.result_key(key)) != _sha256(result)):
+                raise ValueError("Completed worker slice item/result changed or failed")
+        return completed
+
+    def _verify_second_slice(self, ledger):
+        value = self.four_product
+        progress = ledger.get("four_product", {})
+        slices = progress.get("slices")
+        if (progress.get("sha256") != _sha256(value) or not isinstance(slices, list) or len(slices) != 1
+                or slices[0].get("item_keys") != value["worker_slices"][0]):
+            raise Conflict("Only the distinct second slice may follow the first; no retry or third execution")
+        terminal = self._verify_slice_terminal(0, ledger=ledger)
+        attempt, _ = read_json(self.store, self.slice_record_key(0, "attempt"))
+        baseline = attempt["ledger_before"]
+        if (_sha256(baseline) != value["ledger_sha256"]
+                or set(ledger["executions"]) != set(value["prior_execution_ids"]) | {attempt["execution_id"]}
+                or any(ledger["executions"].get(key) != record for key, record in baseline["executions"].items())
+                or any(ledger["reservations"].get(key) != record for key, record in baseline["reservations"].items())):
+            raise ValueError("Second slice must preserve all prior charged reservations and executions")
+        for key, expected in value["historical_records"].items():
+            if _sha256(read_json(self.store, key)[0]) != expected:
+                raise ValueError("Second slice historical record changed")
+        for key in value["cached_documents"]:
+            self.check_recovery_cache(key)
+        self._verify_four_product_prep(baseline)
+        for key in value["worker_slices"][1]:
+            state, _ = read_json(self.store, f"items/{self.batch['id']}/{key}.json")
+            if (state.get("state") != "recovery_ready" or state.get("recovery_sha256") != _sha256(value)
+                    or _sha256(state) != terminal["remaining_item_sha256"].get(key)
+                    or _sha256(state.get("previous_attempt")) != value["item_sha256"][key]):
+                raise ValueError("Second slice requires untouched ready items and original history")
+            try:
+                self.store.read_bytes(self.result_key(key))
+            except Missing:
+                pass
+            else:
+                raise Conflict("Second slice cannot repeat an existing result")
+
+    def finish_slice(self):
+        """Append worker-terminal success; the operator separately observes Azure success."""
+        if not self.four_product or not self.four_product.get("worker_slices"):
+            return None
+        with self._mutex, self.store.lease(BUDGET_KEY):
+            _, ledger, _ = self._fresh_ledger()
+            index = self.active_slice_index
+            if index not in (0, 1) or ledger["four_product"]["slices"][index]["execution_id"] != self._execution_id:
+                raise Conflict("Worker slice was not admitted")
+            attempt, _ = read_json(self.store, self.slice_record_key(index, "attempt"))
+            prepared, _ = read_json(self.store, self.slice_record_key(index, "prepared"))
+            if _now() > _timestamp(attempt["started_at"]) + timedelta(seconds=600):
+                raise ValueError("Timed-out worker slice cannot authorize another execution")
+            if index == 1:
+                self._verify_slice_terminal(0)
+                previous, _ = read_json(self.store, self.slice_record_key(0, "completed"))
+                if any(ledger["reservations"].get(key) != record for key, record in previous["ledger"]["reservations"].items()):
+                    raise ValueError("Second slice changed first-slice reservations")
+            states, results, remaining = {}, {}, {}
+            for key in self.four_product["execution_order"]:
+                state, _ = read_json(self.store, f"items/{self.batch['id']}/{key}.json")
+                if key in self.active_slice_item_keys:
+                    if (state.get("state") not in {"completed", "unresolved"} or not state.get("finished_at")
+                            or state.get("recovery_sha256") != self.recovery_sha256
+                            or state.get("result_key") != self.result_key(key)):
+                        raise ValueError("Failed or incomplete worker slice cannot authorize another execution")
+                    states[key] = _sha256(state)
+                    results[self.result_key(key)] = _sha256(read_json(self.store, self.result_key(key))[0])
+                elif index == 0:
+                    if state.get("state") != "recovery_ready":
+                        raise ValueError("First slice touched a later product")
+                    remaining[key] = _sha256(state)
+            record = {
+                "status": "succeeded", "amendment_sha256": self.recovery_sha256,
+                "slice_index": index, "item_keys": list(self.active_slice_item_keys), "execution_id": self._execution_id,
+                "attempt_sha256": _sha256(attempt), "prepared_sha256": _sha256(prepared),
+                "recovery_audit_sha256": _sha256(read_json(self.store, FOUR_PRODUCT_AUDIT_KEY)[0]),
+                "completed_at": _now().isoformat(), "item_sha256": states, "result_sha256": results,
+                "remaining_item_sha256": remaining, "ledger": ledger,
+            }
+            write_json(self.store, self.slice_record_key(index, "completed"), record)
+            return copy.deepcopy(record)
+
     def verify_recovery(self, ledger):
         """Read-only preflight; no new allowance, recovery write or service call."""
         if self.four_product is not None:
             value = self.four_product
+            if value.get("worker_slices") and ledger.get("four_product"):
+                self._verify_second_slice(ledger)
+                return
             if (_sha256(ledger) != value["ledger_sha256"]
                     or set(ledger["executions"]) != set(value["prior_execution_ids"])
                     or {"executions": len(ledger["executions"]), "attempted": ledger["attempted"],
@@ -1467,6 +1627,17 @@ class RealPilotGuard:
         with self._mutex, self.store.lease(BUDGET_KEY):
             _, ledger, _ = self._fresh_ledger()
             if self.four_product is not None:
+                if self.four_product.get("worker_slices") and self.active_slice_index == 1:
+                    self._verify_slice_terminal(0)
+                    attempt, _ = read_json(self.store, self.slice_record_key(1, "attempt"))
+                    if ledger["four_product"]["slices"][1]["execution_id"] != self._execution_id:
+                        raise Conflict("Second slice is not reserved")
+                    fence()
+                    write_json(self.store, self.slice_record_key(1, "prepared"), {
+                        "attempt_sha256": _sha256(attempt), "execution_id": self._execution_id,
+                        "amendment_sha256": self.recovery_sha256, "slice_index": 1,
+                    })
+                    return
                 if ledger.get("four_product", {}).get("execution_id") != self._execution_id:
                     raise Conflict("Four-product execution exception is not reserved")
                 states = self._four_product_states()
@@ -1489,6 +1660,12 @@ class RealPilotGuard:
                         "requested_mode": "real_pilot", "recovery_sha256": self.recovery_sha256,
                         "result_key": self.result_key(key), "previous_attempt": json.loads(raw),
                     }, version)
+                if self.four_product.get("worker_slices"):
+                    attempt, _ = read_json(self.store, self.slice_record_key(0, "attempt"))
+                    write_json(self.store, self.slice_record_key(0, "prepared"), {
+                        "attempt_sha256": _sha256(attempt), "execution_id": self._execution_id,
+                        "amendment_sha256": self.recovery_sha256, "slice_index": 0,
+                    })
                 return
             if self.gapfill is not None:
                 if ledger.get("gapfill", {}).get("execution_id") != self._execution_id:
@@ -1856,28 +2033,48 @@ class RealPilotGuard:
             if key in ledger["executions"]:
                 raise Conflict("Real-pilot execution already attempted; no automatic retry")
             limit = (approval["limits"]["executions"] + bool(self.final_rerun)
-                     + bool(self.row_rerun) + bool(self.gapfill) + bool(self.four_product))
+                     + bool(self.row_rerun) + bool(self.gapfill)
+                     + (self.four_product["capacity_approval"]["additional_executions"] if self.four_product else 0))
             if len(ledger["executions"]) >= limit:
                 raise ValueError("Real-pilot execution budget exhausted")
             self.verify_recovery(ledger)
             if self.final_rerun and (_timestamp(self.active_recovery["expires_at"]) - _now()).total_seconds() < 600:
                 raise ValueError("Final rerun requires the full 600-second execution window")
-            ledger["executions"][key] = {"started_at": _now().isoformat()}
-            if self.four_product is not None:
-                ledger["four_product"] = {
-                    "sha256": self.recovery_sha256, "execution_id": key,
-                    "baseline_sha256": self.four_product["ledger_sha256"],
-                    "inference_before": ledger["attempted"]["inference"],
-                    "input_before": ledger["reserved"]["input_tokens"],
-                    "output_before": ledger["reserved"]["output_tokens"],
-                    "analysis_before": ledger["attempted"]["analysis"],
-                    "analysis_pages_before": ledger["reserved"]["analysis_pages"],
-                    "cost_before": ledger["reserved"]["microdollars"],
-                    "not_before": self.four_product["not_before"], "expires_at": self.four_product["expires_at"],
-                    "selected_item_keys": self.four_product["selected_item_keys"],
-                    "capacity_approval": self.four_product["capacity_approval"],
-                    "prep_receipt_sha256": self.four_product["prep_receipt_sha256"],
+            started = _now().isoformat()
+            sliced = self.four_product and self.four_product.get("worker_slices")
+            if sliced:
+                index = len(ledger.get("four_product", {}).get("slices", []))
+                if index not in (0, 1):
+                    raise Conflict("No third worker slice is authorized")
+                attempt = {
+                    "amendment_sha256": self.recovery_sha256, "slice_index": index,
+                    "item_keys": sliced[index], "execution_id": key, "started_at": started,
+                    "ledger_before": copy.deepcopy(ledger),
                 }
+                write_json(self.store, self.slice_record_key(index, "attempt"), attempt)
+                self.active_slice_index, self.active_slice_item_keys = index, list(sliced[index])
+            ledger["executions"][key] = {"started_at": started}
+            if self.four_product is not None:
+                if not ledger.get("four_product"):
+                    ledger["four_product"] = {
+                        "sha256": self.recovery_sha256, "execution_id": key,
+                        "baseline_sha256": self.four_product["ledger_sha256"],
+                        "inference_before": ledger["attempted"]["inference"],
+                        "input_before": ledger["reserved"]["input_tokens"],
+                        "output_before": ledger["reserved"]["output_tokens"],
+                        "analysis_before": ledger["attempted"]["analysis"],
+                        "analysis_pages_before": ledger["reserved"]["analysis_pages"],
+                        "cost_before": ledger["reserved"]["microdollars"],
+                        "not_before": self.four_product["not_before"], "expires_at": self.four_product["expires_at"],
+                        "selected_item_keys": self.four_product["selected_item_keys"],
+                        "capacity_approval": self.four_product["capacity_approval"],
+                        "prep_receipt_sha256": self.four_product["prep_receipt_sha256"],
+                    }
+                if sliced:
+                    ledger["four_product"].setdefault("slices", []).append({
+                        "slice_index": index, "item_keys": list(sliced[index]), "execution_id": key,
+                        "attempt_sha256": _sha256(attempt),
+                    })
             elif self.gapfill is not None:
                 ledger["gapfill"] = {
                     "sha256": self.recovery_sha256, "execution_id": key,
@@ -1980,6 +2177,18 @@ class RealPilotGuard:
             if continuation is not None:
                 if operation not in {"inference", "search", "web_retrieval"} or item_key not in continuation["selected_item_keys"]:
                     raise ValueError("Gapfill forbids analysis, internal retrieval and other products")
+                if self.four_product and self.four_product.get("worker_slices"):
+                    if item_key not in (self.active_slice_item_keys or []):
+                        raise ValueError("Reservation belongs to another worker slice")
+                    if (ledger["four_product"]["slices"][-1]["execution_id"] != self._execution_id
+                            or _now() > _timestamp(ledger["executions"][self._execution_id]["started_at"]) + timedelta(seconds=600)):
+                        raise ValueError("Worker slice is no longer active")
+                    try:
+                        self.store.read_bytes(self.slice_record_key(self.active_slice_index, "completed"))
+                    except Missing:
+                        pass
+                    else:
+                        raise Conflict("Completed worker slice cannot reserve more work")
                 previous = [entry for entry in ledger["reservations"].values()
                             if entry["execution_id"] == self._execution_id and entry["item_key"] == item_key]
                 counts = {name: sum(entry["operation"] == name for entry in previous)

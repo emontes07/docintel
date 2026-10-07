@@ -12,7 +12,7 @@ from backend.batch_store import read_json
 from backend.core.websearch_webiq import WebIQSearchClient
 from backend.workbooks import read_workbook, write_workbook
 from tests.test_four_product_continuation import (
-    four_case, final_case, network_blocked, put, row_case,
+    enable_two_slices, four_case, final_case, network_blocked, put, row_case,
 )
 from tests.test_four_product_private_gate import (
     assert_preserved, assert_sdk_failure_before_reservation, profile_worker, reproduction,
@@ -74,13 +74,16 @@ def recovery_case(configured, monkeypatch):
 
 
 @pytest.mark.parametrize("web", [True, False])
-def test_synthetic_all_four_real_worker_preserves_prior_results(four_case, monkeypatch, web):
+@pytest.mark.parametrize("sliced", [False, True])
+def test_synthetic_all_four_real_worker_preserves_prior_results(four_case, monkeypatch, web, sliced):
     store, batch, approval, candidate = four_case
     # Synthetic maximum-only reservations are not a real measured capacity grant.
     # The opt-in private gate requires the independently approved measured plan.
     maximum = 8 * 27952 + 4 * 26000
     candidate["capacity_approval"].update(max_input_tokens=maximum, additional_input_tokens=maximum)
     put(store, real_pilot.FOUR_PRODUCT_KEY, candidate)
+    if sliced:
+        enable_two_slices(four_case)
     before = {key: json.loads(raw) for key, (raw, _) in all_records(store).items()
               if key.endswith(".json") and key != real_pilot.FOUR_PRODUCT_KEY}
     baseline = read_json(store, real_pilot.BUDGET_KEY)[0]
@@ -88,7 +91,7 @@ def test_synthetic_all_four_real_worker_preserves_prior_results(four_case, monke
     if web:
         captures, timeline, measurements = profile_worker(monkeypatch, store, batch, candidate, response_seconds=22)
         calls, requests, searches, pages = captures
-        assert measurements["simulated_worker_elapsed_seconds"] == 512
+        assert measurements["simulated_worker_elapsed_seconds"] == (538 if sliced else 512)
         assert measurements["measured_local_worker_seconds"] > 0
         assert measurements["worker_elapsed_seconds"] > 512
         assert measurements["forecast_including_local_seconds"] > 548
@@ -156,7 +159,28 @@ def test_synthetic_all_four_real_worker_preserves_prior_results(four_case, monke
         helper.validate_pacing(
             proof, actual_plan, execution_order=candidate["execution_order"], interval_seconds=31,
             duration_assumptions=candidate["capacity_approval"]["duration_assumptions"],
+            worker_slices=candidate.get("worker_slices"),
         )
+        if sliced:
+            assert all(value["forecast_including_local_seconds"] <= 510 for value in proof["slices"])
+            for fault in ("slack", "spacing", "payload", "overlap"):
+                bad = copy.deepcopy(proof)
+                value = bad["slices"][1]
+                if fault == "slack":
+                    value["measured_local_worker_seconds"] = 224
+                    value["worker_elapsed_seconds"] = value["simulated_worker_elapsed_seconds"] + 224
+                    value["forecast_including_local_seconds"] = 511
+                    value["remaining_margin_seconds"] = 89
+                elif fault == "spacing":
+                    value["requests"][1]["start_seconds"] = value["requests"][0]["start_seconds"] + 30
+                elif fault == "payload":
+                    value["requests"][0]["payload_sha256"] = "0" * 64
+                else:
+                    value["item_keys"] = candidate["worker_slices"][0]
+                with pytest.raises(ValueError):
+                    helper.validate_pacing(bad, actual_plan, execution_order=candidate["execution_order"],
+                                           interval_seconds=31, worker_slices=candidate["worker_slices"],
+                                           duration_assumptions=candidate["capacity_approval"]["duration_assumptions"])
     else:
         calls, requests, searches, pages = reproduction(monkeypatch, batch, candidate)
     if not web:
@@ -170,7 +194,7 @@ def test_synthetic_all_four_real_worker_preserves_prior_results(four_case, monke
         from backend.extract import ExecutionConfigurationError
 
         with pytest.raises(ExecutionConfigurationError, match="Native WebIQ request validation"):
-            worker.run_batch(store, batch["id"], concurrency=1, item_limit=4)
+            worker.run_batch(store, batch["id"], concurrency=1, item_limit=2 if sliced else 4)
         assert len(calls) == len(requests) == 2 and not searches and not pages
         ledger = read_json(store, real_pilot.BUDGET_KEY)[0]
         assert ledger["attempted"]["inference"] == baseline["attempted"]["inference"] + 2

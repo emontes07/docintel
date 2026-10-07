@@ -159,7 +159,7 @@ def assert_sdk_failure_before_reservation(monkeypatch, store, batch, scope, prov
             assert provider == "web_retrieval"
             context.setattr("backend.core.websearch.preflight_original_page", incompatible)
         with pytest.raises(ExecutionConfigurationError):
-            worker.run_batch(store, batch["id"], concurrency=1, item_limit=4)
+            worker.run_batch(store, batch["id"], concurrency=1, item_limit=2 if scope.get("worker_slices") else 4)
     ledger = read_json(store, real_pilot.BUDGET_KEY)[0]
     assert ledger["attempted"]["inference"] - before["attempted"]["inference"] == (0 if provider == "model" else 2)
     assert ledger["attempted"]["search"] - before["attempted"]["search"] == (1 if provider == "web_retrieval" else 0)
@@ -205,14 +205,47 @@ def profile_worker(monkeypatch, store, batch, scope, *, response_seconds):
         return result
 
     monkeypatch.setattr(worker, "write_json", measured_write)
-    started = perf_counter()
-    worker.run_batch(store, batch["id"], concurrency=1, item_limit=4)
-    local_seconds = perf_counter() - started
+    sliced = scope.get("worker_slices")
+    slices = []
+    local_seconds, simulated_seconds = 0, 0
+    for index, items in enumerate(sliced or [scope["execution_order"]]):
+        clock[0] = assumptions["startup_bookkeeping_seconds"]
+        model_offset, web_offset = len(timeline), len(web_timeline)
+        started = perf_counter()
+        worker.run_batch(store, batch["id"], concurrency=1, item_limit=len(items))
+        measured = perf_counter() - started
+        local_seconds += measured
+        simulated_seconds += clock[0]
+        if sliced:
+            planned = [
+                helper.payload_entry(key, tier, captures[1][model_offset + item_index * 3 + offset])
+                for item_index, key in enumerate(items)
+                for offset, tier in enumerate(("internal_pdf", "vendor_table", "manufacturer_web"))
+            ]
+            forecast = (5 * max(31, assumptions["model_response_allowance_seconds"])
+                        + assumptions["model_response_allowance_seconds"] + assumptions["startup_bookkeeping_seconds"]
+                        + assumptions["web_network_allowance_seconds"] / 2 + measured)
+            slices.append({
+                "slice_index": index, "item_keys": items,
+                "requests": [
+                    {"item_key": entry["item_key"], "tier": entry["tier"], "payload_sha256": entry["payload_sha256"],
+                     "input_byte_bound": entry["input_tokens"], "output_tokens": entry["output_tokens"], **timing}
+                    for entry, timing in zip(planned, timeline[model_offset:])
+                ],
+                "web_delay_events": copy.deepcopy(web_timeline[web_offset:]),
+                "simulated_worker_elapsed_seconds": clock[0], "measured_local_worker_seconds": measured,
+                "worker_elapsed_seconds": clock[0] + measured, "forecast_including_local_seconds": forecast,
+                "remaining_margin_seconds": 600 - forecast,
+                "local_measurement": "perf_counter_whole_real_worker_with_memory_store",
+                "remote_storage_latency_measured": False,
+            })
     return captures, timeline, {
-        "web_delay_events": web_timeline, "simulated_worker_elapsed_seconds": clock[0],
+        **({"slices": slices} if sliced else {}),
+        "web_delay_events": web_timeline, "simulated_worker_elapsed_seconds": simulated_seconds,
         "measured_local_worker_seconds": local_seconds,
-        "worker_elapsed_seconds": clock[0] + local_seconds,
-        "forecast_including_local_seconds": assumptions["forecast_seconds"] + local_seconds,
+        "worker_elapsed_seconds": simulated_seconds + local_seconds,
+        "forecast_including_local_seconds": (sum(value["forecast_including_local_seconds"] for value in slices)
+                                             if sliced else assumptions["forecast_seconds"] + local_seconds),
         "local_measurement": "perf_counter_whole_real_worker_with_memory_store",
         "remote_storage_latency_measured": False,
         "web_allowance_is_hard_deadline": False, "phase_timeouts_bound_dns": False,
@@ -221,14 +254,15 @@ def profile_worker(monkeypatch, store, batch, scope, *, response_seconds):
         "measured_prior_two_item_subtotal_seconds": sum(item_seconds[key] for key in ("row-2", "row-3")),
         "measured_shared_local_seconds": local_seconds - sum(item_seconds.values()),
         "prior_two_comparison": "same_run_mueller_item_subtotal_not_historical_replay",
-        "remaining_margin_seconds": 600 - assumptions["forecast_seconds"] - local_seconds,
+        "remaining_margin_seconds": (min(value["remaining_margin_seconds"] for value in slices)
+                                     if sliced else 600 - assumptions["forecast_seconds"] - local_seconds),
         "provider_preflights": copy.deepcopy(preflights),
     }
 
 
 def assert_preserved(store, original, baseline, batch, candidate):
     ledger = read_json(store, real_pilot.BUDGET_KEY)[0]
-    assert len(ledger["executions"]) == len(baseline["executions"]) + 1
+    assert len(ledger["executions"]) == len(baseline["executions"]) + (2 if candidate.get("worker_slices") else 1)
     assert all(ledger["executions"][key] == value for key, value in baseline["executions"].items())
     assert all(ledger["reservations"][key] == value for key, value in baseline["reservations"].items())
     assert ledger["attempted"]["analysis"] == baseline["attempted"]["analysis"]
@@ -261,7 +295,10 @@ def test_actual_postprep_four_product_private_gate(monkeypatch):
     snapshot = private_file(root, snapshot_name)
     bundle = private_file(root, os.environ["DOCINTEL_TEST_FOUR_PRODUCT_SCOPE"])
     scope = bundle["amendment_scope"]
-    assert set(scope) == real_pilot.FOUR_PRODUCT_FIELDS - helper.TIME_FIELDS
+    assert set(scope) == ((real_pilot.FOUR_PRODUCT_FIELDS | real_pilot.FOUR_PRODUCT_SLICE_FIELDS)
+                          if scope.get("worker_slices") else real_pilot.FOUR_PRODUCT_FIELDS) - helper.TIME_FIELDS
+    if scope.get("worker_slices"):
+        assert scope["slice_authorization"] == private_file(root, helper.CAPACITY_OWNER_AUTHORIZATION_FILE)
     assert scope["capacity_approval"]["plan_sha256"] == helper.sha(bundle["payload_plan"])
     assert len(bundle["payload_plan"]) == 12
     original = helper.decode_records(snapshot)
@@ -349,14 +386,15 @@ def test_actual_postprep_four_product_private_gate(monkeypatch):
     pacing.update(measurements)
     helper.validate_pacing(pacing, actual_plan, execution_order=candidate["execution_order"],
                            interval_seconds=candidate["inference_interval_seconds"],
-                           duration_assumptions=candidate["capacity_approval"]["duration_assumptions"])
+                           duration_assumptions=candidate["capacity_approval"]["duration_assumptions"],
+                           worker_slices=candidate.get("worker_slices"))
     ledger = assert_preserved(store, original, baseline, batch, candidate)
     assert ledger["attempted"]["inference"] - baseline["attempted"]["inference"] == 12
     assert ledger["reserved"]["input_tokens"] - baseline["reserved"]["input_tokens"] == sum(
         request.input_bound for request in requests)
     assert ledger["reserved"]["output_tokens"] - baseline["reserved"]["output_tokens"] == 24576
     after = all_records(store)
-    worker.run_batch(store, batch["id"], concurrency=1, item_limit=4)
+    worker.run_batch(store, batch["id"], concurrency=1, item_limit=2 if scope.get("worker_slices") else 4)
     assert all_records(store) == after
     missing_store = WorkerMemoryStore(ready_records)
     with monkeypatch.context() as context:
@@ -370,7 +408,7 @@ def test_actual_postprep_four_product_private_gate(monkeypatch):
         from backend.extract import ExecutionConfigurationError
 
         with pytest.raises(ExecutionConfigurationError, match="Native WebIQ request validation"):
-            worker.run_batch(missing_store, batch["id"], concurrency=1, item_limit=4)
+            worker.run_batch(missing_store, batch["id"], concurrency=1, item_limit=2 if scope.get("worker_slices") else 4)
     assert len(missing_calls) == 2 and not searches and not pages
     missing_ledger = read_json(missing_store, real_pilot.BUDGET_KEY)[0]
     assert missing_ledger["attempted"]["inference"] == baseline["attempted"]["inference"] + 2
@@ -398,7 +436,7 @@ def test_actual_postprep_four_product_private_gate(monkeypatch):
         context.setattr(real_pilot.RealPilotGuard, "reserve", deny)
         from backend.extract import ExecutionConfigurationError
         with pytest.raises(ExecutionConfigurationError):
-            worker.run_batch(fatal_store, batch["id"], concurrency=1, item_limit=4)
+            worker.run_batch(fatal_store, batch["id"], concurrency=1, item_limit=2 if scope.get("worker_slices") else 4)
     assert fatal and set(fatal) == {batch["items"][0]["item_key"]}
     for item in batch["items"][1:]:
         assert read_json(fatal_store, f"items/{batch['id']}/{item['item_key']}.json")[0]["state"] == "recovery_ready"

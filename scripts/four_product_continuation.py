@@ -35,6 +35,7 @@ OWNER_AUTHORIZATION_FILE = "four-product-owner-authorization-20261006T201622Z.js
 PREPARATION_IDENTITY_AUTHORIZATION_FILE = "four-product-preparation-identity-authorization-20261006T221236Z.json"
 EXISTING_ROLE_EVIDENCE_FILE = "four-product-existing-role-evidence-20261006.json"
 CONTINUATION_OWNER_AUTHORIZATION_FILE = "ford-continuation-owner-authorization-20261006T233051Z.json"
+CAPACITY_OWNER_AUTHORIZATION_FILE = "four-product-capacity-owner-approval-v1.json"
 PREPARATION_STOPPED_FILE = "ford-preparation-stopped-outcome.json"
 KEY = "configuration/real-pilot-four-product.json"
 AUDIT = "operations/real-pilot-four-product.json"
@@ -286,7 +287,8 @@ def verify_continued_preparation(work, postprep):
     return owner
 
 
-def capacity_request(ledger, approval, row_amendment, plan, *, duration_assumptions=None):
+def capacity_request(ledger, approval, row_amendment, plan, *, duration_assumptions=None,
+                     worker_slices=None, slice_authorization=None):
     """A measured request, NOT approval. Does not grant/refund/reset any capacity."""
     require(isinstance(plan, list) and len(plan) == 12, "All twelve complete payload bounds must be measured")
     counts = {}
@@ -314,13 +316,21 @@ def capacity_request(ledger, approval, row_amendment, plan, *, duration_assumpti
         from backend.real_pilot import validate_four_product_duration
 
         validate_four_product_duration(duration_assumptions)
-    return {
+    requested = {
         "plan_sha256": sha(plan), "max_requests": 12, "max_input_tokens": total, "max_output_tokens": 24576,
         "additional_executions": 1, "additional_inference": max(0, 12 - remaining["inference"]),
         "additional_input_tokens": max(0, total - remaining["input_tokens"]),
         "additional_output_tokens": max(0, 24576 - remaining["output_tokens"]),
         "duration_assumptions": copy.deepcopy(duration_assumptions),
     }
+    if worker_slices is not None:
+        from backend.real_pilot import validate_four_product_slices
+
+        requested["additional_executions"] = validate_four_product_slices({
+            "worker_slices": worker_slices, "slice_authorization": slice_authorization,
+            "slice_authorization_sha256": sha(slice_authorization),
+        }, requested, approval["approved_by"])
+    return requested
 
 
 def web_configuration(records, public_attribute_terms, manufacturers):
@@ -361,7 +371,7 @@ def web_configuration(records, public_attribute_terms, manufacturers):
 
 def amendment_scope(records, *, capacity_approval, plan, prep_receipt_key, public_web_policy,
                     web_environment, web_prices, page_limits, fixed_cost_microdollars,
-                    inference_interval_seconds=31):
+                    inference_interval_seconds=31, worker_slices=None, slice_authorization=None):
     """Bind actual post-PREP records only after the separate capacity approval."""
     from backend.real_pilot import FOUR_PRODUCT_CAPACITY_FIELDS, FOUR_PRODUCT_INFERENCE_INTERVAL_SECONDS
 
@@ -373,6 +383,7 @@ def amendment_scope(records, *, capacity_approval, plan, prep_receipt_key, publi
             and type(inference_interval_seconds) is int, "Only the approved four-scope 31-second start spacing is supported")
     expected = capacity_request(
         ledger, approval, previous, plan, duration_assumptions=capacity_approval.get("duration_assumptions"),
+        worker_slices=worker_slices, slice_authorization=slice_authorization,
     )
     require(isinstance(capacity_approval, dict) and set(capacity_approval) == FOUR_PRODUCT_CAPACITY_FIELDS
             and capacity_approval["approved"] is True
@@ -405,7 +416,7 @@ def amendment_scope(records, *, capacity_approval, plan, prep_receipt_key, publi
                if not key.startswith(("items/", "batches/")) and key != "budgets/real-pilot.json"}
     require(KEY not in records and AUDIT not in records and gap.KEY not in records and gap.AUDIT not in records,
             "Prior or current continuation authority already exists")
-    return {
+    scope = {
         "schema_version": 1, "approved": True, "approved_by": approval["approved_by"],
         "approval_sha256": sha(approval), "batch_sha256": approval["batch_sha256"],
         "ledger_sha256": sha(ledger), "prior_row_sha256": sha(previous),
@@ -420,9 +431,13 @@ def amendment_scope(records, *, capacity_approval, plan, prep_receipt_key, publi
         "execution_order": [selected[0], selected[2], selected[1], selected[3]],
         "inference_interval_seconds": inference_interval_seconds,
     }
+    if worker_slices is not None:
+        scope.update(worker_slices=copy.deepcopy(worker_slices), slice_authorization=copy.deepcopy(slice_authorization),
+                     slice_authorization_sha256=sha(slice_authorization))
+    return scope
 
 
-def fixed_cost(completed_prep, approval):
+def fixed_cost(completed_prep, approval, *, worker_slices=None):
     """Forecast completed PREP usage without releasing its reserved allowance."""
     from backend.real_pilot import RealPilotGuard
 
@@ -433,12 +448,21 @@ def fixed_cost(completed_prep, approval):
             and receipt.get("returned_pages") == list(range(1, pages + 1)),
             "Completed actual PREP page usage is required for the fixed forecast")
     measured_cost = RealPilotGuard._cost(approval, "analysis", 0, 0, pages)
-    return int((PRIOR_BUILD_USD * 1000000).to_integral_value(rounding=ROUND_CEILING)) + 198000 + measured_cost
+    from backend.real_pilot import FOUR_PRODUCT_SLICES
+
+    require(worker_slices is None or worker_slices == FOUR_PRODUCT_SLICES, "Only two distinct authorized worker slices")
+    return (int((PRIOR_BUILD_USD * 1000000).to_integral_value(rounding=ROUND_CEILING)) + 198000
+            + measured_cost + (18000 if worker_slices is not None else 0))
 
 
-def validate_pacing(proof, actual_plan, *, execution_order, interval_seconds, duration_assumptions=None):
+def validate_pacing(proof, actual_plan, *, execution_order, interval_seconds, duration_assumptions=None,
+                    worker_slices=None):
     """Verify 31-second starts and an explicitly conditional empirical forecast."""
     from backend.real_pilot import FOUR_PRODUCT_INFERENCE_INTERVAL_SECONDS, validate_four_product_duration
+    if worker_slices is not None:
+        return validate_slice_pacing(proof, actual_plan, worker_slices=worker_slices,
+                                     execution_order=execution_order, interval_seconds=interval_seconds,
+                                     duration_assumptions=duration_assumptions)
 
     require(isinstance(proof, dict) and proof.get("deployment_tpm") == 30000
             and proof.get("basis") == "empirical_provider_latency_conditional"
@@ -524,6 +548,80 @@ def validate_pacing(proof, actual_plan, *, execution_order, interval_seconds, du
                 and math.isclose(end - start, assumptions["web_network_allowance_seconds"] / 4, abs_tol=1e-8),
                 "The full web allowance must be interleaved once per product before its web model call")
     return proof
+
+
+def validate_slice_pacing(proof, actual_plan, *, worker_slices, execution_order, interval_seconds, duration_assumptions):
+    from backend.real_pilot import FOUR_PRODUCT_SLICES, validate_four_product_duration
+
+    require(worker_slices == FOUR_PRODUCT_SLICES and execution_order == sum(worker_slices, [])
+            and interval_seconds == 31 and isinstance(proof.get("slices"), list) and len(proof["slices"]) == 2
+            and len(actual_plan) == 12, "Both distinct six-request slice traces are required")
+    assumptions = validate_four_product_duration(duration_assumptions)
+    require(proof.get("duration_assumptions") == assumptions and proof.get("deployment_tpm") == 30000
+            and proof.get("quota_changed") is False and proof.get("ledger_byte_bounds_preserved") is True
+            and proof.get("worker_timeout_seconds") == 600
+            and all(proof.get(key) is False for key in (
+                "provider_rate_estimate_verified", "byte_bounds_used_as_rate_estimate", "billing_usage_used_as_rate_estimate",
+                "web_allowance_is_hard_deadline", "phase_timeouts_bound_dns")),
+            "Slice timing cannot weaken the unchanged quota or conditional latency assumptions")
+    for index, value in enumerate(proof["slices"]):
+        planned = actual_plan[index * 6:(index + 1) * 6]
+        items = worker_slices[index]
+        require([(entry["item_key"], entry["tier"]) for entry in planned] == [
+            (key, tier) for key in items for tier in ("internal_pdf", "vendor_table", "manufacturer_web")
+        ], "Each slice completes both internal tiers and optional web before advancing")
+        require(value.get("slice_index") == index and value.get("item_keys") == items
+                and isinstance(value.get("requests"), list) and len(value["requests"]) == 6,
+                "Each slice must bind its own six complete requests")
+        local, simulated, elapsed, forecast = (value.get(key) for key in (
+            "measured_local_worker_seconds", "simulated_worker_elapsed_seconds",
+            "worker_elapsed_seconds", "forecast_including_local_seconds"))
+        base = (5 * max(31, assumptions["model_response_allowance_seconds"])
+                + assumptions["model_response_allowance_seconds"] + assumptions["startup_bookkeeping_seconds"]
+                + assumptions["web_network_allowance_seconds"] / 2)
+        require(all(type(x) in (int, float) and math.isfinite(x) and x > 0 for x in (local, simulated, elapsed, forecast))
+                and math.isclose(elapsed, simulated + local, abs_tol=1e-8)
+                and math.isclose(forecast, base + local, abs_tol=1e-8) and elapsed <= forecast <= 510
+                and value.get("local_measurement") == "perf_counter_whole_real_worker_with_memory_store"
+                and value.get("remote_storage_latency_measured") is False
+                and math.isclose(value.get("remaining_margin_seconds", -1), 600 - forecast, abs_tol=1e-8),
+                "Every slice needs at least 90 seconds of measured conditional forecast slack")
+        previous = None
+        for request, payload in zip(value["requests"], planned):
+            require(all(request.get(key) == payload[key] for key in ("item_key", "tier", "payload_sha256"))
+                    and request.get("input_byte_bound") == payload["input_tokens"]
+                    and request.get("output_tokens") == payload["output_tokens"],
+                    "Slice request fingerprints/bounds differ from the unchanged twelve-payload plan")
+            start, end = request.get("start_seconds"), request.get("end_seconds")
+            require(all(type(x) in (int, float) and math.isfinite(x) for x in (start, end))
+                    and assumptions["startup_bookkeeping_seconds"] <= start <= end <= simulated
+                    and end - start <= assumptions["model_response_allowance_seconds"] + 1e-8
+                    and (previous is None or (start >= previous["end_seconds"]
+                                             and start - previous["start_seconds"] + 1e-8 >= 31)),
+                    "Each slice must preserve serialized 31-second request starts")
+            previous = request
+        events = value.get("web_delay_events")
+        require(isinstance(events, list) and len(events) == 2, "Each slice needs both explicit web-network allowances")
+        for offset, event in enumerate(events):
+            require(event["item_key"] == items[offset]
+                    and value["requests"][offset * 3 + 1]["end_seconds"] <= event["start_seconds"]
+                    <= event["end_seconds"] <= value["requests"][offset * 3 + 2]["start_seconds"]
+                    and math.isclose(event["end_seconds"] - event["start_seconds"],
+                                     assumptions["web_network_allowance_seconds"] / 4, abs_tol=1e-8),
+                    "Both products retain their full bounded web-delay scenario")
+    require(proof.get("requests") == [request for value in proof["slices"] for request in value["requests"]]
+            and all(type(proof.get(key)) in (int, float)
+                    and math.isclose(proof[key], sum(value[key] for value in proof["slices"]), abs_tol=1e-8)
+                    for key in ("measured_local_worker_seconds", "simulated_worker_elapsed_seconds",
+                                "worker_elapsed_seconds", "forecast_including_local_seconds"))
+            and math.isclose(proof.get("remaining_margin_seconds", -1),
+                             min(value["remaining_margin_seconds"] for value in proof["slices"]), abs_tol=1e-8),
+            "Aggregate twelve-request timing must equal the two distinct measured worker slices")
+    return proof
+
+
+def execution_policy(scope):
+    return {**POLICY, **({"worker_executions": 2, "item_limit": 2} if scope.get("worker_slices") else {})}
 
 
 def validate_provider_preflights(proof, actual_plan, public_policy):
@@ -895,7 +993,8 @@ def validate(work, config, decision):
         "credential_origin", "credential_source", "webiq_secret_ref",
     } and decision.get("approved") is True and type(decision.get("schema_version")) is int
             and decision.get("schema_version") == 1
-            and decision.get("approved_by") == approval["approved_by"] and decision.get("policy") == POLICY
+            and decision.get("approved_by") == approval["approved_by"]
+            and decision.get("policy") in (POLICY, {**POLICY, "worker_executions": 2, "item_limit": 2})
             and decision.get("target") == release.fingerprint(config)
             and decision.get("credential_source") in {"owner_env_file", "existing_job_secret", "unavailable"}
             and decision.get("credential_origin") == "GBBdemo"
@@ -932,11 +1031,18 @@ def validate(work, config, decision):
             "Actual post-PREP real-worker/real-guard twelve-payload private gate required")
     require(gate["amendment_scope"]["capacity_approval"] == decision["capacity_approval"],
             "Measured exact capacity approval changed")
+    require(decision["policy"] == execution_policy(gate["amendment_scope"]), "Worker count must match the bound scope")
+    if gate["amendment_scope"].get("worker_slices"):
+        authority = release.private_json(work / CAPACITY_OWNER_AUTHORIZATION_FILE)
+        require(authority == gate["amendment_scope"]["slice_authorization"]
+                and sha(authority) == gate["amendment_scope"]["slice_authorization_sha256"],
+                "Two-slice authority must equal the retained owner capture")
     validate_pacing(
         gate["pacing_evidence"], gate["actual_payload_plan"],
         execution_order=gate["amendment_scope"]["execution_order"],
         interval_seconds=gate["amendment_scope"]["inference_interval_seconds"],
         duration_assumptions=decision["capacity_approval"]["duration_assumptions"],
+        worker_slices=gate["amendment_scope"].get("worker_slices"),
     )
     validate_provider_preflights(
         gate["provider_preflights"], gate["actual_payload_plan"], gate["amendment_scope"]["public_web_policy"],
@@ -977,6 +1083,7 @@ def validate(work, config, decision):
             "prep_receipt_key", "public_web_policy", "web_environment", "web_prices", "page_limits",
             "fixed_cost_microdollars", "inference_interval_seconds",
         )},
+        **({key: scope[key] for key in ("worker_slices", "slice_authorization")} if scope.get("worker_slices") else {}),
     ) == scope, "Private gate scope must reconstruct from exact actual post-PREP records")
     ci = release.private_json(work / CHILD / "ci.json")
     require(ci.get("revision") == decision["source_revision"] and ci.get("merged") is True
@@ -1116,7 +1223,7 @@ def decision_from_gate(work, config, gate_name, capacity_approval, *, credential
         "baseline_sha256": digest_file(path(work, "baseline")),
         "gate_file": gate_name, "gate_sha256": digest_file(work / gate_name),
         "scope_sha256": sha(gate["amendment_scope"]), "capacity_approval": capacity_approval,
-        "policy": copy.deepcopy(POLICY), "credential_origin": "GBBdemo",
+        "policy": execution_policy(gate["amendment_scope"]), "credential_origin": "GBBdemo",
         "credential_source": credential_source, "webiq_secret_ref": secret_ref,
     }
 
@@ -1378,19 +1485,53 @@ def enable(work, config, decision):
     prior.ready(config, "backend")
 
 
-def start(work, config, decision):
+def worker_receipt_name(name, slice_index=None):
+    require(slice_index is None or type(slice_index) is int and slice_index in (0, 1), "Only the two distinct worker slices")
+    return "worker-" + (f"slice-{slice_index + 1}-" if slice_index is not None else "") + name
+
+
+def start(work, config, decision, *, slice_index=None):
     approval, _ = validate(work, config, decision)
     current = active_target(work, config, decision)
     candidate = amendment(work, decision)
+    sliced = candidate.get("worker_slices") is not None
+    require(sliced == (slice_index is not None), "Start must select the exact authorized slice mode")
+    name = lambda suffix: worker_receipt_name(suffix, slice_index)
     verify_auth(work, decision, candidate)
     receipt(work, "configured", decision)
-    require(not path(work, "worker-attempt").exists(), "Single worker authority consumed; no retry")
+    require(not path(work, name("attempt")).exists(), "Worker slice authority consumed; no retry")
+    if slice_index == 1:
+        previous = receipt(work, worker_receipt_name("terminal", 0), decision)
+        require(previous["properties"]["status"] == "Succeeded" and previous.get("slice_index") == 0,
+                "Second slice requires the first Azure execution's terminal success")
+        terminal_key = f"operations/real-pilot-four-product-slices/{sha(candidate)}/slice-1/completed.json"
+        output = gap.console(current, approval, {
+            "key": terminal_key, "amendment_sha256": sha(candidate), "batch_id": approval["batch_id"],
+            "item_keys": candidate["worker_slices"][0],
+        }, '''
+terminal = read_json(store, packet["key"])[0]
+assert terminal["status"] == "succeeded" and terminal["slice_index"] == 0
+assert terminal["amendment_sha256"] == packet["amendment_sha256"] and terminal["item_keys"] == packet["item_keys"]
+assert terminal["ledger"] == read_json(store, BUDGET_KEY)[0]
+for item in packet["item_keys"]:
+    state = read_json(store, f'items/{packet["batch_id"]}/{item}.json')[0]
+    assert state["state"] in {"completed", "unresolved"}
+    assert _sha256(state) == terminal["item_sha256"][item]
+for key, expected in terminal["result_sha256"].items():
+    assert _sha256(read_json(store, key)[0]) == expected
+print("FOUR_PRODUCT_SLICE_TERMINAL=" + json.dumps({"terminal_sha256": _sha256(terminal)}))
+''')
+        matches = [line.removeprefix("FOUR_PRODUCT_SLICE_TERMINAL=") for line in output.decode().splitlines()
+                   if line.startswith("FOUR_PRODUCT_SLICE_TERMINAL=")]
+        require(len(matches) == 1, "First slice worker-terminal success must precede the second native start")
+        release.save_once(path(work, worker_receipt_name("guard-terminal", 0)),
+                          {**binding(decision), **json.loads(matches[0]), "terminal_key": terminal_key})
     job = prior.require_worker(current, approval)
     template = copy.deepcopy(job["properties"]["template"])
     container = template["containers"][0]
     container["command"] = ["/app/.venv/bin/python"]
     container["args"] = ["-m", "backend.batch_worker", "--real-pilot", "--batch-id", approval["batch_id"],
-                         "--concurrency", "1", "--max-batches", "1", "--item-limit", "4"]
+                         "--concurrency", "1", "--max-batches", "1", "--item-limit", "2" if sliced else "4"]
     release.merge_environment(container, {
         **approval["environment"], **release.pilot_values(approval), **candidate["web_environment"],
         "DOCINTEL_REAL_PILOT_EXECUTION_SCOPE": "full", "DOCINTEL_OPTIONAL_WEB_GAPFILL_ENABLED": "true",
@@ -1410,25 +1551,29 @@ def start(work, config, decision):
             "Four-product pacing binds the existing 30000-TPM deployment; do not change quota")
     fresh, active = release.active_executions(current)
     require(not active and fresh == job, "Manual job changed or is active")
-    release.save_once(path(work, "worker-template"), template)
-    release.save_once(path(work, "worker-attempt"), {
-        **binding(decision), "attempt": 5, "attempted_at": now().isoformat(),
+    release.save_once(path(work, name("template")), template)
+    release.save_once(path(work, name("attempt")), {
+        **binding(decision), "attempt": 5 + (slice_index or 0), "attempted_at": now().isoformat(),
         "amendment_sha256": sha(candidate), "execution_sha256": sha(template), "model_capacity": capacity,
         "optional_web_credential_available": credential is not None, "status": "start_attempted_completion_unknown",
+        **({"slice_index": slice_index, "item_keys": candidate["worker_slices"][slice_index]} if sliced else {}),
     })
     window(work, decision, "processing", 600)
     result = release.azure("containerapp", "job", "start", "--subscription", config["subscription"],
-                           "-g", config["group"], "-n", config["job"], "--yaml", str(path(work, "worker-template")),
+                           "-g", config["group"], "-n", config["job"], "--yaml", str(path(work, name("template"))),
                            resource_snapshot=job, before_send=lambda: window(work, decision, "processing", 600),
-                           on_preflight=preflight_recorder(work, decision, "worker-start", {
+                           on_preflight=preflight_recorder(work, decision, name("start"), {
                                "resource_sha256": sha(job), "execution_sha256": sha(template),
                            }))
     require(isinstance(result, dict) and isinstance(result.get("name"), str) and result["name"],
             "Worker outcome unknown; never repeat the start request")
-    release.save_once(path(work, "worker-result"), {**binding(decision), "execution_name": result["name"], "attempt": 5})
+    release.save_once(path(work, name("result")), {
+        **binding(decision), "execution_name": result["name"], "attempt": 5 + (slice_index or 0),
+        **({"slice_index": slice_index} if sliced else {}),
+    })
 
 
-def usage(work, config, decision, *, timeout=30):
+def usage(work, config, decision, *, timeout=30, slice_index=None):
     """An advisory read. Failure never stops or restarts the bounded worker."""
     candidate = amendment(work, decision)
     approval, _, _ = original(work, config)
@@ -1448,16 +1593,20 @@ print("DOCINTEL_FOUR_USAGE:" + base64.b64encode(json.dumps(value).encode()).deco
              if line.startswith("DOCINTEL_FOUR_USAGE:")]
     require(len(lines) == 1, "Usage probe unavailable")
     value = json.loads(base64.b64decode(lines[0], validate=True))
-    release.save_once(path(work, "usage-" + uuid.uuid4().hex), {
+    release.save_once(path(work, ("slice-" + str(slice_index + 1) + "-" if slice_index is not None else "")
+                           + "usage-" + uuid.uuid4().hex), {
         **binding(decision), **value, "observed_at": now().isoformat(), "advisory_only": True,
         "fixed_cost_microdollars": candidate["fixed_cost_microdollars"], "historical_forecasts_stacked": False,
     })
     return value
 
 
-def observe(work, config, decision):
-    execution = receipt(work, "worker-result", decision)["execution_name"]
+def observe(work, config, decision, *, slice_index=None):
+    name = lambda suffix: worker_receipt_name(suffix, slice_index)
+    execution = receipt(work, name("result"), decision)["execution_name"]
     end = instant(amendment(work, decision)["expires_at"])
+    if slice_index is not None:
+        end = min(end, instant(receipt(work, name("attempt"), decision)["attempted_at"]) + timedelta(seconds=600))
     while now() < end:
         properties = None
         try:
@@ -1468,24 +1617,27 @@ def observe(work, config, decision):
             matches = [value for value in values if value.get("name") == execution]
             require(len(matches) == 1, "Reserved execution status unavailable")
             properties = matches[0]["properties"]
-            usage(work, config, decision, timeout=min(30, max(1, (end - now()).total_seconds())))
+            usage(work, config, decision, timeout=min(30, max(1, (end - now()).total_seconds())),
+                  **({"slice_index": slice_index} if slice_index is not None else {}))
         except Exception:
             release.save_once(path(work, "warning-" + uuid.uuid4().hex), {
                 **binding(decision), "reason": "advisory_probe_unavailable",
                 "action": "continue_without_retry_or_stop", "observed_at": now().isoformat(),
             })
         if properties and properties["status"] in release.TERMINAL:
-            release.save_once(path(work, "worker-terminal"), {
+            release.save_once(path(work, name("terminal")), {
                 **binding(decision), "execution_name": execution, "properties": properties,
+                **({"slice_index": slice_index} if slice_index is not None else {}),
             })
             require(properties["status"] == "Succeeded", "Worker failed; no retry")
             return
         sleep(min(15, max(0, (end - now()).total_seconds())))
-    release.save_once(path(work, "expiry-stop-attempt"), {**binding(decision), "execution_name": execution})
+    stop_name = "expiry-stop" if slice_index is None else name("expiry-stop")
+    release.save_once(path(work, stop_name + "-attempt"), {**binding(decision), "execution_name": execution})
     release.azure("containerapp", "job", "stop", "--subscription", config["subscription"],
                   "-g", config["group"], "-n", config["job"], "--job-execution-name", execution,
-                  on_preflight=preflight_recorder(work, decision, "expiry-stop", {
-                      "attempt_sha256": sha(receipt(work, "expiry-stop-attempt", decision)),
+                  on_preflight=preflight_recorder(work, decision, stop_name, {
+                      "attempt_sha256": sha(receipt(work, stop_name + "-attempt", decision)),
                       "execution_name_sha256": sha(execution),
                   }))
     raise ValueError("Authority expired; only the reserved execution was stopped")
@@ -1531,8 +1683,15 @@ def activate(work, config, decision):
             active_target(work, config, decision)
             configure(work, config, decision)
             enable(work, config, decision)
-            start(work, config, decision)
-        observe(work, config, decision)
+            if decision.get("policy", {}).get("worker_executions") != 2:
+                start(work, config, decision)
+        if decision.get("policy", {}).get("worker_executions") == 2:
+            for index in range(2):
+                with live(work, decision, "processing", 600):
+                    start(work, config, decision, slice_index=index)
+                observe(work, config, decision, slice_index=index)
+        else:
+            observe(work, config, decision)
     finally:
         close(work, config, decision)
 

@@ -9,7 +9,7 @@ import json
 import pytest
 
 from backend import real_pilot
-from backend.batch_store import Conflict, read_json, write_json
+from backend.batch_store import Conflict, Missing, read_json, write_json
 from scripts import four_product_continuation as helper
 from tests.test_gapfill_rerun import gapfill_case, runtime
 from tests.test_row_rerun import (
@@ -314,6 +314,152 @@ def begin(case):
     guard.prepare_recovery(lambda: None)
     assert guard.four_product == guard.active_recovery == candidate and guard.recovery is not None
     return guard
+
+
+def enable_two_slices(case):
+    store, batch, approval, candidate = case
+    capacity = candidate["capacity_approval"]
+    capacity["additional_executions"] = 2
+    authority = {
+        "schema_version": 1, "approved": True, "approved_by": approval["approved_by"],
+        "capacity_request_file": "four-product-capacity-request-v1.json", "plan_sha256": capacity["plan_sha256"],
+        **{key: capacity[key] for key in ("additional_inference", "additional_input_tokens", "additional_output_tokens")},
+        "original_worker_seconds": 600, "additional_worker_execution_authorized_only_for_two_slices": 1,
+        "additional_worker_seconds": 600, "full_sequence_minimum_slack_seconds": 90,
+        "timing_fallback_order": [
+            "reduce_start_spacing_only_where_service_rate_limits_allow",
+            "two_worker_slices_if_guard_supports_the_second_bounded_execution",
+            "all_four_internal_tiers_first_then_web_by_most_unresolved",
+        ],
+        "all_other_scope_and_limits_unchanged": True, "no_retry_authority": True,
+        "readiness_clock_started": False, "user_confirmation": "SYNTHETIC TWO-SLICE REPRODUCTION, NOT AUTHORITY",
+    }
+    candidate.update(worker_slices=copy.deepcopy(real_pilot.FOUR_PRODUCT_SLICES),
+                     slice_authorization=authority, slice_authorization_sha256=helper.sha(authority))
+    candidate["fixed_cost_microdollars"] += 18000
+    put(store, real_pilot.FOUR_PRODUCT_KEY, candidate)
+    return case
+
+
+def complete_guard_slice(guard, batch, store):
+    for key in guard.active_slice_item_keys:
+        path = f"items/{batch['id']}/{key}.json"
+        state = read_json(store, path)[0]
+        state.update(state="unresolved", finished_at=real_pilot._now().isoformat())
+        put(store, path, state)
+        write_json(store, guard.result_key(key), {"synthetic_terminal_result": key})
+    return guard.finish_slice()
+
+
+def test_two_slices_preserve_first_results_and_every_original_charge(four_case):
+    store, batch, approval, candidate = enable_two_slices(four_case)
+    original = records_of(store)
+    first = begin(four_case)
+    assert first.active_slice_index == 0 and first.active_slice_item_keys == ["row-2", "row-4"]
+    later = next(item for item in batch["items"] if item["item_key"] == "row-3")
+    with pytest.raises(ValueError, match="slice"):
+        reserve(first, later, "inference", 1)
+    for key in first.active_slice_item_keys:
+        reserve(first, next(item for item in batch["items"] if item["item_key"] == key), "inference", 1)
+    complete_guard_slice(first, batch, store)
+    first_done = records_of(store)
+    with pytest.raises(Conflict):
+        first.finish_slice()
+    second = real_pilot.RealPilotGuard(store, batch)
+    second.before_execution("second-distinct-worker")
+    assert second.active_slice_index == 1 and second.active_slice_item_keys == ["row-3", "row-5"]
+    second.prepare_recovery(lambda: None)
+    for key in second.active_slice_item_keys:
+        reserve(second, next(item for item in batch["items"] if item["item_key"] == key), "inference", 1)
+    complete_guard_slice(second, batch, store)
+    final = records_of(store)
+    for key, value in first_done.items():
+        if key != real_pilot.BUDGET_KEY and key not in {f"items/{batch['id']}/{k}.json" for k in second.active_slice_item_keys}:
+            assert final[key] == value
+    ledger = final[real_pilot.BUDGET_KEY]
+    assert len(ledger["executions"]) == 6 and len(ledger["four_product"]["slices"]) == 2
+    assert all(ledger["reservations"][key] == value for key, value in original[real_pilot.BUDGET_KEY]["reservations"].items())
+    assert ledger["reserved"]["analysis_pages"] == original[real_pilot.BUDGET_KEY]["reserved"]["analysis_pages"]
+    with pytest.raises((ValueError, Conflict)):
+        real_pilot.RealPilotGuard(store, batch).before_execution("third-forbidden")
+    assert records_of(store) == final
+
+
+@pytest.mark.parametrize("configured", ["0.01"], indirect=True)
+@pytest.mark.parametrize("four_case", [1], indirect=True)
+def test_two_slice_forecast_adds_only_one_worker_and_retains_unused_prep_reservation(four_case):
+    store, batch, approval, candidate = enable_two_slices(four_case)
+    before = records_of(store)
+    completed = before[candidate["prep_receipt_key"]]
+    assert helper.fixed_cost(completed, approval, worker_slices=candidate["worker_slices"]) == 249227
+    assert candidate["fixed_cost_microdollars"] == 249227
+    assert completed["analysis_receipt"]["actual_page_count"] == 1
+    prep_reservation = before[real_pilot.BUDGET_KEY]["reservations"][completed["analysis_receipt"]["reservation_id"]]
+    assert prep_reservation["reserved_usage"]["analysis_pages"] == 5 and prep_reservation["reserved_microdollars"] == 50000
+    assert real_pilot.validate_four_product(candidate, approval, batch, before[real_pilot.BUDGET_KEY], store) == candidate
+    assert records_of(store) == before
+
+
+@pytest.mark.parametrize("fault", ["missing_authority", "overlap", "third", "digest", "extra_execution",
+                                    "slack", "no_retry", "capacity", "window", "cost"])
+def test_two_slice_invalid_authority_is_readonly(four_case, fault):
+    store, batch, approval, candidate = enable_two_slices(four_case)
+    if fault == "missing_authority":
+        candidate.pop("slice_authorization")
+    elif fault == "overlap":
+        candidate["worker_slices"][1][0] = "row-2"
+    elif fault == "third":
+        candidate["worker_slices"].append(["row-5"])
+    elif fault == "digest":
+        candidate["slice_authorization_sha256"] = "0" * 64
+    elif fault == "extra_execution":
+        candidate["capacity_approval"]["additional_executions"] = 3
+    elif fault in {"slack", "no_retry", "capacity"}:
+        candidate["slice_authorization"][{
+            "slack": "full_sequence_minimum_slack_seconds", "no_retry": "no_retry_authority",
+            "capacity": "additional_input_tokens",
+        }[fault]] = 0
+        candidate["slice_authorization_sha256"] = helper.sha(candidate["slice_authorization"])
+    elif fault == "window":
+        candidate["expires_at"] = (datetime.fromisoformat(candidate["not_before"]) + timedelta(seconds=1201)).isoformat()
+    else:
+        candidate["fixed_cost_microdollars"] -= 1
+    put(store, real_pilot.FOUR_PRODUCT_KEY, candidate)
+    before = records_of(store)
+    with pytest.raises(ValueError):
+        real_pilot.validate_four_product(candidate, approval, batch, before[real_pilot.BUDGET_KEY], store)
+    assert records_of(store) == before
+
+
+@pytest.mark.parametrize("fault", ["unfinished", "failed", "timeout", "result_changed", "ledger_changed", "later_touched"])
+def test_second_slice_requires_untouched_success_not_a_retry(four_case, monkeypatch, fault):
+    store, batch, _, _ = enable_two_slices(four_case)
+    first = begin(four_case)
+    if fault not in {"unfinished", "failed", "timeout"}:
+        complete_guard_slice(first, batch, store)
+    if fault == "failed":
+        key = f"items/{batch['id']}/row-2.json"
+        put(store, key, {**read_json(store, key)[0], "state": "failed"})
+        with pytest.raises(ValueError, match="Failed"):
+            first.finish_slice()
+    elif fault == "timeout":
+        anchor = real_pilot._now()
+        monkeypatch.setattr(real_pilot, "_now", lambda: anchor + timedelta(seconds=601))
+        with pytest.raises(ValueError, match="Timed-out"):
+            first.finish_slice()
+    elif fault == "result_changed":
+        put(store, first.result_key("row-2"), {"changed": True})
+    elif fault == "ledger_changed":
+        ledger = read_json(store, real_pilot.BUDGET_KEY)[0]
+        ledger["reserved"]["input_tokens"] -= 1
+        put(store, real_pilot.BUDGET_KEY, ledger)
+    elif fault == "later_touched":
+        key = f"items/{batch['id']}/row-3.json"
+        put(store, key, {**read_json(store, key)[0], "state": "completed"})
+    before = records_of(store)
+    with pytest.raises((ValueError, Conflict, Missing)):
+        real_pilot.RealPilotGuard(store, batch).before_execution("second-forbidden")
+    assert records_of(store) == before
 
 
 def reserve(guard, item, operation, index):
@@ -1244,12 +1390,17 @@ def test_current_quota_is_checked_before_any_readiness_clock(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("unknown_root", [False, True])
-def test_start_uses_execution_template_schema_without_mutating_job(tmp_path, monkeypatch, unknown_root):
+@pytest.mark.parametrize("index", [None, 0, 1])
+def test_start_uses_execution_template_schema_without_mutating_job(tmp_path, monkeypatch, unknown_root, index):
     from scripts import azure_write_schema
 
     config = {"subscription": "synthetic-subscription", "group": "synthetic-group", "job": "synthetic-worker"}
     approval = {"batch_id": "synthetic-batch", "environment": {}}
-    candidate = {"web_environment": {}, "public_web_policy": {"enabled": True}}
+    candidate = {"web_environment": {}, "public_web_policy": {"enabled": True}, "batch_id": "synthetic-batch"}
+    sliced = index is not None
+    if sliced:
+        candidate["worker_slices"] = copy.deepcopy(real_pilot.FOUR_PRODUCT_SLICES)
+    name = lambda suffix: helper.worker_receipt_name(suffix, index)
     job = {"properties": {"template": {
         "containers": [{"name": "worker", "image": "synthetic", "resources": {"cpu": 1, "memory": "2Gi"}}],
         "initContainers": None, "volumes": [{"name": "existing", "storageType": "EmptyDir"}],
@@ -1265,7 +1416,11 @@ def test_start_uses_execution_template_schema_without_mutating_job(tmp_path, mon
     monkeypatch.setattr(helper, "verify_auth", lambda *args: None)
     read_receipt = helper.receipt
     monkeypatch.setattr(helper, "receipt", lambda work, name, decision: (
-        {} if name == "configured" else read_receipt(work, name, decision)
+        {} if name == "configured" else {"properties": {"status": "Succeeded"}, "slice_index": 0}
+        if name == helper.worker_receipt_name("terminal", 0) else read_receipt(work, name, decision)
+    ))
+    monkeypatch.setattr(helper.gap, "console", lambda *a, **k: (
+        b'FOUR_PRODUCT_SLICE_TERMINAL={"terminal_sha256":"' + b"0" * 64 + b'"}\n'
     ))
     monkeypatch.setattr(helper.prior, "require_worker", lambda *args: job)
     monkeypatch.setattr(helper.prior, "require_model_capacity", lambda *args: {"tokens_per_minute": 30000})
@@ -1278,7 +1433,7 @@ def test_start_uses_execution_template_schema_without_mutating_job(tmp_path, mon
     def execution_template(value):
         container = value["containers"][0]
         assert container["command"] == ["/app/.venv/bin/python"]
-        assert container["args"][-2:] == ["--item-limit", "4"]
+        assert container["args"][-2:] == ["--item-limit", "2" if sliced else "4"]
         assert helper.release.environment_entries(container)["DOCINTEL_REAL_PILOT_EXECUTION_SCOPE"]["value"] == "full"
         assert job == captured
         return project(value)
@@ -1289,14 +1444,14 @@ def test_start_uses_execution_template_schema_without_mutating_job(tmp_path, mon
         assert not unknown_root
         assert args[:3] == ("containerapp", "job", "start")
         assert resource_snapshot == captured and job == captured
-        template = helper.release.private_json(helper.path(tmp_path, "worker-template"))
+        template = helper.release.private_json(helper.path(tmp_path, name("template")))
         assert set(template) == {"containers"}
         azure_write_schema.validate_action_payload("jobStart", template)
         assert template["containers"][0]["command"] == ["/app/.venv/bin/python"]
-        assert template["containers"][0]["args"][-2:] == ["--item-limit", "4"]
-        assert helper.path(tmp_path, "worker-attempt").is_file()
+        assert template["containers"][0]["args"][-2:] == ["--item-limit", "2" if sliced else "4"]
+        assert helper.path(tmp_path, name("attempt")).is_file()
         on_preflight(deployment_proof("azure_write"))
-        native = helper.receipt(tmp_path, "worker-start-azure_write-preflight", {"target": "synthetic"})
+        native = helper.receipt(tmp_path, name("start") + "-azure_write-preflight", {"target": "synthetic"})
         assert native["request_binding"] == {
             "resource_sha256": helper.sha(captured), "execution_sha256": helper.sha(template),
         }
@@ -1308,12 +1463,53 @@ def test_start_uses_execution_template_schema_without_mutating_job(tmp_path, mon
     monkeypatch.setattr(helper.release, "azure", send)
     if unknown_root:
         with pytest.raises(ValueError):
-            helper.start(tmp_path, config, {"target": "synthetic"})
-        assert not calls and not list(tmp_path.iterdir())
+            helper.start(tmp_path, config, {"target": "synthetic"}, slice_index=index)
+        assert not calls and not helper.path(tmp_path, name("attempt")).exists()
     else:
-        helper.start(tmp_path, config, {"target": "synthetic"})
+        helper.start(tmp_path, config, {"target": "synthetic"}, slice_index=index)
         assert calls == [("processing", 600), "preflight", ("processing", 600), "send"]
     assert job == captured
+
+
+@pytest.mark.parametrize("failure", ["missing_azure", "failed_azure", "missing_worker", "changed_worker_ledger"])
+def test_second_native_start_requires_both_terminal_proofs_before_attempt(four_case, tmp_path, monkeypatch, failure):
+    from contextlib import redirect_stdout
+    from io import StringIO
+
+    store, batch, approval, candidate = enable_two_slices(four_case)
+    first = begin(four_case)
+    complete_guard_slice(first, batch, store)
+    if failure == "changed_worker_ledger":
+        ledger = read_json(store, real_pilot.BUDGET_KEY)[0]
+        ledger["reserved"]["input_tokens"] += 1
+        put(store, real_pilot.BUDGET_KEY, ledger)
+    decision = {"target": "synthetic"}
+    monkeypatch.setattr(helper.release, "private_path", lambda value: value)
+    monkeypatch.setattr(helper, "validate", lambda *a: (approval, {}))
+    monkeypatch.setattr(helper, "active_target", lambda *a: {})
+    monkeypatch.setattr(helper, "amendment", lambda *a: candidate)
+    monkeypatch.setattr(helper, "verify_auth", lambda *a: None)
+    helper.release.save_once(helper.path(tmp_path, "configured"), helper.binding(decision))
+    if failure != "missing_azure":
+        helper.release.save_once(helper.path(tmp_path, helper.worker_receipt_name("terminal", 0)), {
+            **helper.binding(decision), "slice_index": 0,
+            "properties": {"status": "Failed" if failure == "failed_azure" else "Succeeded"},
+        })
+
+    def console(config, owner, packet, body):
+        if failure == "missing_worker":
+            raise Missing(first.slice_record_key(0, "completed"))
+        output = StringIO()
+        with redirect_stdout(output):
+            exec(body, {"packet": packet, "store": store, "read_json": read_json, "json": json,
+                        "_sha256": real_pilot._sha256, "BUDGET_KEY": real_pilot.BUDGET_KEY})
+        return output.getvalue().encode()
+
+    monkeypatch.setattr(helper.gap, "console", console)
+    monkeypatch.setattr(helper.release, "azure", lambda *a, **k: pytest.fail("No native start without both terminal proofs"))
+    with pytest.raises((ValueError, Missing, AssertionError, FileNotFoundError)):
+        helper.start(tmp_path, {}, decision, slice_index=1)
+    assert not helper.path(tmp_path, helper.worker_receipt_name("attempt", 1)).exists()
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -1382,6 +1578,37 @@ def test_operator_activation_always_closes_without_retry(tmp_path, monkeypatch, 
         helper.activate(tmp_path, {}, {"target": "synthetic"})
     assert calls[-1] == "close" and calls.count(failure) == 1
     assert calls.count("start") <= 1
+
+
+@pytest.mark.parametrize("failure", [None, "configure", "start-0", "observe-0", "start-1", "observe-1"])
+def test_two_slice_operator_sequence_closes_without_second_attempt_after_first_failure(tmp_path, monkeypatch, failure):
+    from contextlib import nullcontext
+
+    calls = []
+    monkeypatch.setattr(helper.release, "private_path", lambda value: value)
+    monkeypatch.setattr(helper.release, "pilot_lock", lambda *a: nullcontext())
+    monkeypatch.setattr(helper, "live", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(helper, "window", lambda *a: None)
+    monkeypatch.setattr(helper, "validate", lambda *a: None)
+    monkeypatch.setattr(helper, "validate_image_smoke", lambda *a: {"reproduction_only": True})
+    monkeypatch.setattr(helper, "active_target", lambda *a: None)
+    for name in ("configure", "enable", "start", "observe", "close"):
+        def call(*args, _name=name, slice_index=None):
+            label = _name + (f"-{slice_index}" if slice_index is not None else "")
+            calls.append(label)
+            if label == failure:
+                raise ValueError("SYNTHETIC slice failure")
+        monkeypatch.setattr(helper, name, call)
+    decision = {"target": "synthetic", "policy": {**helper.POLICY, "worker_executions": 2, "item_limit": 2}}
+    if failure:
+        with pytest.raises(ValueError, match="SYNTHETIC"):
+            helper.activate(tmp_path, {}, decision)
+    else:
+        helper.activate(tmp_path, {}, decision)
+        assert calls == ["configure", "enable", "start-0", "observe-0", "start-1", "observe-1", "close"]
+    assert calls[-1] == "close" and len(calls) == len(set(calls))
+    if failure in {"configure", "start-0", "observe-0"}:
+        assert "start-1" not in calls
 
 
 def test_operator_usage_failure_does_not_stop_terminal_worker(tmp_path, monkeypatch):

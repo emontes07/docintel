@@ -8,7 +8,7 @@ import pytest
 from backend import batch_worker as worker
 from backend.batch_store import read_json, write_json
 from backend.extract import ExecutionConfigurationError, run_offline
-from backend.models.enrichment import Manifest, OfflineBundle
+from backend.models.enrichment import ExtractionResponse, Manifest, OfflineBundle
 from tests.test_real_batch_worker import configured, no_network
 
 
@@ -23,7 +23,7 @@ def sliced_queue(configured, monkeypatch):
     _, current = read_json(store, f"batches/{batch['id']}.json")
     write_json(store, f"batches/{batch['id']}.json", batch, current)
     slices = [["row-2", "row-4"], ["row-3", "row-5"]]
-    calls, executions = [], []
+    calls, executions, terminals = [], [], []
     selected = [slices[0]]
 
     class QueueGuard:
@@ -46,6 +46,15 @@ def sliced_queue(configured, monkeypatch):
         def result_key(self, key):
             return f"results/{batch['id']}/{key}/attempts/synthetic-slice.json"
 
+        def finish_slice(self):
+            record = read_json(store, f"batches/{batch['id']}.json")[0]
+            assert record["state"] == ("queued" if selected[0] == slices[0] else "completed")
+            assert all(
+                read_json(store, f"items/{batch['id']}/{key}.json")[0]["state"] == "unresolved"
+                for key in self.active_slice_item_keys
+            )
+            terminals.append(list(self.active_slice_item_keys))
+
     monkeypatch.setattr(worker, "RealPilotGuard", QueueGuard)
     for item in batch["items"]:
         key = item["item_key"]
@@ -59,12 +68,13 @@ def sliced_queue(configured, monkeypatch):
         calls.append(item["item_key"])
         result = run_offline(OfflineBundle(
             manifest=Manifest.model_validate(item["manifest"]), sources=[],
+            generated_response=ExtractionResponse(candidates=[]),
         ))
         return result, {"state": "unresolved"}
 
     return SimpleNamespace(
         store=store, batch=batch, calls=calls, executions=executions,
-        selected=selected, slices=slices, process=process,
+        selected=selected, slices=slices, process=process, terminals=terminals,
     )
 
 
@@ -76,6 +86,7 @@ def test_two_slices_keep_second_queued_and_first_results_immutable(sliced_queue)
     case = sliced_queue
     run(case)
     assert case.calls == ["row-2", "row-4"]
+    assert case.terminals == [case.slices[0]]
     first = read_json(case.store, f"batches/{case.batch['id']}.json")[0]
     assert first["state"] == "queued" and first["progress"]["finished"] == 2
     for key in case.slices[1]:
@@ -86,6 +97,7 @@ def test_two_slices_keep_second_queued_and_first_results_immutable(sliced_queue)
     assert case.calls == ["row-2", "row-4", "row-3", "row-5"] and len(case.executions) == 2
     final = read_json(case.store, f"batches/{case.batch['id']}.json")[0]
     assert final["state"] == "completed" and final["progress"]["finished"] == 4
+    assert case.terminals == case.slices
     assert all(case.store.read_bytes(key) == value for key, value in retained.items())
 
 
@@ -111,4 +123,5 @@ def test_reselecting_attempted_slice_never_overwrites_or_reruns(sliced_queue):
     with pytest.raises(ExecutionConfigurationError, match="attempted or unavailable"):
         run(case)
     assert case.calls == ["row-2", "row-4"]
+    assert case.terminals == [case.slices[0]]
     assert all(case.store.read_bytes(key) == value for key, value in retained.items())

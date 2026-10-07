@@ -142,8 +142,10 @@ live actions.
 * One new 2-vCPU/900-second backend build, no frontend build. An attempt receipt
   is written **before** upload/build; the full 900 seconds is rechecked before
   each boundary. Unknown outcomes never permit another submission.
-* One 600-second manual worker, concurrency 1, four items, zero retries. The full
-  600 seconds must remain immediately before start and the guard charge.
+* The original unsliced authority remains supported, but the subsequently
+  approved timing fallback uses **two distinct 600-second slices**, concurrency
+  1, two items each, zero retries. Each native start and guard charge requires
+  the full 600 seconds remaining in the same at-most-20-minute active window.
 * Readiness anchors a 45-minute publication window and 90-minute operating
   window. Deployment readiness anchors the single 20-minute processing window.
   None can be renewed. Before writing either readiness receipt, the approved
@@ -166,7 +168,7 @@ live actions.
 * Cached parses only in the worker: **zero additional analysis**. The PREP charge
   and actual page usage are pinned dynamically, not assumed to remain 1/5.
 * The $5 envelope includes the prior consumed build **$0.0232268896**, the PREP
-  completed actual-page cost, one new build, one worker, model requests and web
+  completed actual-page cost, one new build, the authorized worker slice(s), model requests and web
   searches. It does not stack old forecasts.
   `fixed_cost(original_completed_prep, approval)` uses the verified
   `analysis_receipt.actual_page_count` at the approved `analysis_page` rate and
@@ -221,7 +223,111 @@ worker analysis, all four prior attempts, immutable old results, owner isolation
 and attempt-history export. Completions, discoveries and pages are always
 **REPRODUCTION ONLY**, never actual extraction findings.
 
+## Selected two-slice timing fallback
+
+The later owner capture `four-product-capacity-owner-approval-v1.json` approved
+**+7 requests / +303,895 input reservation units / +14,336 output tokens** and,
+only if needed for timing, one additional 600-second execution. The unchanged
+twelve-payload plan remains **303,895 input / 24,576 output**. The historical
+single-worker private result (523.453546 seconds including local work;
+559.453546 conservative) failed the newly required 90-second margin.
+Reducing the 31-second spacing is not justified by that result.
+
+The selected scope adds exactly these three fields:
+
+```json
+{
+  "worker_slices": [["row-2", "row-4"], ["row-3", "row-5"]],
+  "slice_authorization": "<unchanged parsed owner capture object>",
+  "slice_authorization_sha256": "<canonical SHA-256 of that object>"
+}
+```
+
+`slice_authorization` has exactly: `schema_version`, `approved`, `approved_by`,
+`capacity_request_file`, `plan_sha256`, `additional_inference`,
+`additional_input_tokens`, `additional_output_tokens`, `original_worker_seconds`,
+`additional_worker_execution_authorized_only_for_two_slices`,
+`additional_worker_seconds`, `full_sequence_minimum_slack_seconds`,
+`timing_fallback_order`, `all_other_scope_and_limits_unchanged`,
+`no_retry_authority`, `readiness_clock_started`, and `user_confirmation`.
+The capture has **no invented approval timestamp**. The existing capacity
+receipt retains its own `approved_at`; its unchanged plan digest and exact
+additions must match the new capture. The two worker durations are 600, the
+additional execution is 1, minimum slack is 90, and no-retry/unchanged-limits
+flags must be true. The fallback-order strings are validated literally against
+the retained capture. `readiness_clock_started` remains false.
+
+Pass `worker_slices=...` and `slice_authorization=...` to both
+`capacity_request(...)` and `amendment_scope(...)`. Only that bound authority
+permits `capacity_approval.additional_executions=2`. The helper neither modifies
+the original twelve-payload plan nor creates approval. Pass
+`worker_slices=...` to `fixed_cost(completed_prep, approval, ...)`: it adds
+**18,000 microdollars only**, giving **249,227** fixed forecast microdollars for
+the actual one-page PREP. The retained five-page reservation is untouched.
+The owner's updated total forecast is **$1.3985368896**, within the same $5
+envelope; previous forecasts are not stacked.
+
+Worker/guard contract:
+
+* `before_execution(key)` appends one execution and sets
+  `active_slice_index` (0 or 1) and `active_slice_item_keys` (the corresponding
+  two-element list). Cross-slice operation keys/reservations are rejected.
+* The first `prepare_recovery(fence)` captures all four prior states once in
+  the existing root audit. The second preparation never rewrites that audit,
+  prior state, first results, or counters.
+* The worker runs `item_limit=2`, selects only the active slice, leaves later
+  `recovery_ready` items queued, writes final batch state, then calls
+  `guard.finish_slice()`. This method is a no-op for unsliced authority.
+  Only `completed`/`unresolved` own-item states with persisted results and a
+  duration within 600 seconds can produce worker-terminal success.
+* Each slice gets create-once
+  `operations/real-pilot-four-product-slices/<amendment-sha>/slice-1/`
+  (or `slice-2/`) `attempt.json`, `prepared.json`, and `completed.json`.
+  The attempt retains its entire pre-charge ledger. Completion binds attempt,
+  prepared/root audit, own state/result hashes, remaining-item hashes and the
+  terminal ledger. First-slice records/results/charges remain immutable when
+  admitting slice two. Failed, incomplete, timed-out, repeated or third slices
+  cannot create further authority.
+
+The operator derives policy `{worker_executions:2,item_limit:2}` with all other
+policy values unchanged. It configures/enables once, then calls
+`start(..., slice_index=0)`, `observe(..., slice_index=0)`, and only after success
+the corresponding index-1 calls. Both native starts retain their own original
+job snapshot and exact schema-projected template. Each rechecks a full 600
+seconds **after** native no-send construction and immediately before submission.
+The second start first requires Azure `Succeeded` and a read-only verification
+of the actual first worker-terminal audit, ledger and result/state hashes.
+API/image proof admission still occurs before the single activation attempt.
+One `finally` closes processing; no slice failure triggers a retry or new clock.
+
+Local receipts use `four-product-worker-slice-1-{template,attempt,result,terminal}.json`
+and the corresponding `slice-2` paths. Native start proofs use each slice's
+`worker-slice-N-start` namespace; advisory usage and expiry-stop receipts are
+also slice-specific. `worker-slice-1-guard-terminal` retains the verified remote
+terminal digest before slice two. Observations stop only the specific execution
+at its own 600-second limit or the original active deadline, whichever is first.
+Readiness remains 45/90 minutes, with one active window of at most 20 minutes.
+
+The private profiler runs the **real worker and guard twice** using the actual
+post-PREP cache and captures the same aggregate 12 model / 4 WebIQ / 6 direct-page
+native preflights. Call `validate_pacing(..., worker_slices=...)`. Its `slices`
+list contains two objects with `slice_index`, `item_keys`, six complete
+fingerprinted `requests`, two `web_delay_events`,
+`simulated_worker_elapsed_seconds`, `measured_local_worker_seconds`,
+`worker_elapsed_seconds`, `forecast_including_local_seconds`,
+`remaining_margin_seconds`, `local_measurement`, and
+`remote_storage_latency_measured`. Each conservative forecast is
+`5*max(31,response)+response+startup+web/2+measured_local`, and must be **≤510**.
+The top-level requests/timing totals must equal those two traces; top-level
+remaining margin is the smaller slice margin. With 22/35/150 assumptions,
+each conditional pre-local forecast is 287 seconds. This is a conservative
+scenario, not proof of provider rate estimation or measured remote latency.
+The parent must run the final actual-cache private gate on the reviewed source.
+
 ## Pacing is an independent readiness blocker
+
+The following single-worker timing details are retained as historical evidence
+and for unsliced compatibility; they do not satisfy the newer 90-second margin.
 
 The retained deployment is **30,000 TPM**. Historical recovery's fixed
 61-second interval puts request 12's earliest start at **671 seconds**, even

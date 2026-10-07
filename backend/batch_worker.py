@@ -1156,6 +1156,9 @@ def run_batch(store, batch_id, *, concurrency=2, item_limit=100, processor=None)
             if "deferred" in states:
                 record["progress"]["deferred"] = states.count("deferred")
             write_json(store, path, record, version)
+            if (guard is not None and getattr(guard, "four_product", None) is not None
+                    and guard.four_product.get("worker_slices") is not None):
+                guard.finish_slice()
         finally:
             stopped.set()
             thread.join()
