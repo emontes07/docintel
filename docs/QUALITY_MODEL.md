@@ -90,6 +90,11 @@ and Padlock Wing; `LOCKWING` alone does not prove Padlock Wing. Negation,
 alternatives, optional/accessory descriptions and inference from absence remain
 unsupported. A judge decision is recorded separately from human approval.
 
+The optional canary records every grounded head-style interpretation and every
+rejected answer. Zero or multiple grounded candidates are diagnostic outcomes,
+not readiness failures. All grounded candidates and the spent call are carried
+into the product's vendor pass; its three-call limit is unchanged.
+
 `last_usage` starts as `{}` and describes the latest attempted provider request.
 `call_records` retains independent copies of every record. A synchronous optional
 callback receives another JSON-serializable copy. Records contain actual model

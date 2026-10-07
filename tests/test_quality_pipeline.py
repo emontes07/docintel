@@ -616,20 +616,22 @@ def test_smoke_only_uses_full_packet_one_call_and_changes_no_item_results():
 
 
 @pytest.mark.parametrize("smoke_only,smoke_first", [(True, False), (False, True)])
-def test_wrong_smoke_answer_fails_visibly_before_full_processing(smoke_only, smoke_first):
+def test_unsupported_smoke_answer_is_recorded_without_gating_full_processing(smoke_only, smoke_first):
     store = seed_smoke_store()
     client = SmokeCompletion("Tee")
-    with pytest.raises(QualitySmokeError, match="smoke failed"):
-        run_quality_batch(store, "batch", "owner", "smoke-fail", completion=client,
-                          smoke_only=smoke_only, smoke_first=smoke_first)
+    run_quality_batch(store, "batch", "owner", "smoke-fail", completion=client,
+                      smoke_only=smoke_only, smoke_first=smoke_first)
     summary = read_json(store, "quality-runs/batch/smoke-fail/summary.json")[0]
-    assert summary["state"] == "failed" and summary["smoke"]["status"] == "failed"
+    assert summary["state"] == "completed" and summary["smoke"]["status"] == "no_grounded_candidate"
     assert summary["smoke"]["observed_candidates"][0]["value"] == "Tee"
-    assert summary["model_calls"] == 1 and not store.keys("results/")
-    assert read_json(store, "items/batch/row-2.json")[0]["state"] == "failed"
+    assert summary["smoke"]["candidates"] == []
+    assert summary["smoke"]["rejected_candidates"][0]["reason"]
+    assert bool(store.keys("results/")) is smoke_first
+    assert sum(entry["tier"] == "vendor_table" for entry in summary["usage"]) <= 3
 
 
-def test_grounded_live_canary_disagreement_continues_to_full_extraction_and_judge():
+@pytest.mark.parametrize("multiple", [False, True])
+def test_grounded_live_canary_disagreement_continues_to_full_extraction_and_judge(multiple):
     quote = "FLAT HEAD  INDICATING ARROW  DRILLED FOR WIRE SEAL"
     store = seed_smoke_store(head_description=quote)
 
@@ -644,6 +646,11 @@ def test_grounded_live_canary_disagreement_continues_to_full_extraction_and_judg
                         evidence_ids=[row["citation_id"]],
                         reviewer_explanation="Review head shape separately from the Lockwing feature.",
                     )])
+                    if multiple:
+                        self.responses[-1].append(proposal(
+                            attribute_id="Operating Head Style", value="Lockwing",
+                            supporting_quote="Lockwing", evidence_ids=[row["citation_id"]],
+                        ))
                 else:
                     self.responses.append([])
             return super().complete_structured(system, user, schema, **kwargs)
@@ -652,7 +659,8 @@ def test_grounded_live_canary_disagreement_continues_to_full_extraction_and_judg
     summary = run_quality_batch(store, "batch", "owner", "disagreement", completion=client, smoke_first=True)
     assert summary["state"] == "completed" and len(summary["products"]) == 1
     smoke = summary["smoke"]
-    assert smoke["status"] == "disagreed_with_expectation" and smoke["value"] == "Flat Head"
+    assert smoke["status"] == ("multiple_grounded_interpretations" if multiple else "disagreed_with_expectation")
+    assert smoke["value"] == "Flat Head"
     assert smoke["source_cells"] == ["R1096"]
     assert smoke["expected_source"]["value"] == "Lockwing"
     assert smoke["expected_source"]["source_cells"] == ["T1096"]
@@ -660,6 +668,7 @@ def test_grounded_live_canary_disagreement_continues_to_full_extraction_and_judg
     head = next(attribute for attribute in result["attributes"] if attribute["attribute_id"] == "Operating Head Style")
     assert head["candidates"][0]["value"] == "Flat Head"
     assert head["candidates"][0]["judge_status"] == "accepted"
+    assert len(head["candidates"]) == (2 if multiple else 1)
     assert "Review head style versus locking feature" in head["candidates"][0]["qualification"]
     assert sum(entry["tier"] == "vendor_table" for entry in summary["usage"]) == 3
 
