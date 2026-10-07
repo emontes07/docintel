@@ -73,14 +73,23 @@ print({MARKER!r})
 '''
 
 
-def reviewed_files(revision):
+def reviewed_files(revision, *, context_inventory=None):
     names = release.command([
         "git", "ls-tree", "-r", "--name-only", revision, "--", "backend", "uv.lock", "pyproject.toml",
     ], cwd=release.ROOT).decode().splitlines()
-    return {
+    files = {
         name: hashlib.sha256(release.command(["git", "show", revision + ":" + name], cwd=release.ROOT)).hexdigest()
         for name in names
     }
+    if context_inventory is None:
+        return files
+    omitted = set(files) - set(context_inventory)
+    release.require(all(name.startswith("backend/static/") for name in omitted),
+                    "Published context unexpectedly omits reviewed backend code")
+    included = {name: digest for name, digest in files.items() if name in context_inventory}
+    release.require(all(context_inventory[name] == digest for name, digest in included.items()),
+                    "Published context differs from reviewed backend source")
+    return included
 
 
 def capture(work: Path, config: dict, decision: dict, measurement: dict) -> dict:
@@ -107,7 +116,10 @@ def capture(work: Path, config: dict, decision: dict, measurement: dict) -> dict
     )
     code = image_program(
         source_revision=decision["source_revision"], image_digest=expected.partition("@")[2],
-        expected_files=reviewed_files(decision["source_revision"]), measurement=measurement,
+        expected_files=reviewed_files(
+            decision["source_revision"],
+            context_inventory=release.private_json(four.source_work(work) / "context.json"),
+        ), measurement=measurement,
     )
     release.save_once(four.path(work, "image-sdk-smoke-attempt"), {
         **four.binding(decision), "observed_api_revision": properties["latestReadyRevisionName"],

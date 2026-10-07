@@ -1356,7 +1356,9 @@ def patch(work, config, decision, label, resource, containers, *, job=False, bin
         fresh, active = release.active_executions(config) if job else (release.app(config, config["backend"]), [])
         require(not active and fresh == resource, "Resource drift; do not overwrite")
         kind = "jobs" if job else "containerApps"
-        projected = project_component(kind, "PATCH", ("properties", "template", "containers"), containers)
+        projected = project_component(
+            kind, "PATCH", ("properties", "template", "containers"), release.writable_containers(containers),
+        )
         properties = {"template": {"containers": projected}}
         if bind_existing_secret is not None:
             require(job and label == "deploy-worker" and decision["credential_source"] == "owner_env_file"
@@ -1433,7 +1435,7 @@ def deploy(work, config, decision, *, continue_before_write=False):
             require(not path(work, "deploy-attempt").exists(), "Deployment already attempted")
             release.save_once(path(work, "deploy-attempt"), captured)
         for label, resource, is_job in (("backend", backend, False), ("worker", job, True)):
-            containers = release.writable_containers(release.safe_containers(resource))
+            containers = release.safe_containers(resource)
             containers[0]["image"] = current["backend_image"]
             secret = (decision["webiq_secret_ref"] if is_job and decision["credential_source"] == "owner_env_file"
                       and not resource["properties"]["configuration"].get("secrets") else None)

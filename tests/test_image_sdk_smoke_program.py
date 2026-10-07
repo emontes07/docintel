@@ -3,6 +3,7 @@ import contextlib
 import copy
 import io
 import json
+import hashlib
 
 import pytest
 
@@ -80,7 +81,10 @@ def test_operator_bridge_only_inspects_ready_closed_matching_images(tmp_path, mo
     monkeypatch.setattr(four, "receipt", lambda *args: {"backend_image": digest})
     monkeypatch.setattr(release, "app", lambda *args: api)
     monkeypatch.setattr(release, "active_executions", lambda *args: (job, ["active"] if drift == "active" else []))
-    monkeypatch.setattr(image, "reviewed_files", lambda revision: binding["expected_files"])
+    monkeypatch.setattr(image, "reviewed_files", lambda revision, **kwargs: binding["expected_files"])
+    monkeypatch.setattr(four, "source_work", lambda work: work / "published-context")
+    (tmp_path / "published-context").mkdir()
+    release.save_once(tmp_path / "published-context/context.json", binding["expected_files"])
 
     def console(arguments, code, marker, timeout):
         calls.append(arguments)
@@ -104,3 +108,25 @@ def test_operator_bridge_only_inspects_ready_closed_matching_images(tmp_path, mo
         assert envelope["proof"]["worker_execution_started"] is False
         assert len(envelope["proof"]["native_requests"]) == 22
         assert (tmp_path / "four-product-image-sdk-smoke.json").stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.parametrize("mutation", [None, "missing_code", "changed_code"])
+def test_image_manifest_uses_exact_sanitized_build_context_not_removed_static_files(monkeypatch, mutation):
+    files = {"backend/main.py": b"reviewed code", "backend/static/images/mask.png": b"static",
+             "pyproject.toml": b"project", "uv.lock": b"locked"}
+    def command(arguments, **kwargs):
+        if arguments[1] == "ls-tree":
+            return "\n".join(files).encode()
+        return files[arguments[2].split(":", 1)[1]]
+    monkeypatch.setattr(release, "command", command)
+    context = {name: hashlib.sha256(value).hexdigest() for name, value in files.items()
+               if not name.startswith("backend/static/")}
+    if mutation == "missing_code":
+        del context["backend/main.py"]
+    elif mutation == "changed_code":
+        context["backend/main.py"] = "a" * 64
+    if mutation:
+        with pytest.raises(ValueError):
+            image.reviewed_files("b" * 40, context_inventory=context)
+    else:
+        assert image.reviewed_files("b" * 40, context_inventory=context) == context

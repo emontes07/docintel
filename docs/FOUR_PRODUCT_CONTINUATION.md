@@ -241,9 +241,11 @@ and attempt-history export. Completions, discoveries and pages are always
 ### Pre-write deployment correction
 
 Native Container Apps/Jobs GET responses can include the read-only
-`imageType: ContainerImage` discriminator. Deployment uses the same
-`release.writable_containers` projection as readiness before validating the
-exact target write schema. Raw read objects are never sent.
+`imageType: ContainerImage` discriminator. The shared `patch` boundary uses
+`release.writable_containers` before validating the exact target write schema,
+covering deployment, processing enablement and closure equally. Raw read
+objects are never sent. Image smoke uses the exact reviewed sanitized build
+context; removed static sample images are not runtime source requirements.
 
 If projection rejected the original deployment before any PATCH receipt,
 native-write preflight or credential binding existed, `continue-deploy` can
