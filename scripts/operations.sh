@@ -116,7 +116,7 @@ docintel_export() {
     docintel_get "/batches/$1/export" "$partial" || result=$?
   fi
   if [[ "$result" != 0 ]]; then
-    rm -f -- "$partial"
+    printf 'Export failed; any partial output is retained at %s.\n' "$partial" >&2
     return "$result"
   fi
   mv -- "$partial" "$2/$1.xlsx"

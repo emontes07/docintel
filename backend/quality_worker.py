@@ -3,6 +3,8 @@
 Run ``python -m backend.quality_worker`` with QUALITY_BATCH_ID, QUALITY_OWNER and
 QUALITY_RUN_ID. No Document Intelligence, SharePoint or legacy pilot admission
 path is invoked. Failed cache loads are explicit evidence gaps, never new parses.
+The CLI defaults to one Mueller smoke followed by all products in the same job;
+the smoke candidate is reused within the vendor tier's three-call limit.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from backend.core.docintel import ParsedDocument
 from backend.core.vendor_tables import VendorTableConfig, read_vendor_table
 from backend.evidence_verification import Fragment, match_text
 from backend.extract import source_evidence
-from backend.models.enrichment import Evidence, Manifest, OfflineSource, RetrievalOutcome
+from backend.models.enrichment import Candidate, Evidence, Manifest, OfflineSource, RetrievalOutcome
 from backend.pilot import PARSER_VERSION
 from backend.quality_pipeline import (
     SYSTEM, QualityExtraction, complete_quality_call, expand_citations,
@@ -51,14 +53,37 @@ def scope_document(document: ParsedDocument, product, binding: dict) -> ParsedDo
     document = document.model_copy(deep=True)
     others = [p["mpn"] for p in binding.get("products", []) if p != product.model_dump()]
     suppressed_paragraph_texts = set()
+    key_headers = {"mpn", "model", "model number", "model no", "part number", "part no",
+                   "catalog number", "catalog no", "catalogue number", "product number", "item number"}
     for table in document.tables:
-        product_table = any(_identity(" ".join(row), mpn) for row in table.cells for mpn in [product.mpn, *others])
+        headers = {(r, c): " ".join(re.findall(r"[a-z]+", cell.casefold()))
+                   for r, row in enumerate(table.cells) for c, cell in enumerate(row)}
+        headers = {position: label for position, label in headers.items() if label in key_headers}
+        model_rows = [r for r, row in enumerate(table.cells)
+                      if any(_identity(" ".join(row), mpn) for mpn in [product.mpn, *others])]
+        product_table = bool(model_rows) or any(
+            label == "mpn" or label.startswith(("model", "catalog")) for label in headers.values()
+        )
         if product_table:
             # DI repeats table cells as paragraphs. Remove those duplicates so an
             # unlabelled size from a neighboring model cannot survive row filtering.
-            suppressed_paragraph_texts.update(cell.strip() for row in table.cells for cell in row if cell.strip())
+            suppressed_paragraph_texts.update(
+                " ".join(text.split()).casefold() for row in table.cells
+                for text in [*row, " ".join(row)] if text.strip()
+            )
+            matched_columns = {
+                c for r in model_rows for c, cell in enumerate(table.cells[r])
+                if any(_identity(cell, mpn) for mpn in [product.mpn, *others])
+            }
+            header_columns = {c for _, c in headers}
+            columns = header_columns & matched_columns or header_columns or matched_columns
+            first_data = min(r for r, _ in headers) + 1 if headers else min(model_rows)
             for index, row in enumerate(table.cells):
-                if any(_identity(" ".join(row), mpn) for mpn in others) and not _identity(" ".join(row), product.mpn):
+                if index < first_data or any(r == index for r, _ in headers):
+                    continue
+                keys = [row[c].strip() for c in columns if c < len(row) and row[c].strip()]
+                if keys and not any(_identity(key, product.mpn) for key in keys):
+                    others.extend(key for key in keys if key not in others)
                     table.cells[index] = [""] * len(row)
         else:
             # An unkeyed family dimension schedule cannot identify this variant.
@@ -70,10 +95,10 @@ def scope_document(document: ParsedDocument, product, binding: dict) -> ParsedDo
                 elif dimension_schedule and (not text.strip() or "PART NUMBER" in text.upper()):
                     dimension_schedule = False
                 if dimension_schedule:
-                    suppressed_paragraph_texts.update(cell.strip() for cell in row if cell.strip())
+                    suppressed_paragraph_texts.update(" ".join(cell.split()).casefold() for cell in row if cell.strip())
                     table.cells[index] = [""] * len(row)
     for paragraph in document.paragraphs:
-        if (paragraph.text.strip() in suppressed_paragraph_texts
+        if (" ".join(paragraph.text.split()).casefold() in suppressed_paragraph_texts
                 or any(_identity(paragraph.text, mpn) for mpn in others) and not _identity(paragraph.text, product.mpn)):
             paragraph.text = ""
     document.raw_text = ""
@@ -136,7 +161,7 @@ class CachedEvidenceLoader:
                     document = scope_document(self.cached_document(binding), product, binding)
                     source = OfflineSource(
                         source_id=binding["source_id"], product=product, document=document,
-                        qualification=qualification, attribute_ids=scope.get("attribute_ids") or None,
+                        qualification=qualification, attribute_ids=scope.get("attribute_ids"),
                         provider_retrieved_at=document.parsed_at,
                     )
                     evidence.extend(source_evidence(source, observed))
@@ -159,7 +184,7 @@ class CachedEvidenceLoader:
                             source_locator=f"batchblob:///{blob}#sheet={quote(row.sheet, safe='')}&row={row.row}&cells={','.join(row.cells)}",
                             source_version="sha256:" + binding["sha256"], text=row.text, observed_at=observed,
                             provider_retrieved_at=observed, qualification=qualification,
-                            attribute_ids=scope.get("attribute_ids") or None,
+                            attribute_ids=scope.get("attribute_ids"),
                         ))
                     entry["rows"] = [row.row for row in rows]
                 retrieval.append(RetrievalOutcome(source_tier=tier, source_id=binding["source_id"], status="success"))
@@ -286,10 +311,13 @@ def run_model_smoke(record, loader, completion, *, run_id, usage_callback=None, 
             or cell_match is None):
         raise QualitySmokeError("Model smoke failed: expected grounded Operating Head Style = Lockwing from T1096.",
                                 candidates=candidates)
+    if candidate.grounding is not None:
+        candidate.grounding["quote"] = cell_match.model_dump(mode="json")
     return {"status": "passed", "item_id": manifest.product.item_id, "mpn": manifest.product.mpn,
             "attribute_id": SMOKE_ATTRIBUTE, "value": candidate.value, "source_row": 1096,
             "source_cells": ["T1096"], "supporting_quote": candidate.supporting_quote,
             "grounding": cell_match.model_dump(mode="json"), "model_calls": 1,
+            "candidate": candidate.model_dump(mode="json"),
             "qualification": "Model smoke assertion only; no reviewer proposal or approval is created."}
 
 
@@ -297,13 +325,16 @@ def run_quality_batch(
     store, batch_id: str, owner: str, run_id: str, *, completion=None,
     usage_callback=None, web=None, ford_image_blob: str | None = None, before_call=None,
     smoke_only: bool = False,
+    smoke_first: bool = False,
+    cost_summary=None,
 ) -> dict:
     """Append new immutable results and preserve the complete previous state chain."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
         raise ValueError("QUALITY_RUN_ID must be a safe unique identifier")
     record = BatchService(store).get(batch_id, owner)
     prefix = f"quality-runs/{batch_id}/{run_id}"
-    write_json(store, prefix + "/started.json", {"run_id": run_id, "batch_id": batch_id, "owner": owner, "started_at": now()})
+    write_json(store, prefix + "/started.json", {"run_id": run_id, "batch_id": batch_id, "owner": owner, "started_at": now(),
+                                               "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only})
     loader = CachedEvidenceLoader(store)
     usage_records, products = [], []
 
@@ -343,12 +374,15 @@ def run_quality_batch(
         web.before_call = before_usage
     failure = None
     smoke = None
+    smoke_recorded = False
     try:
         if completion is None:
             from backend.core.quality_model import ResponsesCompletion
             completion = ResponsesCompletion()
-        if smoke_only:
+        if smoke_only or smoke_first:
             smoke = run_model_smoke(record, loader, completion, run_id=run_id, usage_callback=persist_usage, before_call=before_usage)
+            write_json(store, prefix + "/smoke.json", smoke)
+            smoke_recorded = True
         has_ford = any(source.get("sha256") == FORD_PDF_SHA256 for item in record["items"] for source in item.get("sources", []))
         image, image_diagnostic = image_input(store, ford_image_blob) if not smoke_only and has_ford else (None, None)
         for item in [] if smoke_only else record["items"]:
@@ -364,10 +398,14 @@ def run_quality_batch(
             start = now()
             evidence, retrieval, provenance = loader.load(item)
             ford = any(s.get("sha256") == FORD_PDF_SHA256 for s in item.get("sources", []))
+            reuse_smoke = smoke is not None and smoke.get("item_id") == manifest.product.item_id
             result = run_product(
                 manifest, evidence, completion, run_id=run_id, item_key=item_key, web=web,
                 images=image if ford else None, usage_callback=persist_usage,
                 before_call=before_usage, retrieval=retrieval,
+                initial_candidates={"vendor_table": [Candidate.model_validate(smoke["candidate"])]} if reuse_smoke else None,
+                initial_diagnostics=[entry for entry in usage_records if entry.get("phase") == "smoke"
+                                     and entry.get("item_id") == manifest.product.item_id] if reuse_smoke else None,
             )
             if ford and image_diagnostic is not None:
                 result.input_diagnostics.append({
@@ -388,19 +426,27 @@ def run_quality_batch(
             write_json(store, f"{prefix}/products/{item_key}.json", products[-1])
     except Exception as error:
         failure = error
-        if smoke_only:
+        if (smoke_only or smoke_first) and smoke is None:
             smoke = {"status": "failed", "error": type(error).__name__,
                      "attribute_id": SMOKE_ATTRIBUTE, "expected_value": "Lockwing",
                      "source_row": 1096, "source_cells": ["T1096"],
                      "observed_candidates": error.candidates if isinstance(error, QualitySmokeError) else [],
                      "reason": str(error) if isinstance(error, QualitySmokeError) else "Model request or usage recording failed; inspect persisted usage diagnostics."}
-    if smoke_only:
+    if (smoke_only or smoke_first) and not smoke_recorded:
         write_json(store, prefix + "/smoke.json", smoke)
+    cost = None
+    if cost_summary is not None:
+        try:
+            cost = cost_summary()
+        except Exception as error:
+            failure = failure or error
+            cost = {"status": "unavailable", "error": type(error).__name__}
     summary = {"schema_version": 1, "run_id": run_id, "batch_id": batch_id, "owner": owner,
                "state": "failed" if failure else "completed", "finished_at": now(), "products": products,
                "usage": usage_records, "model_calls": sum(e.get("operation") == "model" for e in usage_records),
                "new_di_calls": 0, "error": type(failure).__name__ if failure else None,
-               "smoke_only": smoke_only, "smoke": smoke}
+               "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only, "smoke": smoke,
+               "cost": cost}
     write_json(store, prefix + "/summary.json", summary)
     if failure:
         raise failure
@@ -414,17 +460,49 @@ def main(argv=None) -> int:
     parser.add_argument("--run-id", default=os.environ.get("QUALITY_RUN_ID"))
     parser.add_argument("--smoke-only", action="store_true", default=os.environ.get("QUALITY_SMOKE_ONLY", "false").lower() == "true",
                         help="Run only the one-call Mueller T1096 Lockwing model smoke; do not extract products.")
+    parser.add_argument("--smoke-first", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("QUALITY_SMOKE_FIRST", "true").lower() == "true",
+                        help="Run the Mueller smoke then all products, reusing its candidate within the three-call tier limit.")
     args = parser.parse_args(argv)
     if not all((args.batch_id, args.owner, args.run_id)):
         parser.error("QUALITY_BATCH_ID, QUALITY_OWNER and QUALITY_RUN_ID (or CLI equivalents) are required")
     from backend.quality_web import QualityWeb
+    from backend.quality_cost import QualityCostMeter
 
     store = configured_store()
+    cost_run_id = os.environ.get("QUALITY_COST_RUN_ID") or args.run_id
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", cost_run_id):
+        parser.error("QUALITY_COST_RUN_ID must be a safe run identifier")
+    meter = QualityCostMeter(
+        store, args.batch_id, cost_run_id,
+        run_base_cost_usd=os.environ.get("QUALITY_RUN_BASE_COST_USD", "0"),
+        overnight_prior_cost_usd=os.environ.get("QUALITY_OVERNIGHT_PRIOR_COST_USD", "0"),
+        worker_usd_per_second=os.environ.get("QUALITY_WORKER_USD_PER_SECOND", "0"),
+        search_usd=os.environ.get("QUALITY_WEB_SEARCH_USD_PER_CALL", "0.0125"),
+        browse_usd=os.environ.get("QUALITY_WEB_BROWSE_USD_PER_CALL", "0"),
+    )
+
+    def priced_usage(entry):
+        return {**meter.record(entry), "cost_run_id": cost_run_id}
+
+    def cost_snapshot():
+        return {
+            **meter.summary(), "cost_run_id": cost_run_id,
+            "worker_usd_per_second": float(meter.worker_rate),
+            "worker_rate_configured": "QUALITY_WORKER_USD_PER_SECOND" in os.environ,
+            "overnight_prior_cost_usd": float(meter.overnight_prior),
+            "web_search_usd_per_call": float(meter.search_rate),
+            "web_browse_usd_per_call": float(meter.browse_rate),
+            "compute_reconciliation": "Replace this elapsed worker compute estimate with measured execution-time cost; do not add both.",
+        }
+
     summary = run_quality_batch(
         store, args.batch_id, args.owner, args.run_id,
         web=QualityWeb() if not args.smoke_only and os.environ.get("QUALITY_WEB_ENABLED", "true").lower() == "true" else None,
         ford_image_blob=os.environ.get("QUALITY_FORD_IMAGE_BLOB"),
         smoke_only=args.smoke_only,
+        smoke_first=args.smoke_first and not args.smoke_only,
+        usage_callback=priced_usage, before_call=meter.before_call, cost_summary=cost_snapshot,
     )
     print(json.dumps(summary, ensure_ascii=True))
     return 0

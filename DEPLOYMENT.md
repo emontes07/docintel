@@ -58,7 +58,8 @@ claim of end-user API authentication; perform that smoke with the genuine
 browser session. The default remains HTTP cookie/header export.
 `export` first performs an authenticated owner-scoped batch read, then downloads the
 Excel export to the relative directory you supplied. HTTP/auth failures stop it;
-redirects are not followed. `cost EXECUTION` is plain `az containerapp job logs
+redirects are not followed, and failed partial downloads are retained rather than
+deleted. `cost EXECUTION` is plain `az containerapp job logs
 show --execution ...`, displaying the worker's structured meter summary. If
 execution logs are unavailable, `cost --file PATH` displays an already downloaded
 `quality-runs/BATCH_ID/RUN_ID/cost.json` unchanged. Neither mode computes a second

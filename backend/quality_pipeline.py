@@ -3,6 +3,8 @@
 There are at most three model requests per product/tier: extraction, an optional
 targeted refinement, then a low-effort judge of both passes. Only judge-accepted
 literal/derived candidates resolve a slot. Disputes and inferences remain visible.
+A worker smoke can occupy the first vendor extraction slot; its candidate and
+usage are reused, leaving one targeted extraction and one joint judge.
 """
 
 from __future__ import annotations
@@ -87,14 +89,17 @@ class QualityUsageStop(RuntimeError):
     quality_budget_stop = True
 
 
+_UNIT_ALIASES = {
+    '"': "in", "″": "in", "inches": "in", "inch": "in", "in": "in",
+    "pounds per square inch": "psi", "lbs/in2": "psi", "psi": "psi",
+    "degrees": "degree", "deg": "degree", "°": "degree",
+    "millimeters": "mm", "millimetres": "mm",
+}
+
+
 def _unit(value: str | None) -> str:
     text = (value or "").strip().casefold().rstrip(".")
-    return {
-        '"': "in", "″": "in", "inches": "in", "inch": "in", "in": "in",
-        "pounds per square inch": "psi", "lbs/in2": "psi", "psi": "psi",
-        "degrees": "degree", "deg": "degree", "°": "degree",
-        "millimeters": "mm", "millimetres": "mm",
-    }.get(text, text)
+    return _UNIT_ALIASES.get(text, text)
 
 
 _NUMBER_UNIT = re.compile(
@@ -192,10 +197,16 @@ def _value_match(value, proposal, selected, evidence, cited):
             return match_text(proposal.supporting_quote, windows(evidence, cited))
     aliases = {"fip": "female iron pipe", "fnpt": "female national pipe thread",
                "mip": "male iron pipe", "mnpt": "male national pipe thread",
-               "epdm": "ethylene propylene diene monomer"}
+               "epdm": "ethylene propylene diene monomer", "llb": "low lead brass"}
     expanded = aliases.get(str(value).casefold())
     if expanded:
         return match_text(expanded, quote_span)
+    normalized_value = re.sub(r"[\W_]+", " ", str(value).casefold()).strip()
+    for abbreviation, expansion in aliases.items():
+        if normalized_value == expansion or (abbreviation == "llb" and normalized_value == "brass"):
+            matched = match_text(abbreviation, quote_span)
+            if matched:
+                return matched
     return None
 
 
@@ -233,12 +244,20 @@ def ground_candidate(proposal: QualityProposal, definition: AttributeDefinition,
         if rule and origin == "literal":
             origin = "derived"
         if unit:
-            aliases = [unit]
-            if _unit(unit) == "in":
-                aliases.extend(['"', "in", "inch", "inches"])
             unit_spans = spans + [[replace(part, vendor=True) for part in span] for span in spans]
-            if not any(match_text(alias, unit_spans) for alias in aliases):
+            direct_unit_match = match_text(unit, unit_spans)
+            aliases = [alias for alias, canonical in _UNIT_ALIASES.items() if canonical == _unit(unit)]
+            alias_match = any(
+                any(re.search(r"°(?!\s*[CFK]\b)", part.text, re.I) for span in unit_spans for part in span)
+                if alias == "°" else match_text(alias, unit_spans)
+                for alias in aliases
+            )
+            if not direct_unit_match and not alias_match:
                 raise ValueError("The source does not support the proposed unit; cite the unit-bearing row/header.")
+            if not direct_unit_match:
+                rule = rule or "unit_alias_v1"
+                if origin == "literal":
+                    origin = "derived"
     qualification = None
     if origin == "inferred":
         qualification = "Descriptive Lead-Free inference only; requires human review and is not certification."
@@ -347,6 +366,8 @@ def run_product(
     manifest: Manifest, local_evidence: list[Evidence], completion, *, run_id: str,
     item_key: str = "", web=None, images: list[str] | None = None,
     usage_callback=None, before_call=None, retrieval: list[RetrievalOutcome] | None = None,
+    initial_candidates: dict[SourceTier, list[Candidate]] | None = None,
+    initial_diagnostics: list[dict] | None = None,
 ) -> EnrichmentResult:
     """No retries and no DI. Callbacks make usage persistent before the next request."""
     definitions = {a.attribute_id: a for a in manifest.attributes}
@@ -359,8 +380,8 @@ def run_product(
     }
     evidence = list(local_evidence)
     outcomes = list(retrieval or [])
-    diagnostics = []
-    succeeded = 0
+    diagnostics = [dict(entry) for entry in initial_diagnostics or []]
+    succeeded = len(diagnostics)
 
     def call(tier, phase, packet, schema):
         nonlocal succeeded
@@ -376,9 +397,12 @@ def run_product(
         return response
 
     for tier in TIERS:
+        seeds = [candidate for candidate in (initial_candidates or {}).get(tier, [])
+                 if candidate.attribute_id in attributes and candidate.attribute_id not in manifest.existing_values]
         pending = [key for key, attribute in attributes.items() if not _resolved(attribute)]
+        pending = list(dict.fromkeys([*pending, *[candidate.attribute_id for candidate in seeds]]))
         if not pending:
-            break
+            continue
         if tier in {"manufacturer_web", "approved_web"} and web is not None:
             fetched = web.load(manifest, tier, pending)
             evidence.extend(fetched)
@@ -391,11 +415,13 @@ def run_product(
         if not any(outcome.source_tier == tier for outcome in outcomes):
             outcomes.append(RetrievalOutcome(source_tier=tier, status="success"))
         packet = product_packet(manifest, evidence, tier, pending)
-        accepted: list[Candidate] = []
+        active_ids = {entry.evidence_id for entry in active}
+        accepted = [candidate.model_copy(deep=True) for candidate in seeds if set(candidate.evidence_ids) <= active_ids]
+        prior_calls = sum(entry.get("tier") == tier for entry in diagnostics)
         rejects = []
         call_failed = False
-        for phase in ("extract", "refine"):
-            if phase == "refine":
+        for phase in ("extract", "refine")[:max(0, 2 - prior_calls)]:
+            if phase == "refine" or accepted:
                 targeted = [key for key in pending if key not in {c.attribute_id for c in accepted}]
                 if not targeted and not rejects:
                     break
@@ -431,8 +457,9 @@ def run_product(
             judge_packet = product_packet(manifest, evidence, tier, pending)
             judge_packet["candidates"] = [{"candidate_id": f"C{i+1}", **c.model_dump(mode="json")} for i, c in enumerate(accepted)]
             decisions = {}
+            judge_available = sum(entry.get("tier") == tier for entry in diagnostics) < 3
             try:
-                judged = call(tier, "judge", judge_packet, QualityJudgment)
+                judged = call(tier, "judge", judge_packet, QualityJudgment) if judge_available else QualityJudgment(decisions=[])
                 for decision in judged.decisions:
                     if decision.candidate_id in decisions:
                         decisions[decision.candidate_id] = JudgeDecision(candidate_id=decision.candidate_id, decision="judge_disputed", reason="Judge returned duplicate decisions; manual review required.")
@@ -444,7 +471,10 @@ def run_product(
             for index, candidate in enumerate(accepted):
                 decision = decisions.get(f"C{index+1}")
                 candidate.judge_status = decision.decision if decision else "judge_disputed"
-                candidate.judge_reason = decision.reason if decision else "No usable judge decision; grounded proposal retained for review."
+                candidate.judge_reason = decision.reason if decision else (
+                    "Three-call tier limit reached; grounded proposal retained for review."
+                    if not judge_available else "No usable judge decision; grounded proposal retained for review."
+                )
                 target = attributes[candidate.attribute_id]
                 target.candidates.append(candidate)
                 values = {(str(c.value).casefold(), c.unit) for c in target.candidates}

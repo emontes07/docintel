@@ -610,16 +610,62 @@ def test_smoke_only_uses_full_packet_one_call_and_changes_no_item_results():
     assert packet["smoke_target"] == {"attribute": "Operating Head Style", "source_row": 1096, "source_cell": "T1096"}
 
 
-def test_wrong_smoke_answer_fails_visibly_before_full_processing():
+@pytest.mark.parametrize("smoke_only,smoke_first", [(True, False), (False, True)])
+def test_wrong_smoke_answer_fails_visibly_before_full_processing(smoke_only, smoke_first):
     store = seed_smoke_store()
     client = SmokeCompletion("Tee")
     with pytest.raises(QualitySmokeError, match="smoke failed"):
-        run_quality_batch(store, "batch", "owner", "smoke-fail", completion=client, smoke_only=True)
+        run_quality_batch(store, "batch", "owner", "smoke-fail", completion=client,
+                          smoke_only=smoke_only, smoke_first=smoke_first)
     summary = read_json(store, "quality-runs/batch/smoke-fail/summary.json")[0]
     assert summary["state"] == "failed" and summary["smoke"]["status"] == "failed"
     assert summary["smoke"]["observed_candidates"][0]["value"] == "Tee"
     assert summary["model_calls"] == 1 and not store.keys("results/")
     assert read_json(store, "items/batch/row-2.json")[0]["state"] == "failed"
+
+
+def test_smoke_first_processes_all_four_in_one_execution_and_reuses_vendor_call():
+    from collections import Counter
+    store = seed_smoke_store()
+    others, items = seed_store(4)
+    record, revision = read_json(store, "batches/batch.json")
+    record["items"].extend(items[1:])
+    write_json(store, "batches/batch.json", record, revision)
+    for item in items[1:]:
+        key = f"items/batch/{item['item_key']}.json"
+        write_json(store, key, read_json(others, key)[0])
+    class Combined(Completion):
+        def complete_structured(self, system, user, schema, **kwargs):
+            packet = json.loads(user)
+            target = packet["manifest"]["product"]["item_id"] == "PIMITEM-213030"
+            if packet.get("smoke_target"):
+                row = next(entry for entry in packet["evidence"] if entry["source_tier"] == "vendor_table")
+                generated = [proposal(attribute_id="Operating Head Style", value="Lockwing",
+                                      supporting_quote="Lockwing", evidence_ids=[row["citation_id"]])]
+            else:
+                assert read_json(store, "quality-runs/batch/one-execution/smoke.json")[0]["status"] == "passed"
+                row = next(entry for entry in packet["evidence"] if entry["source_tier"] == "internal_pdf")
+                generated = [] if target else [proposal(evidence_ids=[row["citation_id"]])]
+            if schema == QualityExtraction:
+                self.responses.append(generated)
+            return super().complete_structured(system, user, schema, **kwargs)
+    client = Combined()
+    summary = run_quality_batch(store, "batch", "owner", "one-execution", completion=client, smoke_first=True)
+    assert summary["state"] == "completed" and summary["smoke_first"] is True
+    assert summary["smoke_only"] is False and summary["smoke"]["status"] == "passed"
+    assert len(summary["products"]) == 4
+    assert summary["model_calls"] == len(client.calls) == 11
+    counts = Counter((entry["item_id"], entry["tier"]) for entry in summary["usage"])
+    assert max(counts.values()) <= 3
+    assert counts[("PIMITEM-213030", "vendor_table")] == 3
+    first = BatchService(store).detail("batch", "row-2", "owner")["machine_result"]
+    head = next(attribute for attribute in first["attributes"] if attribute["attribute_id"] == "Operating Head Style")
+    assert len(head["candidates"]) == 1 and head["candidates"][0]["value"] == "Lockwing"
+    assert head["candidates"][0]["judge_status"] == "accepted"
+    assert first["quality_diagnostics"][0]["phase"] == "smoke"
+    rows = read_workbook(BatchService(store).export("batch", "owner"))["Diagnostics"]
+    calls = [row for row in rows if row["Operation"] == "model"]
+    assert len(calls) == len({row["Call ID"] for row in calls}) == 11
 
 
 def test_missing_smoke_cell_fails_without_spending():
@@ -660,6 +706,39 @@ def test_failed_request_without_usage_is_durable_and_exported_without_fabricated
     assert rows[0]["Deployment"] == "gpt-6-sol"
 
 
+@pytest.mark.parametrize("reported", [True, False])
+def test_cost_snapshot_survives_response_failure_and_discloses_unknown_usage(reported):
+    from backend.quality_cost import QualityCostMeter
+    store = seed_smoke_store()
+    ticks = [0]
+    meter = QualityCostMeter(store, "batch", "priced-failure", run_base_cost_usd=".5",
+                             overnight_prior_cost_usd="4", worker_usd_per_second=".01",
+                             clock=lambda: ticks[0])
+    class FailedResponse(Completion):
+        def complete_structured(self, *args, **kwargs):
+            ticks[0] = 20
+            self.last_usage = {
+                "model": "quality-model", "status": "response_invalid" if reported else "request_failed",
+                "usage_reported": reported, "input_tokens": 100 if reported else None,
+                "output_tokens": 20 if reported else None, "cached_input_tokens": 0 if reported else None,
+                "reasoning_tokens": 10 if reported else None, "estimated_cost_usd": .25 if reported else None,
+            }
+            raise ValueError("Unusable response")
+    with pytest.raises(ValueError, match="Unusable response"):
+        run_quality_batch(store, "batch", "owner", "priced-failure", completion=FailedResponse(),
+                          smoke_only=True, before_call=meter.before_call, usage_callback=meter.record,
+                          cost_summary=meter.summary)
+    summary = read_json(store, "quality-runs/batch/priced-failure/summary.json")[0]
+    cost = summary["cost"]
+    assert cost == read_json(store, "quality-runs/batch/priced-failure/cost.json")[0]
+    assert cost["worker_seconds"] == 20 and cost["worker_cost_usd"] == pytest.approx(.2)
+    assert cost["known_run_cost_usd"] == pytest.approx(.95 if reported else .7)
+    assert cost["known_overnight_cost_usd"] == pytest.approx(4.95 if reported else 4.7)
+    assert cost["unpriced_model_calls"] == (0 if reported else 1)
+    assert summary["usage"][0]["cost_usd"] == (.25 if reported else None)
+    assert summary["state"] == "failed" and cost["model_calls"] == 1
+
+
 def test_web_usage_has_run_identity_and_is_exported_even_without_model_calls(monkeypatch):
     store, _ = seed_store(1)
     monkeypatch.setattr(CachedEvidenceLoader, "load", lambda *args: ([], [], []))
@@ -693,3 +772,56 @@ def test_smoke_cli_env_does_not_initialize_web(monkeypatch):
     monkeypatch.setattr("backend.quality_web.QualityWeb", lambda *args, **kwargs: pytest.fail("Smoke cannot initialize WebIQ"))
     assert main(["--batch-id", "batch", "--owner", "owner", "--run-id", "smoke"]) == 0
     assert calls[0]["smoke_only"] is True and calls[0]["web"] is None
+    assert calls[0]["smoke_first"] is False
+
+
+def test_default_cli_runs_smoke_then_products_and_can_explicitly_skip_it(monkeypatch):
+    from backend.quality_worker import main
+    calls = []
+    monkeypatch.delenv("QUALITY_SMOKE_ONLY", raising=False)
+    monkeypatch.delenv("QUALITY_SMOKE_FIRST", raising=False)
+    monkeypatch.setenv("QUALITY_WEB_ENABLED", "false")
+    monkeypatch.setattr("backend.quality_worker.configured_store", Store)
+    monkeypatch.setattr("backend.quality_worker.run_quality_batch", lambda *args, **kwargs: calls.append(kwargs) or {"state": "completed"})
+    args = ["--batch-id", "batch", "--owner", "owner", "--run-id", "first"]
+    assert main(args) == 0
+    assert calls[-1]["smoke_first"] is True and calls[-1]["smoke_only"] is False
+    assert main([*args, "--no-smoke-first"]) == 0
+    assert calls[-1]["smoke_first"] is False
+
+
+def test_cli_shared_cost_scope_accumulates_executions_without_rebilling_build(monkeypatch):
+    from backend.quality_cost import QualityCostMeter
+    from backend.quality_worker import main
+    store = Store()
+    ticks = [0]
+    outputs = []
+    monkeypatch.setenv("QUALITY_RUN_BASE_COST_USD", ".5")
+    monkeypatch.setenv("QUALITY_OVERNIGHT_PRIOR_COST_USD", "4")
+    monkeypatch.setenv("QUALITY_WORKER_USD_PER_SECOND", ".01")
+    monkeypatch.setenv("QUALITY_COST_RUN_ID", "logical-run")
+    monkeypatch.setenv("QUALITY_WEB_ENABLED", "false")
+    monkeypatch.setattr("backend.quality_worker.configured_store", lambda: store)
+    monkeypatch.setattr("backend.quality_cost.QualityCostMeter",
+                        lambda *args, **kwargs: QualityCostMeter(*args, **kwargs, clock=lambda: ticks[0]))
+    def fake_worker(store, batch_id, owner, run_id, **kwargs):
+        event = {"operation": "model", "run_id": run_id, "cost_usd": .25}
+        kwargs["before_call"](event)
+        ticks[0] += 10
+        priced = kwargs["usage_callback"](event)
+        result = {"state": "completed", "cost": kwargs["cost_summary"](), "usage": [priced]}
+        outputs.append(result)
+        return result
+    monkeypatch.setattr("backend.quality_worker.run_quality_batch", fake_worker)
+    for run_id in ("execution-1", "execution-2"):
+        assert main(["--batch-id", "batch", "--owner", "owner", "--run-id", run_id]) == 0
+    cost = read_json(store, "quality-runs/batch/logical-run/cost.json")[0]
+    assert cost["run_base_cost_usd"] == .5 and cost["model_calls"] == 2
+    assert cost["worker_seconds"] == 20 and cost["worker_cost_usd"] == pytest.approx(.2)
+    assert cost["known_run_cost_usd"] == pytest.approx(1.2)
+    assert cost["known_overnight_cost_usd"] == pytest.approx(5.2)
+    assert outputs[-1]["cost"]["cost_run_id"] == "logical-run"
+    assert outputs[-1]["cost"]["worker_rate_configured"] is True
+    assert outputs[-1]["cost"]["worker_usd_per_second"] == .01
+    assert outputs[-1]["cost"]["web_browse_usd_per_call"] == 0
+    assert all(output["usage"][0]["cost_run_id"] == "logical-run" for output in outputs)

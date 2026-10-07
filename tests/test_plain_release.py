@@ -313,7 +313,10 @@ def test_export_authenticates_first_and_does_not_replace_export_on_failure(invok
         assert result.returncode == 0, result.stderr
         assert workbook.read_bytes() == b"SYNTHETIC-XLSX"
         assert "/quality-001/export>" in calls[1]
-    assert not list(output.glob("*.part"))
+    assert bool(list(output.glob("*.part"))) == (failure == "curl-export")
+    if failure == "curl-export":
+        assert (output / "quality-001.xlsx.part").read_bytes() == b"SYNTHETIC-XLSX"
+        assert "partial output is retained" in result.stderr
 
 
 def test_live_commands_and_workflows_do_not_load_archived_operators():

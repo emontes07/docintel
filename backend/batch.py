@@ -429,7 +429,7 @@ class BatchService:
         results = [["Row", "Item ID", "Vendor", "MPN", "Attribute", "Status", "Candidate index", "Proposed value", "Unit", "Evidence IDs", "Qualifications", "Review status", "Reviewed value", "Reviewed unit", "Reviewer", "Reviewed at", "Reason", "Error", "Source tiers", "Supporting quote", "Model confidence (not measured accuracy)", "Evidence verification JSON", "Evidence basis", "Inference rule", "Origin", "Normalization rule", "Justification", "Judge status", "Judge reason", "Reviewer explanation", "Rejected candidates"]]
         evidence_rows = [["Row", "Evidence ID", "Source ID", "Locator", "Version", "Excerpt", "Observed at", "Source tier", "Applicability", "Approved attributes", "Discovery method"]]
         errors = [["Row", "State", "Error", "Warnings", "Definition clarifications", "Validation diagnostics"]]
-        diagnostics_sheet = [["Row", "Diagnostic", "Part", "Parts", "Sanitized diagnostic JSON", "Model", "Tier", "Phase", "Input tokens", "Reasoning tokens", "Output tokens", "Cost USD", "Status", "Note", "Run ID", "Call ID", "Operation", "Cached input tokens", "Usage reported", "Error type", "Deployment"]]
+        diagnostics_sheet = [["Row", "Diagnostic", "Part", "Parts", "Sanitized diagnostic JSON", "Model", "Tier", "Phase", "Input tokens", "Reasoning tokens", "Output tokens", "Cost USD", "Status", "Note", "Run ID", "Call ID", "Operation", "Cached input tokens", "Usage reported", "Error type", "Deployment", "Cost Run ID"]]
         attempts_sheet = [["Row", "Attempt", "State", "Result key", "Machine SHA256", "Error", "Started at", "Finished at", "Proposals", "Extraction error"]]
         attempt_records = [["Row", "Attempt", "Part", "Parts", "Attempt record JSON"]]
         provenance = [["Row", "Execution method", "Machine SHA256", "Source provenance", "Consumption reservations and usage", "Attribute coverage", "Inference provenance"]]
@@ -456,6 +456,7 @@ class BatchService:
                 diagnostic.get("output_tokens"), diagnostic.get("cost_usd"), diagnostic.get("status"), diagnostic.get("reason"),
                 run_id, call_id, operation, diagnostic.get("cached_input_tokens"), diagnostic.get("usage_reported"),
                 diagnostic.get("error_type") or diagnostic.get("meter_error"), diagnostic.get("deployment"),
+                diagnostic.get("cost_run_id") or run_id,
             ])
 
         for item in record["items"]:

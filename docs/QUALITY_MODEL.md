@@ -121,3 +121,35 @@ Fake responses should expose the usual `status`, `output`, and `usage` fields
 ```sh
 .venv/bin/python -m pytest tests/test_quality_model.py -q
 ```
+
+## Product quality extraction
+
+`backend.quality_worker` loads the existing owner-scoped batch and cached PDF and
+vendor evidence; it does not request new Document Intelligence analyses. Its
+default first step checks Mueller Operating Head Style against the vendor row,
+then processes all products in the same execution. `QUALITY_SMOKE_ONLY=true`
+selects just that check; `QUALITY_SMOKE_FIRST=false` omits it on a subsequent run.
+The original Ford PDF page is rendered in memory and supplied alongside its text.
+
+Each product/tier packet contains the manifest, all attribute definitions and
+product-scoped evidence. Catalog rows are selected by the model/part-number column,
+including removal of variants not present in the batch and their duplicated
+paragraphs. Shared component tables and family prose remain qualified evidence.
+Explicit empty source attribute scopes retain their existing no-eligibility
+meaning. Evidence references and source locations are preserved.
+
+The tier order is PDF, vendor, manufacturer web, then other web, with unresolved
+attributes alone advancing. Each tier permits extraction, one targeted second
+pass, and a joint low-effort judge, at most three model calls. The first Mueller
+vendor smoke occupies an extraction slot rather than adding a fourth call.
+Proposals retain literal/derived/inferred origins, normalization or inference
+justification, quotes, judge disagreements, conflicts and actionable reviewer
+notes. Unit aliases use the same equivalences for normalization and grounding
+(inch notation, psi/pounds per square inch, degree notation, and mm spellings);
+alias-only matches record `unit_alias_v1`. A temperature degree sign does not
+establish an angle unit. Pressure candidates remain visible without resolving the
+definition question, and descriptive Lead-Free inferences require human review.
+Documented derived abbreviation mappings include FIP/FNPT, MIP/MNPT, EPDM and
+LLB (low lead brass). LLB also supports the base material brass, but plain brass
+does not establish low-lead content. An arbitrary normalization explanation
+cannot authorize an invented value.
