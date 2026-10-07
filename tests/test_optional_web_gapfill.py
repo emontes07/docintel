@@ -517,3 +517,99 @@ def test_remeasured_optional_input_boundary_is_admitted_or_skipped_without_trunc
     ledger, _ = read_json(store, "budgets/real-pilot.json")
     assert ledger["attempted"]["inference"] == int(admitted)
     assert ledger["reserved"]["input_tokens"] == (input_bound if admitted else 0)
+
+
+def four_policy_record(record):
+    record = copy.deepcopy(record)
+    template = record["items"][0]
+    record["items"] = []
+    for index in range(4):
+        item = copy.deepcopy(template)
+        item["item_key"] = f"row-{index + 2}"
+        item["manifest"]["product"]["mpn"] = f"PART-{index + 1:03}"
+        record["items"].append(item)
+    return record
+
+
+def test_four_item_optional_policy_preserves_one_search_model_each_and_fair_page_caps(configured, monkeypatch):
+    store, record, approval = configured
+    record = four_policy_record(record)
+    policy = policy_for(record, max_search_calls=4, max_inference_calls=4, max_direct_page_attempts=6)
+    allocation = {"row-2": 2, "row-4": 2, "row-3": 1, "row-5": 1}
+    policy = policy.model_copy(update={
+        "items": {
+            key: value.model_copy(update={"max_direct_page_attempts": allocation[key]})
+            for key, value in policy.items.items()
+        },
+    })
+    guard = SimpleNamespace(execution_scope="full", recovery=None, _cost=lambda *args: 1)
+    processor = RealBatchProcessor(store, record, guard, optional_web_policy=policy)
+    monkeypatch.setattr(processor, "optional_guard_state", lambda: approval)
+    reserve = Mock(return_value={"synthetic": True})
+    monkeypatch.setattr(processor, "reserve_real", reserve)
+    for item_key, pages in allocation.items():
+        for operation in ["search", "inference"]:
+            processor.reserve_optional(operation, item_key + operation, item_key=item_key)
+            with pytest.raises(OptionalTierSkipped, match="optional_operation_capacity"):
+                processor.reserve_optional(operation, item_key + "duplicate", item_key=item_key)
+        for index in range(pages):
+            processor.reserve_optional("web_retrieval", f"{item_key}:{index}", item_key=item_key)
+        with pytest.raises(OptionalTierSkipped, match="optional_operation_capacity"):
+            processor.reserve_optional("web_retrieval", item_key + ":extra", item_key=item_key)
+    assert processor.optional_attempted == {"search": 4, "inference": 4, "web_retrieval": 6}
+    assert reserve.call_count == 14
+
+
+@pytest.mark.parametrize("field,value", [
+    ("max_search_calls", 5), ("max_inference_calls", 5), ("max_direct_page_attempts", 7),
+])
+def test_four_item_policy_cannot_exceed_operation_ceilings(configured, field, value):
+    _, record, _ = configured
+    with pytest.raises(ValueError):
+        policy_for(four_policy_record(record), **{field: value})
+
+
+@pytest.mark.parametrize("pages", [-1, 3, True, 1.5])
+def test_per_item_direct_page_cap_is_strict_and_bounded(configured, pages):
+    _, record, _ = configured
+    public = policy_for(record).items["row-2"].model_dump()
+    with pytest.raises(ValueError):
+        PublicWebScope.model_validate({**public, "max_direct_page_attempts": pages})
+
+
+@pytest.mark.parametrize("lead_count,page_limit", [(0, 2), (3, 2), (3, 1)])
+def test_four_product_web_prioritizes_leads_not_manufacturer_homepage(configured, monkeypatch, lead_count, page_limit):
+    store, record, approval = configured
+    item = record["items"][0]
+    binding = item["sources"][1]
+    binding["url"] = "https://manufacturer.invalid/"
+    policy = policy_for(record)
+    policy = policy.model_copy(update={
+        "items": {"row-2": policy.items["row-2"].model_copy(update={"max_direct_page_attempts": page_limit})},
+    })
+    guard = SimpleNamespace(
+        execution_scope="full", recovery=None, four_product={"synthetic": True},
+        operation_key=lambda *args, **kwargs: "synthetic-operation",
+    )
+    processor = RealBatchProcessor(store, record, guard, optional_web_policy=policy)
+    monkeypatch.setattr(processor, "optional_guard_state", lambda: approval)
+    reserve = Mock()
+    monkeypatch.setattr(processor, "reserve_optional", reserve)
+    _, _, pages, _ = install_services(monkeypatch)
+    from backend.core.config import settings
+
+    monkeypatch.setattr(settings, "WEBIQ_API_KEY", "synthetic-no-send-only")
+    leads = [
+        WebIQSearchResult(
+            url=f"https://manufacturer.invalid/lead-{index}", content="UNVERIFIED DISCOVERY",
+            retrieved_at=datetime.now(timezone.utc),
+        ) for index in range(lead_count)
+    ]
+    monkeypatch.setattr("backend.core.websearch_webiq.WebIQSearchClient.search", lambda *args, **kwargs: leads)
+    provenance = {}
+    sources = processor.web_sources(binding, item, binding["applicability"][0], ["Outlet"], provenance)
+    assert pages == [lead.url for lead in leads[:page_limit]]
+    assert reserve.call_count == 1 + min(lead_count, page_limit)
+    assert all("UNVERIFIED DISCOVERY" not in excerpt.text for source in sources for excerpt in source.excerpts)
+    if not lead_count:
+        assert provenance["skip_reason"] == "optional_no_product_page_leads"

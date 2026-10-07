@@ -25,6 +25,7 @@ class PublicWebScope(BaseModel):
     attribute_terms: dict[str, str] = Field(min_length=1)
     source_ids: list[str] = Field(min_length=1)
     allowed_hosts: list[str] = Field(min_length=1)
+    max_direct_page_attempts: int = Field(default=2, strict=True, ge=0, le=2)
 
     @model_validator(mode="after")
     def public_terms(self):
@@ -54,11 +55,11 @@ class OptionalWebPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     batch_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    items: dict[str, PublicWebScope] = Field(min_length=1, max_length=2)
+    items: dict[str, PublicWebScope] = Field(min_length=1, max_length=4)
     max_cost_microdollars: int = Field(strict=True, ge=0)
-    max_search_calls: int = Field(default=2, strict=True, ge=0, le=2)
-    max_direct_page_attempts: int = Field(default=4, strict=True, ge=0, le=4)
-    max_inference_calls: int = Field(default=2, strict=True, ge=0, le=2)
+    max_search_calls: int = Field(default=2, strict=True, ge=0, le=4)
+    max_direct_page_attempts: int = Field(default=4, strict=True, ge=0, le=6)
+    max_inference_calls: int = Field(default=2, strict=True, ge=0, le=4)
     max_input_tokens: int = Field(
         default=OPTIONAL_WEB_MAX_INPUT_TOKENS, strict=True, ge=1, le=OPTIONAL_WEB_MAX_INPUT_TOKENS,
     )

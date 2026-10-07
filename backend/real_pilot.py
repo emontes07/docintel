@@ -69,6 +69,7 @@ import base64
 import copy
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -103,6 +104,40 @@ ROW_RERUN_KEY = "configuration/real-pilot-row-rerun.json"
 ROW_RERUN_AUDIT_KEY = "operations/real-pilot-row-rerun.json"
 GAPFILL_KEY = "configuration/real-pilot-gapfill.json"
 GAPFILL_AUDIT_KEY = "operations/real-pilot-gapfill.json"
+FOUR_PRODUCT_KEY = "configuration/real-pilot-four-product.json"
+FOUR_PRODUCT_AUDIT_KEY = "operations/real-pilot-four-product.json"
+FOUR_PRODUCT_INFERENCE_INTERVAL_SECONDS = 31
+FOUR_PRODUCT_FIELDS = {
+    "schema_version", "approved", "approved_by", "approval_sha256", "batch_sha256",
+    "ledger_sha256", "prior_row_sha256", "prior_row_audit_sha256", "prior_execution_ids",
+    "selected_item_keys", "item_sha256", "result_sha256", "cached_documents",
+    "historical_records", "prep_receipt_key", "prep_receipt_sha256", "baseline",
+    "capacity_approval", "public_web_policy", "web_environment", "web_prices",
+    "page_limits", "execution_order", "inference_interval_seconds",
+    "fixed_cost_microdollars", "readiness_at", "operating_expires_at",
+    "not_before", "expires_at",
+}
+FOUR_PRODUCT_CAPACITY_FIELDS = {
+    "approved", "approved_by", "approved_at", "receipt_id", "plan_sha256",
+    "max_requests", "max_input_tokens", "max_output_tokens",
+    "additional_executions", "additional_inference", "additional_input_tokens",
+    "additional_output_tokens",
+    "duration_assumptions",
+}
+FOUR_PRODUCT_PREP_PREFIX = (
+    "operations/ford-analysis-preparation/"
+    "b50c311840c19d96fd994a2a8f281f243c37e63257aad81c41821e0df6910cfa/"
+)
+FOUR_PRODUCT_PREP_CACHE_KEY = "parses/2d9239607c598350d1cdd3ca96ee84acc4e0eb5c2cf11ee5c312492b774c63f3.json"
+FOUR_PRODUCT_PREP_RECORDS = tuple(FOUR_PRODUCT_PREP_PREFIX + name for name in (
+    "attempt.json", "authorization.json", "ledger-before.json", "submitted.json",
+    "parsed.json", "analysis-receipt.json", "completed.json", "reserved.json",
+    "packet.json", "storage-program.json",
+))
+FOUR_PRODUCT_PREP_CONTINUATION_PREFIX = FOUR_PRODUCT_PREP_PREFIX + "continuation/"
+FOUR_PRODUCT_PREP_CONTINUATION_RECORDS = tuple(FOUR_PRODUCT_PREP_CONTINUATION_PREFIX + name for name in (
+    "attempt.json", "authorization.json", "plan.json", "failure-before.json", "program.json", "completed.json",
+))
 GAPFILL_GRANTS = {
     "additional_inference": 1, "additional_input_tokens": 151646,
     "additional_output_tokens": 2048, "max_requests": 6,
@@ -344,6 +379,59 @@ def validate_gapfill(amendment, approval, batch, ledger, store):
     return copy.deepcopy(checker.gapfill)
 
 
+def validate_four_product(amendment, approval, batch, ledger, store):
+    """Verify a supplied exact capacity approval against the post-PREP baseline."""
+    class ReadOnlyCandidate:
+        def read_bytes(self, key):
+            if key == FOUR_PRODUCT_KEY:
+                return json.dumps(amendment).encode(), None
+            return store.read_bytes(key)
+
+    if (read_json(store, APPROVAL_KEY)[0] != approval
+            or read_json(store, BUDGET_KEY)[0] != ledger
+            or ledger.get("approval_sha256") != _sha256(approval) or ledger.get("invalidated")):
+        raise ValueError("Four-product original approval or consumption binding changed")
+    checker = RealPilotGuard.__new__(RealPilotGuard)
+    checker.store, checker.batch = ReadOnlyCandidate(), copy.deepcopy(batch)
+    try:
+        checker._validate_approval(approval, verify_runtime=False)
+        checker.verify_recovery(ledger)
+    except (KeyError, TypeError, AttributeError):
+        raise ValueError("Incomplete or malformed four-product prerequisite") from None
+    return copy.deepcopy(checker.four_product)
+
+
+def validate_four_product_duration(value):
+    """An empirical, provider-latency-conditional forecast; never a token-rate estimate."""
+    fields = {
+        "basis", "deployment_tpm", "inference_interval_seconds", "worker_timeout_seconds",
+        "historical_max_model_seconds", "model_response_allowance_seconds",
+        "startup_bookkeeping_seconds", "web_network_allowance_seconds", "forecast_seconds",
+        "provider_rate_estimate_verified", "byte_bounds_used_as_rate_estimate",
+        "billing_usage_used_as_rate_estimate",
+    }
+    if (not isinstance(value, dict) or set(value) != fields
+            or value["basis"] != "empirical_provider_latency_conditional"
+            or value["deployment_tpm"] != 30000 or value["worker_timeout_seconds"] != 600
+            or value["inference_interval_seconds"] != FOUR_PRODUCT_INFERENCE_INTERVAL_SECONDS
+            or value["provider_rate_estimate_verified"] is not False
+            or value["byte_bounds_used_as_rate_estimate"] is not False
+            or value["billing_usage_used_as_rate_estimate"] is not False):
+        raise ValueError("Four-product duration must remain empirical and conditional; no invented provider token estimate")
+    for name in ("historical_max_model_seconds", "model_response_allowance_seconds",
+                 "startup_bookkeeping_seconds", "web_network_allowance_seconds", "forecast_seconds"):
+        if type(value[name]) not in (int, float) or not math.isfinite(value[name]):
+            raise ValueError("Four-product duration assumptions must be explicit finite values")
+    response = value["model_response_allowance_seconds"]
+    forecast = (11 * max(FOUR_PRODUCT_INFERENCE_INTERVAL_SECONDS, response) + response
+                + value["startup_bookkeeping_seconds"] + value["web_network_allowance_seconds"])
+    if (value["historical_max_model_seconds"] != 21.42772 or response < 22
+            or value["startup_bookkeeping_seconds"] < 35 or value["web_network_allowance_seconds"] < 150
+            or value["forecast_seconds"] != forecast or forecast >= 600):
+        raise ValueError("Four-product conditional duration forecast does not fit the full 600-second worker")
+    return value
+
+
 class RealPilotGuard:
     def __init__(self, store, batch_record):
         self.store = store
@@ -366,15 +454,525 @@ class RealPilotGuard:
 
     @property
     def execution_scope(self):
-        return "full" if self.gapfill else approval_scope(self._approval)
+        return "full" if self.four_product or self.gapfill else approval_scope(self._approval)
 
     @property
     def active_recovery(self):
-        return self.gapfill or self.row_rerun or self.final_rerun or self.recovery
+        return self.four_product or self.gapfill or self.row_rerun or self.final_rerun or self.recovery
 
     def result_key(self, item_key):
         root = f"results/{self.batch['id']}/{item_key}"
         return f"{root}/attempts/{self.recovery_sha256}.json" if self.final_rerun else root + ".json"
+
+    def _four_product(self, approval):
+        try:
+            raw, _ = self.store.read_bytes(FOUR_PRODUCT_KEY)
+        except Missing:
+            return None
+        if len(raw) > 262144:
+            raise ValueError("Four-product amendment exceeds its metadata bound")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) != FOUR_PRODUCT_FIELDS:
+            raise ValueError("Four-product amendment schema mismatch")
+        selected = [item["item_key"] for item in self.batch["items"]]
+        if (self.row_rerun is None or self.gapfill is not None
+                or value["schema_version"] != 1 or type(value["schema_version"]) is not int
+                or value["approved"] is not True or value["approved_by"] != approval["approved_by"]
+                or value["approval_sha256"] != _sha256(approval)
+                or value["batch_sha256"] != binding_digest(self.batch)
+                or value["prior_row_sha256"] != _sha256(self.row_rerun)
+                or value["selected_item_keys"] != selected or len(selected) != 4):
+            raise ValueError("Four-product continuation requires the unchanged four-item row lineage")
+        if value["execution_order"] != [selected[0], selected[2], selected[1], selected[3]]:
+            raise ValueError("Four-product execution must interleave manufacturers without splitting each product")
+        interval = _integer(value["inference_interval_seconds"], "four-product inference interval")
+        if interval != FOUR_PRODUCT_INFERENCE_INTERVAL_SECONDS:
+            raise ValueError("Four-product pacing requires exactly 31-second starts; the old 61-second interval cannot fit")
+        for name in ("item_sha256", "result_sha256", "cached_documents", "historical_records", "page_limits"):
+            if not isinstance(value[name], dict):
+                raise ValueError("Four-product canonical record bindings are required")
+        if (value["prep_receipt_key"] != FOUR_PRODUCT_PREP_PREFIX + "completed.json"
+                or any(not re.fullmatch(r"parses/[a-f0-9]{64}\.json", key) for key in value["cached_documents"])
+                or any(not isinstance(key, str) or key.startswith(("/", "items/", "batches/", "locks/"))
+                       or ".." in key.split("/") or key in {BUDGET_KEY, FOUR_PRODUCT_KEY, FOUR_PRODUCT_AUDIT_KEY}
+                       for key in value["historical_records"])):
+            raise ValueError("Four-product completed PREP and immutable record paths are required")
+        required_history = {
+            APPROVAL_KEY, RECOVERY_KEY, RECOVERY_AUDIT_KEY, FINAL_RERUN_KEY, FINAL_RERUN_AUDIT_KEY,
+            ROW_RERUN_KEY, ROW_RERUN_AUDIT_KEY, value["prep_receipt_key"],
+            *FOUR_PRODUCT_PREP_RECORDS,
+            *FOUR_PRODUCT_PREP_CONTINUATION_RECORDS,
+            *value["cached_documents"], *value["result_sha256"],
+        }
+        if not required_history <= set(value["historical_records"]):
+            raise ValueError("Four-product entire prior authority/cache/result lineage must remain pinned")
+        if (set(value["item_sha256"]) != set(selected)
+                or not value["cached_documents"]
+                or not set(self.row_rerun["cached_documents"]) <= set(value["cached_documents"])
+                or set(value["page_limits"]) != set(selected)
+                or value["page_limits"] != {
+                    key: 2 if index < 2 else 1 for index, key in enumerate(value["execution_order"])}
+                or any(type(limit) is not int for limit in value["page_limits"].values())):
+            raise ValueError("Four-product caches and balanced six-page allocation are required")
+        prior = value["prior_execution_ids"]
+        if not isinstance(prior, list) or len(prior) != 4 or len(set(prior)) != 4:
+            raise ValueError("Four-product continuation must retain four consumed executions")
+        hashes = [value["ledger_sha256"], value["prior_row_audit_sha256"],
+                  value["prep_receipt_sha256"], *prior, *value["item_sha256"].values(),
+                  *value["result_sha256"].values(), *value["cached_documents"].values(),
+                  *value["historical_records"].values()]
+        if not all(isinstance(digest, str) and re.fullmatch(r"[a-f0-9]{64}", digest) for digest in hashes):
+            raise ValueError("Four-product canonical SHA-256 bindings are required")
+        audit, _ = read_json(self.store, ROW_RERUN_AUDIT_KEY)
+        if (_sha256(audit) != value["prior_row_audit_sha256"]
+                or audit.get("amendment_sha256") != value["prior_row_sha256"]
+                or audit.get("execution_id") not in prior):
+            raise ValueError("Four-product prior row audit changed")
+        baseline = value["baseline"]
+        if (not isinstance(baseline, dict) or set(baseline) != {"attempted", "reserved", "executions"}
+                or baseline["executions"] != 4
+                or baseline["attempted"]["inference"] != 11
+                or any(baseline["attempted"][name] for name in EXTERNAL_OPERATIONS)
+                or baseline["reserved"]["input_tokens"] != 257868
+                or baseline["reserved"]["output_tokens"] != 22528):
+            raise ValueError("Four-product post-PREP consumption changed")
+        _integer(baseline["attempted"]["analysis"], "post-PREP analysis", maximum=approval["limits"]["analysis"])
+        _integer(baseline["reserved"]["analysis_pages"], "post-PREP pages", maximum=approval["limits"]["analysis_pages"])
+        capacity = value["capacity_approval"]
+        if (not isinstance(capacity, dict) or set(capacity) != FOUR_PRODUCT_CAPACITY_FIELDS
+                or capacity["approved"] is not True or capacity["approved_by"] != approval["approved_by"]
+                or not isinstance(capacity["receipt_id"], str) or not 1 <= len(capacity["receipt_id"]) <= 256
+                or not re.fullmatch(r"[a-f0-9]{64}", capacity["plan_sha256"])):
+            raise ValueError("An explicit exact measured capacity exception is required")
+        _timestamp(capacity["approved_at"])
+        validate_four_product_duration(capacity["duration_assumptions"])
+        for name in FOUR_PRODUCT_CAPACITY_FIELDS - {
+                "approved", "approved_by", "approved_at", "receipt_id", "plan_sha256", "duration_assumptions"}:
+            _integer(capacity[name], name)
+        if (capacity["max_requests"] != 12 or capacity["max_output_tokens"] != 24576
+                or not 1 <= capacity["max_input_tokens"] <= 8 * 27952 + 4 * 26000
+                or capacity["additional_executions"] != 1
+                or capacity["additional_inference"] != max(0, 12 - (
+                    approval["limits"]["inference"] - baseline["attempted"]["inference"]))
+                or capacity["additional_input_tokens"] != max(0, capacity["max_input_tokens"] - (
+                    self.row_rerun["effective_input_ceiling"] - baseline["reserved"]["input_tokens"]))
+                or capacity["additional_output_tokens"] != max(0, 24576 - (
+                    approval["limits"]["output_tokens"] - baseline["reserved"]["output_tokens"]))):
+            raise ValueError("Four-product capacity must be the exact measured additive exception")
+        ready, deadline = (_timestamp(value[name]) for name in ("readiness_at", "operating_expires_at"))
+        start, end = (_timestamp(value[name]) for name in ("not_before", "expires_at"))
+        if ((deadline - ready).total_seconds() != 5400
+                or ready < _timestamp(self.row_rerun["operating_expires_at"])
+                or not ready <= start < end <= deadline
+                or _timestamp(capacity["approved_at"]) > ready):
+            raise ValueError("Four-product readiness requires prior capacity approval and fixed 90 minutes")
+        from backend.core.websearch_policy import OptionalWebPolicy
+        from backend.core.websearch_webiq import ENDPOINT
+
+        policy = OptionalWebPolicy.model_validate(value["public_web_policy"])
+        if (policy.batch_sha256 != value["batch_sha256"] or set(policy.items) != set(selected)
+                or (policy.max_search_calls, policy.max_direct_page_attempts, policy.max_inference_calls,
+                    policy.max_input_tokens, policy.max_output_tokens) != (4, 6, 4, 26000, 2048)):
+            raise ValueError("Four-product public policy must permit only four bounded optional tiers")
+        for item in self.batch["items"]:
+            public = policy.items[item["item_key"]]
+            sources = {entry["source_id"]: entry for entry in item["sources"]
+                       if entry["kind"] == "web" and entry["source_tier"] == "manufacturer_web"}
+            if (public.max_direct_page_attempts != value["page_limits"][item["item_key"]]
+                    or public.mpn != item["manifest"]["product"]["mpn"]
+                    or public.manufacturer.casefold() not in item["manifest"]["product"]["vendor"].casefold()
+                    or not set(public.source_ids) <= set(sources)
+                    or not set(public.attribute_terms) <= {
+                        entry["attribute_id"] for entry in item["manifest"]["attributes"]}
+                    or set(public.allowed_hosts) != {
+                        urlsplit(sources[key]["url"]).hostname for key in public.source_ids}):
+                raise ValueError("Four-product public manufacturer/MPN/attribute scope changed")
+        if value["web_environment"] != {"WEBSEARCH_PROVIDER": "webiq", "WEBIQ_ENDPOINT": ENDPOINT}:
+            raise ValueError("Four-product continuation permits only the exact WebIQ /web endpoint")
+        if not isinstance(value["web_prices"], dict) or set(value["web_prices"]) != {"search", "web_retrieval"}:
+            raise ValueError("Explicit conservative four-product web prices are required")
+        prices = {name: _price(price, allow_zero=name == "web_retrieval")
+                  for name, price in value["web_prices"].items()}
+        # Include the already-consumed 116.134448s build, rounded UP only once,
+        # plus one new 2-vCPU/900s build and one 600s worker. No old forecasts.
+        fixed = _integer(value["fixed_cost_microdollars"], "fixed cost", minimum=221227)
+        model = self._cost(approval, "inference", capacity["max_input_tokens"], 24576, 0)
+        web = int(((4 * prices["search"] + 6 * prices["web_retrieval"]) * 1000000).to_integral_value(rounding=ROUND_CEILING))
+        if (fixed + model + web > 5000000
+                or policy.max_cost_microdollars < web + self._cost(approval, "inference", 104000, 8192, 0)
+                or policy.max_cost_microdollars > 5000000 - fixed):
+            raise ValueError("Four-product incremental envelope including prior build exceeds $5")
+        return value
+
+    def _verify_four_product_prep(self, ledger):
+        value = self.four_product
+        try:
+            self.store.read_bytes(FOUR_PRODUCT_PREP_PREFIX + "failure.json")
+        except Missing:
+            pass
+        else:
+            raise ValueError("Four-product PREP failed or has an unknown outcome; no retry or activation")
+        completed, _ = read_json(self.store, value["prep_receipt_key"])
+        receipt, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "analysis-receipt.json")
+        before, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "ledger-before.json")
+        attempt, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "attempt.json")
+        authorization, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "authorization.json")
+        submitted, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "submitted.json")
+        parsed, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "parsed.json")
+        approval, _ = read_json(self.store, APPROVAL_KEY)
+        if (completed.get("status") != "prepared_cache_verified_for_both_products"
+                or completed.get("worker_executions_charged") != 0
+                or completed.get("readiness_clock_started") is not False
+                or completed.get("ford_extraction_authorized") is not False
+                or completed.get("reserved_analysis") != 1 or completed.get("reserved_pages") != 5
+                or completed.get("raw_hashes_are_capture_integrity_only") is not True
+                or completed.get("ledger_after_canonical_sha256") != _sha256(ledger)
+                or completed.get("analysis_receipt") != receipt
+                or completed.get("cache_key") != FOUR_PRODUCT_PREP_CACHE_KEY
+                or completed["cache_key"] not in value["cached_documents"]
+                or receipt.get("outcome") != "succeeded" or receipt.get("sdk_retries") != 0
+                or receipt.get("source_sha256") != FOUR_PRODUCT_PREP_PREFIX.split("/")[-2]
+                or receipt.get("source") != "batchblob:///documents/av-source-4.pdf"
+                or receipt.get("request_options") != {"pages": "1-5"}
+                or receipt.get("fresh_analysis") is not True or receipt.get("legacy_local_parse_reused") is not False
+                or receipt.get("readiness_clock_started") is not False
+                or receipt.get("model_requested") != receipt.get("model_returned")
+                or receipt.get("model_returned") != "prebuilt-layout"
+                or receipt.get("api_version_requested") != receipt.get("api_version_returned")
+                or receipt.get("api_version_returned") != "2024-11-30"
+                or receipt.get("sdk_package") != "azure-ai-documentintelligence"
+                or not isinstance(receipt.get("sdk_version"), str) or not receipt["sdk_version"]
+                or receipt.get("sdk_result_serialization") != "AnalyzeResult.as_dict; sorted ASCII JSON; compact separators"
+                or type(receipt.get("sdk_result_bytes")) is not int or receipt["sdk_result_bytes"] <= 0
+                or type(receipt.get("source_bytes")) is not int or receipt["source_bytes"] <= 0
+                or receipt.get("raw_http_response_retained") is not False
+                or before["executions"] != ledger["executions"]):
+            raise ValueError("Four-product requires actual bounded PREP provenance without worker execution")
+        _uuid(receipt.get("operation_id"), "PREP operation")
+        contract = authorization.get("contract")
+        if (not isinstance(contract, dict)
+                or any(contract.get(key) != expected for key, expected in {
+                    "purpose": "one_ford_analysis_preparation_before_readiness",
+                    "source_sha256": receipt["source_sha256"], "source_location": receipt["source"],
+                    "model": "prebuilt-layout", "api_version": "2024-11-30",
+                    "request_options": {"pages": "1-5"}, "max_submissions": 1,
+                    "max_analysis_pages": 5, "sdk_retries": 0, "worker_executions": 0,
+                    "inference": 0, "search": 0, "web_retrieval": 0,
+                    "identity_route": "local_operator_di_api_mi_storage",
+                }.items())):
+            raise ValueError("Four-product PREP contract must authorize only the bounded shared Ford analysis")
+        if (not isinstance(receipt.get("sdk_result_sha256"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", receipt["sdk_result_sha256"])
+                or submitted.get("operation_id") != receipt["operation_id"]
+                or submitted.get("source_sha256") != receipt["source_sha256"]
+                or submitted.get("request_options") != receipt["request_options"]
+                or authorization.get("approved") is not True or authorization.get("approved_by") != approval["approved_by"]
+                or authorization.get("parent_live_executor_only") is not True
+                or authorization.get("existing_operator_di_access_verified") is not True
+                or authorization.get("operator_analysis_api_storage_approved") is not True
+                or _sha256(authorization) != receipt.get("preparation_authorization_sha256")
+                or attempt.get("authorization_sha256") != _sha256(authorization)
+                or attempt.get("contract") != authorization.get("contract")
+                or attempt.get("ledger_before_canonical_sha256") != _sha256(before)
+                or attempt.get("source_bytes") != receipt["source_bytes"]
+                or submitted.get("source_bytes") != receipt["source_bytes"]
+                or attempt.get("reservation_id") != receipt.get("reservation_id")):
+            raise ValueError("Four-product PREP authorization/submission/operation lineage changed")
+        reservation = ledger["reservations"].get(receipt.get("reservation_id"), {})
+        if (reservation.get("execution_id") is not None or reservation.get("operation") != "analysis"
+                or reservation.get("reservation_id") != receipt["reservation_id"]
+                or reservation.get("purpose") != "one_ford_analysis_preparation_before_readiness"
+                or reservation.get("item_key") != "row-4" or reservation.get("item_keys") != ["row-4", "row-5"]
+                or reservation.get("preparation_authorization_sha256") != _sha256(authorization)
+                or reservation.get("reserved_usage") != {"input_tokens": 0, "output_tokens": 0, "analysis_pages": 5}
+                or reservation.get("actual_usage") != {
+                    "input_tokens": 0, "output_tokens": 0, "analysis_pages": receipt.get("actual_page_count")}
+                or type(receipt.get("actual_page_count")) is not int
+                or not 1 <= receipt["actual_page_count"] <= 5
+                or receipt.get("returned_pages") != list(range(1, receipt["actual_page_count"] + 1))
+                or any(ledger["reservations"].get(key) != prior for key, prior in before["reservations"].items())
+                or set(ledger["reservations"]) != set(before["reservations"]) | {receipt["reservation_id"]}
+                or ledger["attempted"] != {**before["attempted"], "analysis": before["attempted"]["analysis"] + 1}
+                or ledger["reserved"] != {
+                    **before["reserved"], "analysis_pages": before["reserved"]["analysis_pages"] + 5,
+                    "microdollars": before["reserved"]["microdollars"] + reservation.get("reserved_microdollars", -1)}
+                or completed.get("reserved_microdollars") != reservation.get("reserved_microdollars")
+                or attempt.get("reserved_microdollars") != reservation.get("reserved_microdollars")
+                or reservation.get("reserved_microdollars") != self._cost(approval, "analysis", 0, 0, 5)):
+            raise ValueError("Four-product post-PREP ledger must retain every charge without refunds")
+        measured_cost = self._cost(approval, "analysis", 0, 0, receipt["actual_page_count"])
+        mutable = {"attempted", "reserved", "reservations", "actual_usage", "estimated_usage_cost_microdollars"}
+        if (set(ledger) != set(before)
+                or any(ledger.get(key) != prior for key, prior in before.items() if key not in mutable)
+                or ledger["actual_usage"] != {
+                    **before["actual_usage"],
+                    "analysis_pages": before["actual_usage"]["analysis_pages"] + receipt["actual_page_count"]}
+                or ledger["estimated_usage_cost_microdollars"] != before["estimated_usage_cost_microdollars"] + measured_cost):
+            raise ValueError("Four-product PREP usage must append to every retained accounting field")
+        self._verify_four_product_prep_identities(approval, authorization, attempt, receipt, submitted, before, ledger)
+        cache, _ = read_json(self.store, completed["cache_key"])
+        if (cache.get("analysis_receipt_key") != FOUR_PRODUCT_PREP_PREFIX + "analysis-receipt.json"
+                or cache.get("origin") != "ford_preparation_analysis_first_five_pages"
+                or cache.get("parser_version") != receipt.get("parser_version")
+                or receipt.get("parser_version") != "prebuilt-layout:2024-11-30:mapping-v1"
+                or completed.get("cache_canonical_sha256") != _sha256(cache)
+                or cache.get("document_sha256") != receipt.get("mapped_result_sha256")
+                or cache.get("document") != parsed or parsed.get("source") != receipt["source"]
+                or cache.get("document", {}).get("cache_key") != "sha256:" + receipt["source_sha256"]):
+            raise ValueError("Four-product PREP cache/provenance association changed")
+        self._verify_four_product_prep_continuation(approval, completed, receipt, ledger)
+        if value["fixed_cost_microdollars"] < 221227 + measured_cost:
+            raise ValueError("Four-product fixed forecast must include verified actual PREP page cost")
+
+    def _verify_four_product_prep_continuation(self, approval, completed, receipt, ledger):
+        prefix = FOUR_PRODUCT_PREP_CONTINUATION_PREFIX
+        try:
+            self.store.read_bytes(prefix + "failure.json")
+        except Missing:
+            pass
+        else:
+            raise ValueError("Four-product PREP continuation failed or is unknown; no retry")
+        attempt, authorization, plan, failure, program, audit = (
+            read_json(self.store, key)[0] for key in FOUR_PRODUCT_PREP_CONTINUATION_RECORDS
+        )
+        packet, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "packet.json")
+        original_auth, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "authorization.json")
+        claim, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "reserved.json")
+        if (set(authorization) != {
+                "schema_version", "approved", "approved_by", "approved_at", "continuation_plan_sha256",
+                "original_packet_sha256", "reservation_id", "one_continuation_only",
+                "no_new_reservation", "no_retry_or_refund", "parent_live_executor_only",
+            } or type(authorization["schema_version"]) is not int or authorization["schema_version"] != 1
+                or authorization["approved_by"] != approval["approved_by"]
+                or any(authorization[key] is not True for key in (
+                    "approved", "one_continuation_only", "no_new_reservation", "no_retry_or_refund", "parent_live_executor_only"))
+                or authorization["continuation_plan_sha256"] != _sha256(plan)
+                or authorization["original_packet_sha256"] != _sha256(packet)
+                or authorization["reservation_id"] != receipt["reservation_id"]
+                or plan.get("original_packet_sha256") != _sha256(packet)
+                or plan.get("original_authorization_sha256") != _sha256(original_auth)
+                or plan.get("claim_sha256") != _sha256(claim)
+                or plan.get("reservation_id") != receipt["reservation_id"]
+                or plan.get("purpose") != "one_continuation_of_existing_ford_reservation"
+                or plan.get("max_submissions") != 1 or plan.get("sdk_retries") != 0
+                or plan.get("new_reservations") != 0 or plan.get("new_reserved_microdollars") != 0):
+            raise ValueError("Four-product requires the explicit one-use continuation of the existing PREP reservation")
+        metadata = failure.get("analysis_metadata", {})
+        if (failure != plan.get("failure") or failure.get("status") != "failed_or_unknown_no_retry"
+                or failure.get("allowance_refunded") is not False or failure.get("submitted_transport_errors") != []
+                or metadata.get("operation_id") is not None or "accepted_at" in metadata
+                or metadata.get("error_type") != "ClientAuthenticationError"
+                or metadata.get("source_sha256") != receipt["source_sha256"]
+                or metadata.get("source_bytes") != receipt["source_bytes"]
+                or metadata.get("request_options") != {"pages": "1-5"}
+                or plan.get("history_hash_semantics") != "sha256_sorted_compact_ascii_json"
+                or plan.get("history_sha256", {}).get(BUDGET_KEY) != claim["reserved_ledger_canonical_sha256"]):
+            raise ValueError("The stopped pre-submission failure and charged ledger must remain preserved")
+        for record in (attempt, audit):
+            if (record.get("plan_sha256") != _sha256(plan)
+                    or record.get("authorization_sha256") != _sha256(authorization)
+                    or record.get("reservation_id") != receipt["reservation_id"]
+                    or record.get("new_reservations") != 0 or record.get("new_reserved_microdollars") != 0
+                    or record.get("readiness_clock_started") is not False):
+                raise ValueError("Continuation must not reset, rearm, refund, or add a reservation")
+        if (attempt.get("state") != "one_continuation_claimed_no_retry"
+                or attempt.get("claim_sha256") != _sha256(claim)
+                or attempt.get("ledger_canonical_sha256") != claim["reserved_ledger_canonical_sha256"]
+                or program.get("sha256") != plan.get("continuation_program_sha256")
+                or not isinstance(program.get("source"), str)
+                or hashlib.sha256(program["source"].encode()).hexdigest() != program["sha256"]
+                or audit.get("status") != "existing_reservation_continuation_completed"
+                or audit.get("original_packet_sha256") != _sha256(packet)
+                or audit.get("original_failure_canonical_sha256") != _sha256(failure)
+                or audit.get("original_completed_canonical_sha256") != _sha256(completed)
+                or audit.get("cache_canonical_sha256") != completed["cache_canonical_sha256"]
+                or audit.get("ledger_after_canonical_sha256") != _sha256(ledger)
+                or audit.get("operation_id") != receipt["operation_id"]
+                or audit.get("worker_executions_charged") != 0):
+            raise ValueError("Continuation program/completion must bind the actual unchanged PREP result")
+        proof, ci = plan["native_no_send_proof"], plan["ci_proof"]
+        if (not isinstance(proof, dict) or set(proof) != {
+                "status", "provider", "sdk_package", "sdk_version", "transport_package", "transport_version",
+                "method", "api_version", "endpoint_sha256", "body_sha256", "body_bytes", "content_type",
+                "request_sha256", "authentication_performed", "provider_send_performed",
+                "provider_response_fabricated", "source_sha256", "source_bytes", "transport",
+                "transport_real_calls", "network_calls", "credential_real_calls", "captured_requests",
+                "query", "query_is_complete", "query_sha256", "pages", "request_options", "path_sha256", "path", "model_id",
+            } or proof.get("status") != "validated_no_send" or proof.get("provider") != "document_intelligence"
+                or proof.get("sdk_package") != "azure-ai-documentintelligence"
+                or proof.get("transport_package") != "azure-core" or proof.get("content_type") != "application/octet-stream"
+                or any(not isinstance(proof[key], str) or not re.fullmatch(r"[0-9.]+[a-z0-9.]{0,20}", proof[key])
+                       for key in ("sdk_version", "transport_version"))
+                or proof.get("sdk_version") != receipt["sdk_version"] or proof.get("method") != "POST"
+                or proof.get("api_version") != receipt["api_version_requested"]
+                or proof.get("source_sha256") != receipt["source_sha256"]
+                or proof.get("body_sha256") != receipt["source_sha256"]
+                or proof.get("source_bytes") != receipt["source_bytes"] or proof.get("body_bytes") != receipt["source_bytes"]
+                or proof.get("transport") != "in_memory_no_send"
+                or type(proof.get("captured_requests")) is not int or proof["captured_requests"] != 1
+                or proof.get("request_options") != {"pages": "1-5"} or proof.get("pages") != "1-5"
+                or proof.get("query") != {"api-version": [receipt["api_version_requested"]], "pages": ["1-5"]}
+                or proof.get("query_is_complete") is not True or proof.get("model_id") != "prebuilt-layout"
+                or proof.get("path") != "/documentintelligence/documentModels/prebuilt-layout:analyze"
+                or any(type(proof[key]) is not int or proof[key] != 0
+                       for key in ("transport_real_calls", "network_calls", "credential_real_calls"))
+                or any(proof.get(key) is not False for key in (
+                    "authentication_performed", "provider_send_performed", "provider_response_fabricated"))
+                or any(not isinstance(proof.get(key), str) or not re.fullmatch(r"[a-f0-9]{64}", proof[key])
+                       for key in ("endpoint_sha256", "request_sha256", "path_sha256", "query_sha256"))
+                or not isinstance(ci, dict) or set(ci) != {
+                    "schema_version", "status", "source_revision", "code_sha256", "checks",
+                } or type(ci["schema_version"]) is not int or ci["schema_version"] != 1
+                or ci.get("status") != "passed" or ci.get("code_sha256") != plan.get("local_code_sha256")
+                or not plan.get("local_code_sha256")
+                or not re.fullmatch(r"[a-f0-9]{40}", ci.get("source_revision", ""))
+                or not isinstance(ci["checks"], list) or not ci["checks"]
+                or any(not isinstance(check, dict) or set(check) != {"name", "run_id", "conclusion"}
+                       or check["conclusion"] != "success"
+                       or not isinstance(check["name"], str) or not re.fullmatch(r"[\w ./()-]{1,120}", check["name"])
+                       or type(check["run_id"]) is not int or check["run_id"] <= 0
+                       for check in ci["checks"])):
+            raise ValueError("Exact installed native DI no-send proof and focused CI are mandatory")
+        times = [_timestamp(value) for value in (
+            failure["recorded_at"], authorization["approved_at"], attempt["started_at"],
+            receipt["started_at"], receipt["mapped_at"], audit["completed_at"],
+            self.four_product["capacity_approval"]["approved_at"],
+        )]
+        if times != sorted(times):
+            raise ValueError("Continuation authority must precede the one approved DI submission")
+
+    def _verify_four_product_prep_identities(self, approval, authorization, attempt, receipt, submitted, before, ledger):
+        packet, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "packet.json")
+        claim, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "reserved.json")
+        program, _ = read_json(self.store, FOUR_PRODUCT_PREP_PREFIX + "storage-program.json")
+        if (set(authorization) != {
+                "schema_version", "approved", "approved_by", "approved_at", "packet_sha256", "contract",
+                "parent_live_executor_only", "existing_operator_di_access_verified",
+                "operator_analysis_api_storage_approved",
+            } or authorization["schema_version"] != 1 or type(authorization["schema_version"]) is not int
+                or authorization["packet_sha256"] != _sha256(packet)
+                or attempt.get("packet_sha256") != _sha256(packet)
+                or claim.get("packet_sha256") != _sha256(packet)
+                or claim.get("authorization_sha256") != _sha256(authorization)
+                or packet.get("contract") != authorization["contract"]
+                or packet.get("batch_id") != approval["batch_id"] or packet.get("approved_by") != approval["approved_by"]
+                or packet.get("api_principal_id") != approval["identities"]["api_principal_id"]
+                or packet.get("analysis_endpoint") != approval["environment"]["AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT"]):
+            raise ValueError("Four-product PREP split-route authorization/packet binding changed")
+        tenant = _uuid(packet.get("tenant_id"), "PREP tenant")
+        subscription = _uuid(packet.get("subscription_id"), "PREP subscription")
+        analysis = {
+            "kind": "approved_operator", "credential": "AzureCliCredential",
+            "principal_id": approval["approved_by"], "tenant_id": tenant, "subscription_id": subscription,
+        }
+        storage = {
+            "kind": "api_system_assigned", "credential": "ManagedIdentityCredential",
+            "principal_id": approval["identities"]["api_principal_id"], "tenant_id": tenant,
+        }
+        actual = receipt.get("analysis_identity")
+        if (packet.get("analysis_identity") != analysis or claim.get("analysis_identity") != analysis
+                or packet.get("storage_identity") != storage or claim.get("storage_identity") != storage
+                or receipt.get("storage_identity") != storage
+                or not isinstance(actual, dict) or set(actual) != set(analysis) | {
+                    "token_audience", "identity_checked_at", "sdk_token_identity_matched",
+                    "token_signature_validated_locally", "token_stored",
+                }
+                or any(actual.get(key) != expected for key, expected in analysis.items())
+                or actual["token_audience"] not in {
+                    "https://cognitiveservices.azure.com", "https://cognitiveservices.azure.com/"}
+                or actual["sdk_token_identity_matched"] is not True
+                or actual["token_signature_validated_locally"] is not False
+                or actual["token_stored"] is not False
+                or submitted.get("analysis_identity") != actual):
+            raise ValueError("Four-product PREP must retain operator DI and API-MI storage identity without token transfer")
+        provenance = receipt.get("input_provenance")
+        local = packet.get("local_pdf")
+        if (not isinstance(provenance, dict) or set(provenance) != {
+                "kind", "local_path", "blob_source", "sha256", "bytes", "blob_etag", "blob_verified_at",
+            } or not isinstance(local, dict)
+                or provenance["kind"] != "approved_local_copy_equal_to_verified_blob"
+                or provenance["blob_source"] != receipt["source"] or provenance["sha256"] != receipt["source_sha256"]
+                or provenance["local_path"] != local.get("path")
+                or not isinstance(provenance["local_path"], str) or not 1 <= len(provenance["local_path"]) <= 4096
+                or local.get("sha256") != receipt["source_sha256"]
+                or provenance["bytes"] != local.get("bytes") or provenance["bytes"] != receipt["source_bytes"]
+                or provenance["blob_etag"] != claim.get("source_etag")
+                or provenance["blob_etag"] != attempt.get("source_etag")
+                or not isinstance(provenance["blob_etag"], str)
+                or not re.fullmatch(r'["A-Za-z0-9_-]{1,256}', provenance["blob_etag"])
+                or provenance["blob_verified_at"] != claim.get("blob_verified_at")
+                or claim.get("source_sha256") != receipt["source_sha256"]
+                or claim.get("source_bytes") != receipt["source_bytes"]
+                or claim.get("reservation_id") != receipt["reservation_id"]
+                or claim.get("reserved_microdollars") != attempt["reserved_microdollars"]
+                or claim.get("readiness_clock_started") is not False):
+            raise ValueError("Four-product PREP local input must equal the API-verified approved blob")
+        if (set(program) != {"source", "sha256"} or not isinstance(program["source"], str)
+                or not 1 <= len(program["source"].encode()) <= 200000
+                or hashlib.sha256(program["source"].encode()).hexdigest() != program["sha256"]
+                or program["sha256"] != packet.get("storage_program_sha256")
+                or packet.get("history_hash_semantics") != "sha256_sorted_compact_ascii_json"
+                or attempt.get("historical_record_hash_semantics") != "sha256_sorted_compact_ascii_json"
+                or attempt.get("historical_record_sha256") != packet.get("history_sha256")
+                or packet.get("history_sha256", {}).get(BUDGET_KEY) != _sha256(before)
+                or packet["history_sha256"].get(APPROVAL_KEY) != _sha256(approval)):
+            raise ValueError("Four-product PREP storage-only program or canonical history pin changed")
+        charged = copy.deepcopy(before)
+        charged["attempted"] = ledger["attempted"]
+        charged["reserved"] = ledger["reserved"]
+        reservation = copy.deepcopy(ledger["reservations"][receipt["reservation_id"]])
+        reservation.pop("recorded_at", None)
+        reservation.update(actual_usage=None, estimated_usage_cost_microdollars=None,
+                           status="attempt_reserved_completion_unknown")
+        charged["reservations"][receipt["reservation_id"]] = reservation
+        if claim.get("reserved_ledger_canonical_sha256") != _sha256(charged):
+            raise ValueError("Four-product PREP must prove the append-only reservation preceded operator analysis")
+        timestamps = [_timestamp(stamp) for stamp in (
+            authorization["approved_at"], attempt["reserved_at"], provenance["blob_verified_at"],
+            receipt["started_at"], receipt["accepted_at"],
+            receipt["completed_at"], receipt["mapped_at"], self.four_product["capacity_approval"]["approved_at"],
+            self.four_product["readiness_at"],
+        )]
+        if timestamps != sorted(timestamps):
+            raise ValueError("PREP completion must precede measured capacity approval and readiness")
+        if not _timestamp(receipt["started_at"]) <= _timestamp(actual["identity_checked_at"]) <= _timestamp(receipt["completed_at"]):
+            raise ValueError("PREP SDK identity must be observed during the analysis operation")
+
+    def _four_product_states(self):
+        value, states, results = self.four_product, {}, {}
+        for item_key in value["selected_item_keys"]:
+            raw, version = self.store.read_bytes(f"items/{self.batch['id']}/{item_key}.json")
+            state = json.loads(raw)
+            if (_sha256(state) != value["item_sha256"][item_key]
+                    or state.get("state") not in {"partial_draft", "unresolved", "completed", "deferred"}):
+                raise ValueError("Four-product closed item history changed")
+            root, previous = f"results/{self.batch['id']}/{item_key}", state
+            for _ in range(32):
+                if not isinstance(previous, dict):
+                    raise ValueError("Four-product previous attempt is malformed")
+                target = previous.get("result_key") or root + ".json"
+                if not isinstance(target, str) or not (
+                        target == root + ".json" or re.fullmatch(
+                            re.escape(root) + r"/attempts/[a-f0-9]{64}\.json", target)):
+                    raise ValueError("Four-product history references an unrelated result")
+                try:
+                    results[target] = _sha256(read_json(self.store, target)[0])
+                except Missing:
+                    pass
+                previous = previous.get("previous_attempt")
+                if previous is None:
+                    break
+            else:
+                raise ValueError("Four-product previous attempts exceed the bound")
+            try:
+                self.store.read_bytes(f"{root}/attempts/{_sha256(value)}.json")
+            except Missing:
+                states[item_key] = raw, version
+                continue
+            raise Conflict("Four-product immutable result already exists; no retry")
+        if results != value["result_sha256"]:
+            raise ValueError("Four-product immutable result history changed")
+        return states
 
     def _gapfill(self, approval):
         try:
@@ -729,7 +1327,7 @@ class RealPilotGuard:
     def check_recovery_cache(self, key):
         if self.active_recovery is not None:
             raw, _ = self.store.read_bytes(key)
-            digest = _sha256(json.loads(raw)) if self.gapfill else hashlib.sha256(raw).hexdigest()
+            digest = _sha256(json.loads(raw)) if self.four_product or self.gapfill else hashlib.sha256(raw).hexdigest()
             if self.active_recovery["cached_documents"].get(key) != digest:
                 raise ValueError("Recovery parse cache is missing, changed or not approved")
 
@@ -761,6 +1359,32 @@ class RealPilotGuard:
 
     def verify_recovery(self, ledger):
         """Read-only preflight; no new allowance, recovery write or service call."""
+        if self.four_product is not None:
+            value = self.four_product
+            if (_sha256(ledger) != value["ledger_sha256"]
+                    or set(ledger["executions"]) != set(value["prior_execution_ids"])
+                    or {"executions": len(ledger["executions"]), "attempted": ledger["attempted"],
+                        "reserved": ledger["reserved"]} != value["baseline"]
+                    or ledger.get("row_rerun", {}).get("sha256") != value["prior_row_sha256"]
+                    or ledger.get("four_product") or ledger.get("gapfill")):
+                raise ValueError("Four-product continuation requires exact post-PREP consumption")
+            for key in (GAPFILL_KEY, GAPFILL_AUDIT_KEY, FOUR_PRODUCT_AUDIT_KEY):
+                try:
+                    self.store.read_bytes(key)
+                except Missing:
+                    continue
+                raise Conflict("Four-product prior or current authority already attempted; no retry")
+            for key, expected in value["historical_records"].items():
+                if _sha256(read_json(self.store, key)[0]) != expected:
+                    raise ValueError("Four-product pinned historical record changed")
+            if (value["historical_records"].get(value["prep_receipt_key"]) != value["prep_receipt_sha256"]
+                    or _sha256(read_json(self.store, value["prep_receipt_key"])[0]) != value["prep_receipt_sha256"]):
+                raise ValueError("Four-product completed PREP receipt changed")
+            for key in value["cached_documents"]:
+                self.check_recovery_cache(key)
+            self._verify_four_product_prep(ledger)
+            self._four_product_states()
+            return
         if self.gapfill is not None:
             value = self.gapfill
             if (_sha256(ledger) != value["ledger_sha256"]
@@ -842,6 +1466,30 @@ class RealPilotGuard:
             return
         with self._mutex, self.store.lease(BUDGET_KEY):
             _, ledger, _ = self._fresh_ledger()
+            if self.four_product is not None:
+                if ledger.get("four_product", {}).get("execution_id") != self._execution_id:
+                    raise Conflict("Four-product execution exception is not reserved")
+                states = self._four_product_states()
+                fence()
+                write_json(self.store, FOUR_PRODUCT_AUDIT_KEY, {
+                    "amendment": self.four_product, "amendment_sha256": self.recovery_sha256,
+                    "execution_id": self._execution_id, "recorded_at": _now().isoformat(),
+                    "prior_states": {
+                        key: {"base64": base64.b64encode(raw).decode(), "version": version}
+                        for key, (raw, version) in states.items()
+                    },
+                    "prior_result_sha256": self.four_product["result_sha256"],
+                    "prior_row_audit_sha256": self.four_product["prior_row_audit_sha256"],
+                    "prep_receipt_sha256": self.four_product["prep_receipt_sha256"],
+                })
+                for key, (raw, version) in states.items():
+                    fence()
+                    write_json(self.store, f"items/{self.batch['id']}/{key}.json", {
+                        "id": key, "batch_id": self.batch["id"], "state": "recovery_ready",
+                        "requested_mode": "real_pilot", "recovery_sha256": self.recovery_sha256,
+                        "result_key": self.result_key(key), "previous_attempt": json.loads(raw),
+                    }, version)
+                return
             if self.gapfill is not None:
                 if ledger.get("gapfill", {}).get("execution_id") != self._execution_id:
                     raise Conflict("Gapfill execution exception is not reserved")
@@ -983,6 +1631,7 @@ class RealPilotGuard:
         self.final_rerun = self._final_rerun(approval)
         self.row_rerun = self._row_rerun(approval)
         self.gapfill = self._gapfill(approval)
+        self.four_product = self._four_product(approval)
         window = self.active_recovery or approval
         original_start, original_end = _timestamp(approval["not_before"]), _timestamp(approval["expires_at"])
         if self.recovery is not None and not 0 < (original_end - original_start).total_seconds() <= 1200:
@@ -1011,14 +1660,16 @@ class RealPilotGuard:
             _price(price, allow_zero=name == "web_retrieval")
         self._validate_batch(approval)
         self._validate_environment(approval, verify_runtime=verify_runtime)
-        if self.gapfill:
-            from backend.core.websearch_policy import configured_optional_web_policy
+        public_continuation = self.four_product or self.gapfill
+        if public_continuation:
+            from backend.core.websearch_policy import OptionalWebPolicy, configured_optional_web_policy
 
             if verify_runtime:
                 policy = configured_optional_web_policy()
-                if (policy is None or policy.model_dump(mode="json") != self.gapfill["public_web_policy"]
-                        or any(os.environ.get(key) != value for key, value in self.gapfill["web_environment"].items())):
-                    raise ValueError("Gapfill runtime public policy or WebIQ endpoint changed")
+                expected_policy = OptionalWebPolicy.model_validate(public_continuation["public_web_policy"])
+                if (policy is None or policy.model_dump(mode="json") != expected_policy.model_dump(mode="json")
+                        or any(os.environ.get(key) != value for key, value in public_continuation["web_environment"].items())):
+                    raise ValueError("Continuation runtime public policy or WebIQ endpoint changed")
 
     def _validate_batch(self, approval):
         batch = self.batch
@@ -1069,7 +1720,7 @@ class RealPilotGuard:
         scope = approval_scope(approval)
         if scope == "internal_only" and set(expected) & EXTERNAL_ENVIRONMENT_KEYS:
             raise ValueError("Internal-only approval must omit external service environment settings")
-        runtime_scope = "full" if self.gapfill else scope
+        runtime_scope = "full" if self.four_product or self.gapfill else scope
         if verify_runtime and os.environ.get("DOCINTEL_REAL_PILOT_EXECUTION_SCOPE", runtime_scope) != runtime_scope:
             raise ValueError("Real-pilot runtime execution scope mismatch")
         required = {"AZURE_CLIENT_ID"}
@@ -1128,6 +1779,8 @@ class RealPilotGuard:
             raise ValueError("Row rerun changed after budget use")
         if ledger.get("gapfill") and ledger["gapfill"]["sha256"] != _sha256(self.gapfill):
             raise ValueError("Gapfill changed after budget use")
+        if ledger.get("four_product") and ledger["four_product"]["sha256"] != _sha256(self.four_product):
+            raise ValueError("Four-product continuation changed after budget use")
 
     def _fresh_ledger(self):
         try:
@@ -1165,7 +1818,22 @@ class RealPilotGuard:
                 "cost_basis": "approved_upper_bound_prices_not_actual_billing",
                 "executions": {}, "reservations": {},
             }
-        if self.gapfill:
+        if self.four_product:
+            approval = copy.deepcopy(approval)
+            value, capacity = self.four_product, self.four_product["capacity_approval"]
+            baseline = value["baseline"]
+            approval["execution_scope"] = "full"
+            approval["unit_prices_usd"].update(value["web_prices"])
+            approval["limits"].update(
+                inference=baseline["attempted"]["inference"] + capacity["max_requests"],
+                input_tokens=baseline["reserved"]["input_tokens"] + capacity["max_input_tokens"],
+                output_tokens=baseline["reserved"]["output_tokens"] + capacity["max_output_tokens"],
+                search=4, web_retrieval=6, retrieval=0,
+                analysis=baseline["attempted"]["analysis"],
+                analysis_pages=baseline["reserved"]["analysis_pages"],
+                spend_microdollars=baseline["reserved"]["microdollars"] + 5000000 - value["fixed_cost_microdollars"],
+            )
+        elif self.gapfill:
             approval = copy.deepcopy(approval)
             approval["execution_scope"] = "full"
             approval["unit_prices_usd"].update(self.gapfill["web_prices"])
@@ -1187,14 +1855,30 @@ class RealPilotGuard:
                 raise ValueError("Worker must explicitly select real_pilot mode")
             if key in ledger["executions"]:
                 raise Conflict("Real-pilot execution already attempted; no automatic retry")
-            limit = approval["limits"]["executions"] + bool(self.final_rerun) + bool(self.row_rerun) + bool(self.gapfill)
+            limit = (approval["limits"]["executions"] + bool(self.final_rerun)
+                     + bool(self.row_rerun) + bool(self.gapfill) + bool(self.four_product))
             if len(ledger["executions"]) >= limit:
                 raise ValueError("Real-pilot execution budget exhausted")
             self.verify_recovery(ledger)
             if self.final_rerun and (_timestamp(self.active_recovery["expires_at"]) - _now()).total_seconds() < 600:
                 raise ValueError("Final rerun requires the full 600-second execution window")
             ledger["executions"][key] = {"started_at": _now().isoformat()}
-            if self.gapfill is not None:
+            if self.four_product is not None:
+                ledger["four_product"] = {
+                    "sha256": self.recovery_sha256, "execution_id": key,
+                    "baseline_sha256": self.four_product["ledger_sha256"],
+                    "inference_before": ledger["attempted"]["inference"],
+                    "input_before": ledger["reserved"]["input_tokens"],
+                    "output_before": ledger["reserved"]["output_tokens"],
+                    "analysis_before": ledger["attempted"]["analysis"],
+                    "analysis_pages_before": ledger["reserved"]["analysis_pages"],
+                    "cost_before": ledger["reserved"]["microdollars"],
+                    "not_before": self.four_product["not_before"], "expires_at": self.four_product["expires_at"],
+                    "selected_item_keys": self.four_product["selected_item_keys"],
+                    "capacity_approval": self.four_product["capacity_approval"],
+                    "prep_receipt_sha256": self.four_product["prep_receipt_sha256"],
+                }
+            elif self.gapfill is not None:
                 ledger["gapfill"] = {
                     "sha256": self.recovery_sha256, "execution_id": key,
                     "baseline_sha256": self.gapfill["ledger_sha256"],
@@ -1292,14 +1976,16 @@ class RealPilotGuard:
             gapfill_tier = None
             if approval_scope(approval) == "internal_only" and operation in EXTERNAL_OPERATIONS:
                 raise ValueError("External operations are forbidden by internal-only approval")
-            if self.gapfill is not None:
-                if operation not in {"inference", "search", "web_retrieval"} or item_key not in self.gapfill["selected_item_keys"]:
+            continuation = self.four_product or self.gapfill
+            if continuation is not None:
+                if operation not in {"inference", "search", "web_retrieval"} or item_key not in continuation["selected_item_keys"]:
                     raise ValueError("Gapfill forbids analysis, internal retrieval and other products")
                 previous = [entry for entry in ledger["reservations"].values()
                             if entry["execution_id"] == self._execution_id and entry["item_key"] == item_key]
                 counts = {name: sum(entry["operation"] == name for entry in previous)
                           for name in ("inference", "search", "web_retrieval")}
-                maximum = {"inference": 3, "search": 1, "web_retrieval": 2}[operation]
+                page_limit = self.four_product["page_limits"][item_key] if self.four_product else 2
+                maximum = {"inference": 3, "search": 1, "web_retrieval": page_limit}[operation]
                 if counts[operation] >= maximum:
                     raise RealPilotBudgetExceeded("gapfill_item_" + operation, 1, 0)
                 if operation == "inference":
@@ -1329,7 +2015,7 @@ class RealPilotGuard:
             if key in ledger["reservations"]:
                 raise Conflict("Real-pilot operation already attempted; no automatic retry")
             limits = dict(approval["limits"])
-            if self.row_rerun is not None and self.gapfill is None:
+            if self.row_rerun is not None and continuation is None:
                 limits["input_tokens"] = self.row_rerun["effective_input_ceiling"]
                 available_output = self.row_rerun["max_output_tokens"] - (
                     ledger["reserved"]["output_tokens"] - ledger["row_rerun"]["output_before"]
@@ -1421,4 +2107,6 @@ class RealPilotGuard:
             output["row_rerun"] = ledger["row_rerun"]
         if ledger.get("gapfill"):
             output["gapfill"] = ledger["gapfill"]
+        if ledger.get("four_product"):
+            output["four_product"] = ledger["four_product"]
         return copy.deepcopy(output)
