@@ -1,26 +1,27 @@
 # Root-level .dockerignore
 # Backend remote build uses the repository root; frontend uses frontend/.
+# Omit directory trailing slashes: Azure CLI 2.77 matches unsuffixed tar names.
 
 # Agent / IDE tooling metadata (may contain broken symlinks that break remote build)
-.claude/
-.agents/
+.claude
+.agents
 .github/copilot-instructions.md
-.vscode/
-.idea/
+.vscode
+.idea
 
 # Git and CI
-.git/
+.git
 .gitignore
-.github/
+.github
 
 # Docs and samples not needed at build time
 *.md
-notebooks/
-tests/
-docs/
-output/
-tools/
-scripts/
+notebooks
+tests
+docs
+output
+tools
+scripts
 run.sh
 
 # Env and secrets
@@ -29,34 +30,44 @@ run.sh
 !.env.example
 **/.env
 **/.env.*
+*.xlsx
+*.xlsm
+*.pdf
+*.sqlite3
+*.sqlite3-*
 **/*.xlsx
 **/*.xlsm
 **/*.pdf
 **/*.sqlite3
 **/*.sqlite3-*
-.memories/
-frontend/
+.memories
+frontend
 
 # Python
-__pycache__/
+__pycache__
+**/__pycache__
 *.py[cod]
 *.pyo
-.pytest_cache/
-.cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-env/
-*.egg-info/
-build/
-dist/
+.pytest_cache
+.cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+env
+*.egg-info
+build
+dist
 
 # Node / frontend build artifacts (frontend Dockerfile handles its own install)
-**/node_modules/
-**/.next/
-**/out/
-**/coverage/
+node_modules
+.next
+out
+coverage
+**/node_modules
+**/.next
+**/out
+**/coverage
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -66,4 +77,4 @@ yarn-error.log*
 Thumbs.db
 
 # Azure / azd local state
-.azure/
+.azure

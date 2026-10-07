@@ -319,6 +319,19 @@ def test_export_authenticates_first_and_does_not_replace_export_on_failure(invok
         assert "partial output is retained" in result.stderr
 
 
+def test_context_exclusions_match_native_azure_directory_tar_names():
+    rules = {
+        line for line in (ROOT / ".dockerignore").read_text().splitlines()
+        if line and not line.startswith("#")
+    }
+    assert not any(rule.endswith("/") for rule in rules)
+    assert {
+        ".git", ".venv", ".vscode", ".claude", "output", "tools", "scripts",
+        "frontend", ".azure", ".env", "**/.env", "*.xlsx", "**/*.xlsx",
+        "*.pdf", "**/*.pdf", "node_modules", "**/node_modules",
+    } <= rules
+
+
 def test_live_commands_and_workflows_do_not_load_archived_operators():
     live = "\n".join(path.read_text() for path in [
         ROOT / "run.sh", ROOT / "scripts/operations.sh", ROOT / "scripts/container_smoke.py",
