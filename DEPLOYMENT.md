@@ -1458,7 +1458,7 @@ separate, schema-backed isolation operation has been reviewed. Ordinary
 schema-valid updates and processing closure do not need that operation.
 The credential-bearing `gap.secure_worker_patch(...)` independently validates
 before reading the existing key and validates the completed in-memory body before
-obtaining a management token or invoking curl. Errors contain only fixed reason
+obtaining a management token or invoking the dedicated native HTTP transport. Errors contain only fixed reason
 codes, not failing instance values, arbitrary property names, keys, tokens, URLs,
 or raw validator diagnostics.
 
@@ -1483,6 +1483,112 @@ credential reader or arbitrary credential supplier is introduced.
 The transport writes no receipts and needs no filename factory;
 the caller must own its new scope's intent reservation, empty-secret-store and
 identity checks, immutable outcome records, read-back verification and closure.
+
+## Native request construction — no-send release blocker
+
+Before an actual publication, resource update, or execution start/stop, the helper
+constructs the **exact installed client's request with transport disabled**.
+Schema validation alone, CLI help output, and mocked argument lists are not
+substitutes. No-send evidence is construction evidence, not observed Azure
+authorization, resource freshness, upload metadata, or successful service results.
+
+`action-provenance.json` pins four additional official files at the same source
+commit: ACR `2019-04-01`, Jobs and common definitions `2025-01-01`, and Blob
+`2024-08-04`. Their derived contracts regenerate into the existing artifact:
+
+| Operation | Required request |
+| --- | --- |
+| `Registries_GetBuildSourceUploadUrl` | POST, no body |
+| `Registries_ScheduleRun` | The official `DockerBuildRequest` discriminator variant; exactly two CPU and 900 seconds |
+| `Jobs_Start` | POST, the original execution template validated before native deserialization |
+| `Jobs_StopExecution` | POST `/jobs/{job}/executions/{execution}/stop`, no body |
+| `BlockBlob_Upload` | Binary PUT, actual archive length, `BlockBlob`, `application/octet-stream`, explicit `x-ms-version: 2024-08-04` |
+
+The Azure CLI's real parser, command handler, serializer and prepared request run
+in its installed Python runtime. HOME/config/extensions are isolated in an
+owner-only project-local directory, token/subscription data are explicitly
+synthetic, and every socket is denied. A supplied job snapshot answers only the
+native start handler's matching GET; the matching outgoing write is intercepted
+before `Session.send` can use a network transport. Original and serialized
+bodies must compare structurally; coercion or dropped properties cannot rescue
+an invalid original body. Unknown writes, mismatched versions/routes, unsupported
+CLI launchers, and unmodeled bootstrap/provisioning commands fail closed.
+Deployment receipts retain their existing `status`/`no_send` fields and add
+`validation_status: validated_no_send`, package versions, exact wire-byte
+body/endpoint/request fingerprints, byte counts, and no-send counters.
+The top-level request hash covers method + newline + exact URL + newline + exact
+body bytes; the legacy nested request-body hash is explicitly labeled
+`canonical-json` and remains separate from wire-byte evidence.
+CLI capture truthfully declares synthetic response fixtures, including its
+matching GET snapshot and synthetic write response. These are never actual
+provider outcomes. Dedicated Requests no-send prepares without response fixtures.
+The provider/DI receipt schemas are separate and are not imported or extended.
+
+Installed CLI 2.77.0 uses Jobs API `2025-01-01` for native start. Its native
+specific-execution stop route differs from the official operation; the wrapper
+therefore constructs the schema-backed canonical REST stop, never the legacy
+`/jobs/{job}/stop/{execution}` route. No new stop scope is authorized.
+
+The two formerly curl-based paths (binary build-source upload and existing-key
+job PATCH) use the installed CLI runtime's Requests client. Both no-send and live
+paths use the same `Request`/`Session.prepare_request`, validated prepared URL,
+headers and body, with zero adapter retries, no redirects, and no environment
+proxies/netrc. The live path validates again before its single send. SAS, keys,
+tokens and bodies travel through stdin, never argv or diagnostic output. Blob
+bytes stream from the retained archive. The subprocess has the original hard
+time bound; an unknown outcome never permits retry. No package/lock change is
+needed. Historical `curl_returncode` diagnostic fields remain present with null
+for the replacement transport; HTTP status remains available.
+
+For readiness from already captured resources, without service or key reads:
+
+```python
+receipt = release.preflight_deployment(
+    config, captured_api, captured_worker, exact_execution_template,
+    api_payload=exact_api_patch, worker_payload=exact_worker_patch,
+    publication=exact_build_body_if_already_available,
+)
+```
+
+Optional payloads otherwise use the existing write builders on copies.
+Build a copied override with `release.writable_execution_template(template)`
+after applying the approved command/environment changes. The action schema
+allows only containers/initContainers: existing job volume definitions stay on
+the job, not in the execution override; optional GET nulls and read-only container
+members are projected using the pinned schema. Other unknown members still fail.
+Unavailable dynamic upload metadata/archive/build bodies remain explicitly
+pending; the actual upload and queue boundaries always preflight their exact
+later inputs. The callable writes no operational receipts and cannot activate,
+reserve, upload, deploy, or start anything.
+
+`release.azure(..., resource_snapshot=current_job)` is required for native
+`containerapp job start --subscription ... -g ... -n ... --yaml ...`. Both
+`release.azure` and `upload_publication_context` accept `before_send=callback`;
+operators use their existing clock callback to recheck the full allowance **after**
+no-send construction, immediately before submission. Gapfill and publication
+paths compose those callbacks without moving clocks or replacing reservations.
+The existing-key transport retains its required `check_window` interface.
+
+For durable, decision-bound construction evidence, supply
+`on_preflight(receipt)` to `release.azure`, `release.execute_publication`,
+`release.upload_publication_context`, or `gap.send_existing_secret_patch`
+(also supported by its compatibility wrapper). The synchronous callback receives
+only a deep-copied, safe metadata receipt, never the request body, key, token,
+raw URL, or raw headers. It must finish its owner-controlled append-only receipt
+write before returning. Bind the evidence to the existing decision/request
+context; do not create another approval or reservation.
+
+The callback runs after successful native construction and before the final
+clock check/send. A callback failure stops submission with a sanitized error;
+it does not refund prior attempts or permit retry. Existing live return values
+are unchanged. `operation_stage` distinguishes `azure_write`,
+`publication_upload_metadata`, `binary_source_upload`,
+`publication_schedule_run`, `worker_secret_redacted`, and
+`worker_secret_credential_bound`. Publication forwards the callback to the actual
+dynamic requests. Secret binding emits one proof before key/token access and a
+second proof for the completed in-memory request; even the latter contains only
+safe fingerprints and metadata. The shared helpers never choose receipt paths,
+write authority records, or start a readiness clock.
 Neither a no-op callback nor an old approval is an authorization substitute.
 Do not invoke this transport from local `prepare`/`check`; pure builders and
 validators never read credentials.
