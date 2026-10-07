@@ -939,6 +939,29 @@ def verify_running_source(revision):
     require(not untracked, "Uncommitted app/operator files cannot pass publication source verification")
 
 
+def operator_revision(work, decision):
+    selected = path(work, "operator-source")
+    if not selected.exists():
+        return decision["source_revision"]
+    value = release.private_json(selected)
+    require(set(value) == {"decision_sha256", "source_review", "ci", "publication_sha256", "deployment_attempt_sha256"}
+            and value["decision_sha256"] == sha(decision)
+            and value["publication_sha256"] == sha(receipt(work, "published", decision))
+            and value["deployment_attempt_sha256"] == sha(receipt(work, "deploy-attempt", decision)),
+            "Operator correction must retain the original decision, publication and deployment attempt")
+    review, ci = value["source_review"], value["ci"]
+    require(review["base_revision"] == decision["source_revision"]
+            and set(review["files"]) <= {
+                "scripts/four_product_continuation.py", "tests/test_four_product_continuation.py",
+                "docs/FOUR_PRODUCT_CONTINUATION.md",
+            }, "Only the reviewed deployment operator correction may differ from the published application")
+    source_boundary(review["revision"], review)
+    require(ci.get("revision") == review["revision"] and ci.get("merged") is True
+            and ci.get("base") == "main" and ci.get("checks") == row.CI_CHECKS,
+            "The deployment operator correction requires exact merged CI")
+    return review["revision"]
+
+
 def history(work):
     retained = {}
     for candidate in sorted(work.rglob("*.json")):
@@ -1034,7 +1057,7 @@ def validate(work, config, decision):
             and baseline["existing_role_evidence_sha256"] == sha(role_evidence)
             and baseline["approval_sha256"] == sha(approval), "Source/target/approval baseline changed")
     source_boundary(decision["source_revision"], baseline["source_review"])
-    verify_running_source(decision["source_revision"])
+    verify_running_source(operator_revision(work, decision))
     child = source_work(work)
     require(not child.is_symlink() and child.resolve() == child
             and release.verify_source(child)["revision"] == decision["source_revision"],
@@ -1381,20 +1404,36 @@ def patch(work, config, decision, label, resource, containers, *, job=False, bin
             sleep(5)
 
 
-def deploy(work, config, decision):
+def deploy(work, config, decision, *, continue_before_write=False):
     with release.pilot_lock(work), live(work, decision, "overall", 600):
         approval, previous = validate(work, config, decision)
         current = current_config(work, config, decision)
-        require(not path(work, "deploy-attempt").exists(), "Deployment already attempted")
         backend, frontend, job = mixed_resources(previous, approval)
         release.require_real_pilot_off(backend)
         gap.credential_binding(job, decision, allow_install=True)
         remote_snapshot(work, previous, decision, approval)
-        release.save_once(path(work, "deploy-attempt"), {
+        captured = {
             **binding(decision), "backend": prior.shape(backend), "frontend": prior.shape(frontend), "worker": prior.shape(job),
-        })
+        }
+        if continue_before_write:
+            require(path(work, "operator-source").exists()
+                    and receipt(work, "deploy-attempt", decision) == captured,
+                    "Pre-write continuation requires the reviewed correction and unchanged original resources")
+            require(not any(path(work, name).exists() for name in (
+                "deploy-backend-patch", "deploy-worker-patch", "credential-binding", "deployed",
+            )) and not list(work.glob(PREFIX + "-deploy-*-preflight.json")),
+                    "A submitted or outcome-unknown deployment cannot be retried")
+            release.save_once(path(work, "deployment-continuation-attempt"), {
+                **binding(decision), "original_attempt_sha256": sha(captured),
+                "operator_source_sha256": digest_file(path(work, "operator-source")),
+                "readiness_sha256": sha(receipt(work, "readiness", decision)),
+                "reason": "canonical_container_projection_failed_before_any_write",
+            })
+        else:
+            require(not path(work, "deploy-attempt").exists(), "Deployment already attempted")
+            release.save_once(path(work, "deploy-attempt"), captured)
         for label, resource, is_job in (("backend", backend, False), ("worker", job, True)):
-            containers = release.safe_containers(resource)
+            containers = release.writable_containers(release.safe_containers(resource))
             containers[0]["image"] = current["backend_image"]
             secret = (decision["webiq_secret_ref"] if is_job and decision["credential_source"] == "owner_env_file"
                       and not resource["properties"]["configuration"].get("secrets") else None)
@@ -1412,6 +1451,10 @@ def deploy(work, config, decision):
         release.save_once(path(work, "deployed"), {
             **binding(decision), "both_ready_at": anchor.isoformat(), "processing_expires_at": end.isoformat(),
         })
+
+
+def continue_deploy(work, config, decision):
+    return deploy(work, config, decision, continue_before_write=True)
 
 
 def amendment(work, decision):
@@ -1719,7 +1762,7 @@ def activate(work, config, decision):
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "stage", "check", "ready", "publish", "deploy", "activate", "close"))
+    parser.add_argument("action", choices=("prepare", "stage", "check", "ready", "publish", "deploy", "continue-deploy", "activate", "close"))
     parser.add_argument("--work", type=Path)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--revision")
@@ -1741,7 +1784,7 @@ def main():
             validate(work, config, decision)
         else:
             require(options.approve == options.action, "Explicit bounded action approval required")
-            globals()[options.action](work, config, decision)
+            globals()[options.action.replace("-", "_")](work, config, decision)
     print("Four-product action confirmed; retained approvals, attempts and charges preserved.")
 
 

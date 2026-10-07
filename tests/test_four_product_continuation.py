@@ -1271,6 +1271,101 @@ def test_expiry_stop_retains_proof_for_only_the_reserved_execution(tmp_path, mon
         helper.observe(tmp_path, config, decision)
 
 
+@pytest.mark.parametrize("continuation,blocked", [(False, None), (True, None), (True, "deploy-backend-patch"), (True, "deployment-continuation-attempt")])
+def test_deploy_projects_native_container_discriminator_and_only_continues_before_write(tmp_path, monkeypatch, continuation, blocked):
+    from contextlib import nullcontext
+    from scripts import azure_write_schema
+
+    decision = {"target": "synthetic", "credential_source": "existing_job_secret", "webiq_secret_ref": "existing"}
+    resources = [{
+        "id": f"/subscriptions/sub/resourceGroups/group/providers/Microsoft.App/{kind}/{name}",
+        "location": "eastus", "properties": {
+            "configuration": {"secrets": [{"name": "existing"}]},
+            "template": {"containers": [{
+                "name": name, "image": "synthetic@sha256:" + "a" * 64, "imageType": "ContainerImage",
+                "resources": {"cpu": 1, "memory": "2Gi"},
+            }]},
+        },
+    } for name, kind in (("backend", "containerApps"), ("frontend", "containerApps"), ("worker", "jobs"))]
+    before = copy.deepcopy(resources)
+    current = {"backend_image": "synthetic@sha256:" + "b" * 64}
+    monkeypatch.setattr(helper.release, "private_path", lambda value: value)
+    monkeypatch.setattr(helper, "live", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(helper, "validate", lambda *a: ({}, {}))
+    monkeypatch.setattr(helper, "current_config", lambda *a: current)
+    monkeypatch.setattr(helper, "mixed_resources", lambda *a: tuple(resources))
+    monkeypatch.setattr(helper.release, "require_real_pilot_off", lambda *a: None)
+    monkeypatch.setattr(helper.gap, "credential_binding", lambda *a, **k: None)
+    monkeypatch.setattr(helper, "remote_snapshot", lambda *a: None)
+    end = (helper.now() + timedelta(seconds=5400)).isoformat()
+    monkeypatch.setattr(helper, "window", lambda *a, **k: {"overall_expires_at": end})
+    calls = []
+
+    def patch(work, config, supplied, label, resource, containers, *, job, bind_existing_secret):
+        assert supplied == decision and bind_existing_secret is None
+        assert resource["properties"]["template"]["containers"][0]["imageType"] == "ContainerImage"
+        assert "imageType" not in containers[0] and containers[0]["image"] == current["backend_image"]
+        kind = "jobs" if job else "containerApps"
+        azure_write_schema.build_payload(kind, "PATCH", properties={"template": {"containers": containers}},
+                                         **({} if job else {"location": "eastus"}))
+        calls.append(label)
+        resource["properties"]["template"]["containers"][0]["image"] = current["backend_image"]
+
+    monkeypatch.setattr(helper, "patch", patch)
+    captured = {**helper.binding(decision), **{
+        name: helper.prior.shape(resource) for name, resource in zip(("backend", "frontend", "worker"), before)
+    }}
+    if continuation:
+        helper.release.save_once(helper.path(tmp_path, "deploy-attempt"), captured)
+        helper.release.save_once(helper.path(tmp_path, "operator-source"), {"reviewed": "synthetic"})
+        helper.release.save_once(helper.path(tmp_path, "readiness"), helper.binding(decision))
+    if blocked:
+        helper.release.save_once(helper.path(tmp_path, blocked), {"consumed": True})
+        with pytest.raises((ValueError, FileExistsError)):
+            helper.continue_deploy(tmp_path, {}, decision)
+        assert not calls and not helper.path(tmp_path, "deployed").exists()
+        return
+    operation = helper.continue_deploy if continuation else helper.deploy
+    operation(tmp_path, {}, decision)
+    assert calls == ["deploy-backend", "deploy-worker"] and resources[1] == before[1]
+    assert helper.receipt(tmp_path, "deploy-attempt", decision) == captured
+    deployed = helper.receipt(tmp_path, "deployed", decision)
+    assert helper.instant(deployed["processing_expires_at"]) - helper.instant(deployed["both_ready_at"]) == timedelta(seconds=1200)
+    if continuation:
+        assert helper.receipt(tmp_path, "deployment-continuation-attempt", decision)["original_attempt_sha256"] == helper.sha(captured)
+
+
+@pytest.mark.parametrize("invalid", [None, "application", "decision", "ci", "publication"])
+def test_operator_source_review_cannot_change_published_application_or_authority(tmp_path, monkeypatch, invalid):
+    decision = {"target": "synthetic", "source_revision": "a" * 40}
+    assert helper.operator_revision(tmp_path, decision) == decision["source_revision"]
+    for name in ("published", "deploy-attempt"):
+        helper.release.save_once(helper.path(tmp_path, name), helper.binding(decision))
+    review = {"base_revision": "a" * 40, "revision": "b" * 40,
+              "files": {"scripts/four_product_continuation.py": "c" * 64}}
+    value = {
+        "decision_sha256": helper.sha(decision), "source_review": review,
+        "ci": {"revision": "b" * 40, "merged": True, "base": "main", "checks": helper.row.CI_CHECKS},
+        "publication_sha256": helper.sha(helper.receipt(tmp_path, "published", decision)),
+        "deployment_attempt_sha256": helper.sha(helper.receipt(tmp_path, "deploy-attempt", decision)),
+    }
+    if invalid == "application":
+        review["files"]["backend/batch_worker.py"] = "d" * 64
+    elif invalid == "decision":
+        value["decision_sha256"] = "e" * 64
+    elif invalid == "ci":
+        value["ci"]["merged"] = False
+    elif invalid == "publication":
+        value["publication_sha256"] = "f" * 64
+    helper.release.save_once(helper.path(tmp_path, "operator-source"), value)
+    monkeypatch.setattr(helper, "source_boundary", lambda revision, supplied: review)
+    if invalid:
+        with pytest.raises(ValueError):
+            helper.operator_revision(tmp_path, decision)
+    else:
+        assert helper.operator_revision(tmp_path, decision) == "b" * 40
+
+
 def test_operator_write_reuses_authoritative_schema_before_transport(tmp_path, monkeypatch):
     from contextlib import nullcontext
     from scripts import azure_write_schema
