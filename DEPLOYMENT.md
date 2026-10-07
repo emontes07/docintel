@@ -59,6 +59,8 @@ uses existing Azure administrative app-exec permission, native `az containerapp
 exec`, and system `script` for its terminal. It calls `BatchService.export` for
 that batch/owner, decodes the workbook with the local `.venv` Python, and preserves
 a uniquely named console diagnostic log with mode `0600`, including failures.
+The command uses double-quoted Python code; the native console treats surrounding
+single quotes literally.
 These logs are not authority receipts; list deletion candidates and ask before
 removing any. It adds no grant or endpoint and is not a
 claim of end-user API authentication; perform that smoke with the genuine

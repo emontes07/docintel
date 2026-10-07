@@ -2,10 +2,8 @@
 
 import base64
 from io import BytesIO
-import json
 from pathlib import Path
 import re
-import shlex
 import sys
 import zipfile
 
@@ -15,13 +13,17 @@ END = "DOCINTEL_WORKBOOK_END"
 
 
 def export_command(batch_id, owner):
+    def literal(value):
+        escaped = value.encode("unicode_escape").decode("ascii")
+        return "'" + escaped.replace("'", "\\'").replace('"', "\\x22") + "'"
+
     code = (
         "import base64; from backend.batch import BatchService; "
         "from backend.batch_store import configured_store; "
-        f"data=BatchService(configured_store()).export({json.dumps(batch_id)},{json.dumps(owner)}); "
+        f"data=BatchService(configured_store()).export({literal(batch_id)},{literal(owner)}); "
         f"print({BEGIN!r}); print(base64.b64encode(data).decode('ascii')); print({END!r})"
     )
-    return shlex.join(["/app/.venv/bin/python", "-c", code])
+    return '/app/.venv/bin/python -c "' + code + '"'
 
 
 def decode_export(transcript, destination):

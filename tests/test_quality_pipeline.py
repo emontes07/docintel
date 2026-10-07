@@ -546,7 +546,7 @@ def test_legacy_candidates_and_results_keep_defaults():
     assert candidate.origin == "model_generated" and candidate.judge_status == "not_judged"
 
 
-def seed_smoke_store(cell_value="Lockwing"):
+def seed_smoke_store(cell_value="Lockwing", head_description=None):
     store, items = seed_store(1)
     item = items[0]
     current = manifest([
@@ -561,6 +561,8 @@ def seed_smoke_store(cell_value="Lockwing"):
     item["sources"][0]["products"] = [current.product.model_dump()]
     headers = ["MPN", *[f"Field {index}" for index in range(2, 20)], "Operating Head Style"]
     rows = [headers, *[[f"OTHER-{index}"] for index in range(1094)], [current.product.mpn, *([""] * 18), cell_value]]
+    if head_description is not None:
+        rows[-1][17] = head_description
     workbook = write_workbook({"Vendor": rows})
     store.write_bytes("documents/mueller.xlsx", workbook)
     item["sources"].append({
@@ -625,6 +627,41 @@ def test_wrong_smoke_answer_fails_visibly_before_full_processing(smoke_only, smo
     assert summary["smoke"]["observed_candidates"][0]["value"] == "Tee"
     assert summary["model_calls"] == 1 and not store.keys("results/")
     assert read_json(store, "items/batch/row-2.json")[0]["state"] == "failed"
+
+
+def test_grounded_live_canary_disagreement_continues_to_full_extraction_and_judge():
+    quote = "FLAT HEAD  INDICATING ARROW  DRILLED FOR WIRE SEAL"
+    store = seed_smoke_store(head_description=quote)
+
+    class Disagreeing(Completion):
+        def complete_structured(self, system, user, schema, **kwargs):
+            packet = json.loads(user)
+            if schema == QualityExtraction:
+                if packet.get("smoke_target"):
+                    row = next(entry for entry in packet["evidence"] if entry["source_tier"] == "vendor_table")
+                    self.responses.append([proposal(
+                        attribute_id="Operating Head Style", value="Flat Head", supporting_quote=quote,
+                        evidence_ids=[row["citation_id"]],
+                        reviewer_explanation="Review head shape separately from the Lockwing feature.",
+                    )])
+                else:
+                    self.responses.append([])
+            return super().complete_structured(system, user, schema, **kwargs)
+
+    client = Disagreeing()
+    summary = run_quality_batch(store, "batch", "owner", "disagreement", completion=client, smoke_first=True)
+    assert summary["state"] == "completed" and len(summary["products"]) == 1
+    smoke = summary["smoke"]
+    assert smoke["status"] == "disagreed_with_expectation" and smoke["value"] == "Flat Head"
+    assert smoke["source_cells"] == ["R1096"]
+    assert smoke["expected_source"]["value"] == "Lockwing"
+    assert smoke["expected_source"]["source_cells"] == ["T1096"]
+    result = BatchService(store).detail("batch", "row-2", "owner")["machine_result"]
+    head = next(attribute for attribute in result["attributes"] if attribute["attribute_id"] == "Operating Head Style")
+    assert head["candidates"][0]["value"] == "Flat Head"
+    assert head["candidates"][0]["judge_status"] == "accepted"
+    assert "Review head style versus locking feature" in head["candidates"][0]["qualification"]
+    assert sum(entry["tier"] == "vendor_table" for entry in summary["usage"]) == 3
 
 
 def test_smoke_first_processes_all_four_in_one_execution_and_reuses_vendor_call():

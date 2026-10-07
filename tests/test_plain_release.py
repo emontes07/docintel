@@ -7,7 +7,6 @@ from io import BytesIO
 import os
 from pathlib import Path
 import shutil
-import shlex
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -224,11 +223,14 @@ def test_missing_cookie_file_fails_without_http_or_falling_back_to_bearer(invoke
     assert result.returncode == 2 and calls == []
 
 
-def test_native_console_command_keeps_identifiers_as_data():
-    owner = 'owner"); print("not-code'
-    arguments = shlex.split(console_export.export_command("batch-001", owner))
-    assert arguments[:2] == ["/app/.venv/bin/python", "-c"]
-    tree = ast.parse(arguments[2])
+@pytest.mark.parametrize("owner", ['owner"); print("not-code', "owner'); print('not-code", "tenant\\owner\nname", "tenant/é"])
+def test_native_console_command_keeps_identifiers_as_data(owner):
+    command = console_export.export_command("batch-001", owner)
+    prefix = '/app/.venv/bin/python -c "'
+    assert command.startswith(prefix) and command.endswith('"')
+    code = command[len(prefix):-1]
+    assert '"' not in code
+    tree = ast.parse(code)
     data = next(statement for statement in tree.body if isinstance(statement, ast.Assign))
     assert [ast.literal_eval(argument) for argument in data.value.args] == ["batch-001", owner]
 

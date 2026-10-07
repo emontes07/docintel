@@ -130,6 +130,10 @@ default first step checks Mueller Operating Head Style against the vendor row,
 then processes all products in the same execution. `QUALITY_SMOKE_ONLY=true`
 selects just that check; `QUALITY_SMOKE_FIRST=false` omits it on a subsequent run.
 The original Ford PDF page is rendered in memory and supplied alongside its text.
+The canary records its expected Lockwing/T1096 observation separately from the
+model's interpretation. A different but grounded answer is retained with a review
+qualification and continues to full extraction/judgment, rather than becoming an
+additional readiness gate. Ungrounded responses and provider errors remain explicit.
 
 Each product/tier packet contains the manifest, all attribute definitions and
 product-scoped evidence. Catalog rows are selected by the model/part-number column,
