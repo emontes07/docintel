@@ -53,6 +53,15 @@ def evidence(text="Body: BRASS.", tier="internal_pdf", key="e1"):
     )
 
 
+def model_packet(user, kwargs):
+    packet = json.loads(user)
+    if kwargs.get("cache_prefix"):
+        prefix = json.loads(kwargs["cache_prefix"])
+        packet["definitions"] = prefix["definitions"]
+        packet["evidence"] = prefix["shared_source_documents"] + packet["evidence"]
+    return packet
+
+
 class Completion:
     effort = "medium"
 
@@ -63,7 +72,7 @@ class Completion:
         self.disputed = disputed
 
     def complete_structured(self, system, user, schema, **kwargs):
-        packet = json.loads(user)
+        packet = model_packet(user, kwargs)
         self.calls.append((schema, packet, kwargs))
         self.last_usage = {"model": "quality-model", "input_tokens": 100, "output_tokens": 30,
                            "reasoning_tokens": 10, "cached_input_tokens": 0, "cost_usd": 0.001}
@@ -88,6 +97,16 @@ def test_missing_pressure_candidate_is_not_described_as_a_found_value():
     status, action = reviewer_status(result.attributes[0], result)
     assert status == "Definition needs clarification"
     assert "no verified candidate was found" in action.lower()
+
+
+def test_reviewer_confidence_is_separate_from_model_probability():
+    exact = evidence("Part number: AV11-333W-NL. Body: BRASS.")
+    result = run_product(manifest(), [exact], Completion([[proposal(confidence=0.01)]]), run_id="confidence")
+    sheets = read_workbook(build_reviewer_package([result]).workbook)
+    assert sheets["Review"][0]["Confidence"] == "High"
+    assert sheets["Evidence"][0]["Confidence"] == "High"
+    assert result.attributes[0].candidates[0].confidence == 0.01
+    assert sheets["Review"][0]["Decision"] == ""
 
 
 def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdicts():
@@ -118,7 +137,7 @@ def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdi
     assert packet["unresolved_attributes"] == ["Primary Material"]
     assert "prior_tier_review" not in packet
     assert len(packet["evidence"]) == 2
-    assert len(client.calls) == 4
+    assert len(client.calls) == 6
     assert [candidate.judge_status for candidate in result.attributes[0].candidates] == [
         "judge_disputed", "accepted",
     ]
@@ -126,17 +145,18 @@ def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdi
                if schema == QualityJudgment)
 
 
-def test_three_call_bound_judges_both_passes_and_retains_disagreement():
+def test_disputed_verdicts_receive_three_votes_after_both_extraction_passes():
     definitions = manifest().attributes + [AttributeDefinition(attribute_id="Valve Type", description="", value_type="string")]
     client = Completion([[proposal()], [proposal(attribute_id="Valve Type", value="angle valve", supporting_quote="angle valve")]], disputed=True)
     result = run_product(manifest(definitions), [evidence("Body: BRASS. Angle valve.")], client, run_id="r")
-    assert [schema for schema, _, _ in client.calls] == [QualityExtraction, QualityExtraction, QualityJudgment]
+    assert [schema for schema, _, _ in client.calls] == [QualityExtraction, QualityExtraction, *[QualityJudgment] * 3]
     assert client.calls[-1][2]["reasoning_effort"] == "low"
     assert len(client.calls[-1][1]["candidates"]) == 2
     assert all(a.candidates[0].judge_status == "judge_disputed" for a in result.attributes)
     assert all(a.reviewer_explanation for a in result.attributes)
-    assert len(result.quality_diagnostics) == 3
-    assert all(call["run_id"] == "r" and call["call_id"] for call in result.quality_diagnostics)
+    model_calls = [call for call in result.quality_diagnostics if call["operation"] == "model"]
+    assert len(model_calls) == 5
+    assert all(call["run_id"] == "r" and call["call_id"] for call in model_calls)
 
 
 def test_second_pass_reasks_material_using_already_cited_brass_and_nl_paragraphs():
@@ -410,15 +430,15 @@ def test_four_product_worker_appends_attempts_preserves_history_and_persists_usa
     old = dict(store.data)
     client = Completion()
     def answer(system, user, schema, **kwargs):
-        packet = json.loads(user)
+        packet = model_packet(user, kwargs)
         if schema == QualityExtraction:
             client.responses.append([proposal(evidence_ids=[packet["evidence"][0]["evidence_id"]])])
         return Completion.complete_structured(client, system, user, schema, **kwargs)
     client.complete_structured = answer
     summary = run_quality_batch(store, "batch", "owner", "first", completion=client, execution_id="first-execution")
-    assert len(summary["products"]) == 4 and summary["model_calls"] == 8
+    assert len(summary["products"]) == 4 and summary["model_calls"] == 5
     assert summary["new_di_calls"] == 0
-    assert len(store.keys("quality-runs/batch/first/usage/")) == 8
+    assert len(store.keys("quality-runs/batch/first/usage/")) == 5
     for item in items:
         key = "items/batch/" + item["item_key"] + ".json"
         state = read_json(store, key)[0]
@@ -435,9 +455,118 @@ def test_four_product_worker_appends_attempts_preserves_history_and_persists_usa
     assert exported["Diagnostics"][0]["Model"] == "quality-model"
     assert exported["Results"][0]["Judge status"] == "accepted"
     calls = [row for row in exported["Diagnostics"] if row["Operation"] == "model"]
-    assert len(calls) == len({row["Call ID"] for row in calls}) == 16
+    assert len(calls) == len({row["Call ID"] for row in calls}) == 9
     assert {row["Run ID"] for row in calls} == {"first", "second"}
-    assert sum(float(row["Cost USD"]) for row in calls) == pytest.approx(.016)
+    assert sum(float(row["Cost USD"]) for row in calls) == pytest.approx(.009)
+    assert len(store.keys("quality-judge-cache/")) == 1
+    prefixes = [kwargs["cache_prefix"] for schema, packet, kwargs in client.calls if schema == QualityExtraction]
+    assert len(set(prefixes)) == 1
+    assert all("product-0" not in prefix and "product-1" not in prefix for prefix in prefixes)
+
+
+def test_first_disputed_vote_uses_majority_and_persists_for_next_product():
+    from backend.quality_judge import JudgeCache
+
+    cache = JudgeCache(Store(), namespace="owner", policy="test")
+
+    class Majority(Completion):
+        def complete_structured(self, system, user, schema, **kwargs):
+            answer = super().complete_structured(system, user, schema, **kwargs)
+            if schema == QualityJudgment and sum(s == QualityJudgment for s, _, _ in self.calls) == 1:
+                answer.decisions[0].decision = "judge_disputed"
+                answer.decisions[0].reason = "Uncertain first vote."
+            return answer
+
+    first = Majority([[proposal()]])
+    result = run_product(manifest(), [evidence()], first, run_id="first", judge_cache=cache)
+    assert result.attributes[0].candidates[0].judge_status == "accepted"
+    assert "Majority 2/3" in result.attributes[0].candidates[0].judge_reason
+    assert sum(schema == QualityJudgment for schema, _, _ in first.calls) == 3
+    second_manifest = manifest()
+    second_manifest.product.item_id = "second-product"
+    second = Completion([[proposal()]], disputed=True)
+    repeated = run_product(second_manifest, [evidence()], second, run_id="second", judge_cache=cache)
+    assert repeated.attributes[0].candidates[0].judge_status == "accepted"
+    assert not any(schema == QualityJudgment for schema, _, _ in second.calls)
+
+
+def test_judge_identity_invalidates_changed_definition_source_quote_and_owner():
+    from backend.quality_judge import JudgeCache
+
+    store = Store()
+    definition, original = manifest().attributes[0], evidence()
+    candidate = ground_candidate(QualityProposal(**proposal()), definition, [original])
+    cache = JudgeCache(store, namespace="owner", policy="policy")
+    key = cache.identity(definition, candidate, [original])
+    cache.put(key, {"decision": "accepted", "reason": "Supported.", "votes": []})
+    assert JudgeCache(store, namespace="owner", policy="policy").get(key)["decision"] == "accepted"
+    assert JudgeCache(store, namespace="another-owner", policy="policy").get(key) is None
+    assert cache.identity(definition.model_copy(update={"description": "Different meaning"}), candidate, [original]) != key
+    assert cache.identity(definition, candidate, [original.model_copy(update={"source_version": "changed"})]) != key
+    assert cache.identity(definition, candidate.model_copy(update={"supporting_quote": "other quote"}), [original]) != key
+
+
+def test_incomplete_judge_votes_are_visible_and_never_cached():
+    from backend.quality_judge import JudgeCache
+
+    cache = JudgeCache(Store(), policy="test")
+
+    class MissingJudge(Completion):
+        def complete_structured(self, system, user, schema, **kwargs):
+            answer = super().complete_structured(system, user, schema, **kwargs)
+            return QualityJudgment(decisions=[]) if schema == QualityJudgment else answer
+
+    client = MissingJudge([[proposal()]])
+    result = run_product(manifest(), [evidence()], client, run_id="r", judge_cache=cache)
+    assert result.attributes[0].candidates[0].judge_status == "judge_disputed"
+    assert "Incomplete judge votes" in result.attributes[0].candidates[0].judge_reason
+    assert cache.memory == {}
+
+
+def test_worker_ocr_verification_uses_one_bounded_analysis_and_the_same_usage_callback(monkeypatch):
+    import hashlib
+    from types import SimpleNamespace
+    from backend import quality_pdf, quality_worker
+    from backend.quality_pdf import CachedPDFOCR
+
+    store, items = seed_store(1)
+    content = b"%PDF-synthetic-textless"
+    source_hash = "51bd50b060bda424281f80c61b038cdc7221c07c05c80da432cd6c3dc2c34290"
+    items[0]["sources"][0]["sha256"] = source_hash
+    record, version = read_json(store, "batches/batch.json")
+    record["items"] = items
+    write_json(store, "batches/batch.json", record, version)
+    store.write_bytes("documents/catalog.pdf", content)
+    original_digest = quality_worker.digest
+    monkeypatch.setattr(quality_worker, "digest", lambda value: source_hash if value == content else original_digest(value))
+    monkeypatch.setattr(CachedEvidenceLoader, "load", lambda self, item: ([evidence()], [], []))
+    monkeypatch.setattr(quality_pdf, "pdf_text", lambda content: ("", 1))
+
+    class Parser:
+        last_page_count = 1
+        calls = 0
+
+        def extract_pdf_bytes(self, data, *, source, page_limit):
+            self.calls += 1
+            assert data == content and page_limit == 1
+            return ParsedDocument(
+                source=source, cache_key="sha256:" + hashlib.sha256(data).hexdigest(), parsed_at=NOW,
+                raw_text="Mueller Co. manufacturer drawing.",
+                paragraphs=[ParsedParagraph(text="Mueller Co. manufacturer drawing.", page_number=1)],
+            )
+
+    parser = Parser()
+    web = SimpleNamespace(pdf_ocr=CachedPDFOCR(store, parser))
+    usage = []
+    summary = run_quality_batch(
+        store, "batch", "owner", "ocr-test", completion=Completion([[proposal()]]),
+        web=web, ocr_smoke=True, usage_callback=usage.append,
+    )
+    assert parser.calls == summary["new_di_calls"] == 1
+    calls = [entry for entry in usage if entry["operation"] == "document_intelligence"]
+    assert len(calls) == 1 and calls[0]["analyzed_pages"] == 1
+    assert calls[0]["phase"] == "ocr_verification" and calls[0]["status"] == "succeeded"
+    assert read_json(store, "quality-runs/batch/ocr-test/ocr-verification.json")[0]["page_count"] == 1
 
 
 def test_cache_miss_is_gap_never_fresh_di_and_image_is_not_pdf_hash(monkeypatch):
@@ -479,11 +608,11 @@ def test_ford_image_fault_is_per_item_and_text_results_survive(monkeypatch, mode
     client = Completion([[proposal()], [proposal()]])
     summary = run_quality_batch(store, "batch", "owner", "image-" + mode, completion=client, ford_image_blob=blob)
     assert summary["state"] == "completed" and len(summary["products"]) == 2
-    assert summary["model_calls"] == 4
+    assert summary["model_calls"] == 3
     ford = EnrichmentResult.model_validate(BatchService(store).detail("batch", "row-2", "owner")["machine_result"])
     other = EnrichmentResult.model_validate(BatchService(store).detail("batch", "row-3", "owner")["machine_result"])
     assert ford.attributes[0].candidates[0].value == other.attributes[0].candidates[0].value == "brass"
-    assert len(ford.quality_diagnostics) == 2 and not other.input_diagnostics
+    assert sum(d["operation"] == "model" for d in ford.quality_diagnostics) == 2 and not other.input_diagnostics
     diagnostic = ford.input_diagnostics[0]
     assert diagnostic["status"] == status and diagnostic["text_only"] is (mode != "present")
     assert diagnostic["target_mpn"] == ford.manifest.product.mpn
@@ -771,7 +900,7 @@ def test_smoke_first_processes_all_four_in_one_execution_and_reuses_vendor_call(
         write_json(store, key, read_json(others, key)[0])
     class Combined(Completion):
         def complete_structured(self, system, user, schema, **kwargs):
-            packet = json.loads(user)
+            packet = model_packet(user, kwargs)
             target = packet["manifest"]["product"]["item_id"] == "PIMITEM-213030"
             if packet.get("smoke_target"):
                 row = next(entry for entry in packet["evidence"] if entry["source_tier"] == "vendor_table")
@@ -789,7 +918,7 @@ def test_smoke_first_processes_all_four_in_one_execution_and_reuses_vendor_call(
     assert summary["state"] == "completed" and summary["smoke_first"] is True
     assert summary["smoke_only"] is False and summary["smoke"]["status"] == "passed"
     assert len(summary["products"]) == 4
-    assert summary["model_calls"] == len(client.calls) == 11
+    assert summary["model_calls"] == len(client.calls) == 9
     counts = Counter((entry["item_id"], entry["tier"]) for entry in summary["usage"])
     assert max(counts.values()) <= 3
     assert counts[("PIMITEM-213030", "vendor_table")] == 3
@@ -800,7 +929,7 @@ def test_smoke_first_processes_all_four_in_one_execution_and_reuses_vendor_call(
     assert first["quality_diagnostics"][0]["phase"] == "smoke"
     rows = read_workbook(BatchService(store).export("batch", "owner"))["Diagnostics"]
     calls = [row for row in rows if row["Operation"] == "model"]
-    assert len(calls) == len({row["Call ID"] for row in calls}) == 11
+    assert len(calls) == len({row["Call ID"] for row in calls}) == 9
 
 
 def test_missing_smoke_cell_fails_without_spending():

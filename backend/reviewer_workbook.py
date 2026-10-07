@@ -18,13 +18,14 @@ from backend.evidence_verification import Fragment, match_text
 from backend.models.enrichment import (
     AttributeDefinition, AttributeResult, Candidate, EnrichmentResult, Evidence, Manifest, ProductKey,
 )
+from backend.quality_applicability import build_applicability_map, candidate_applicability
 
 
 REVIEW_COLUMNS = [
     "Product ID", "MPN", "Attribute", "Decision", "Correction", "Correction unit", "Reason",
     "Status", "Next action", "Proposed value", "Unit", "Evidence basis",
     "Supporting quote", "Evidence", "Source URL", "Retrieved at", "Applicability",
-    "Origin", "Normalization or justification", "Judge status", "Judge reason", "Reviewer explanation",
+    "Origin", "Normalization or justification", "Judge status", "Judge reason", "Reviewer explanation", "Confidence",
 ]
 DECISIONS = ("Approve", "Correct", "Reject")
 
@@ -178,7 +179,7 @@ def _build_package(
     columns remain blank unless a real ReviewDecision already exists.
     """
     rows = [list(REVIEW_COLUMNS)]
-    evidence_rows = [["Product ID", "MPN", "Attribute", "Proposed value", "Unit", "Source", "Source tier", "Location", "Quote", "Source URL", "Retrieved at", "Applicability", "Evidence basis", "Origin", "Judge status", "Judge reason"]]
+    evidence_rows = [["Product ID", "MPN", "Attribute", "Proposed value", "Unit", "Source", "Source tier", "Location", "Quote", "Source URL", "Retrieved at", "Applicability", "Evidence basis", "Origin", "Judge status", "Judge reason", "Confidence"]]
     question_rows = [["Product ID", "MPN", "Attribute", "Question", "Response"]]
     bindings = []
     status_counts = {}
@@ -187,6 +188,7 @@ def _build_package(
     for result in results:
         product = result.manifest.product
         indexed = {entry.evidence_id: entry for entry in result.evidence}
+        mapping = build_applicability_map(result.manifest, result.evidence)
         for attribute in result.attributes:
             identity = (product.item_id, attribute.attribute_id)
             if identity in seen:
@@ -203,8 +205,10 @@ def _build_package(
                     product.item_id, product.mpn, attribute.attribute_id,
                     _display(attribute.definition_clarification or attribute.reviewer_explanation or action), "",
                 ])
-            proposals, units, bases, quotes, labels, urls, retrieved, applicability = [], [], [], [], [], [], [], []
+            proposals, units, bases, quotes, labels, urls, retrieved, applicability, confidence = [], [], [], [], [], [], [], [], []
             for index, candidate in enumerate(attribute.candidates):
+                confidence_label = candidate_applicability(candidate, mapping, result.evidence).confidence
+                confidence.append(confidence_label)
                 proposed_value = _proposed_display(
                     candidate.value, vendor=any(indexed[key].source_tier == "vendor_table" for key in candidate.evidence_ids),
                 )
@@ -234,7 +238,7 @@ def _build_package(
                         product.item_id, product.mpn, attribute.attribute_id,
                         proposed_value, _display(candidate.unit), label, evidence.source_tier, _candidate_location(candidate, evidence),
                         _display(candidate.supporting_quote), url, date, scope, candidate.evidence_basis,
-                        candidate.origin, candidate.judge_status, _display(candidate.judge_reason),
+                        candidate.origin, candidate.judge_status, _display(candidate.judge_reason), confidence_label,
                     ])
             review = attribute.review
             rows.append([
@@ -250,6 +254,7 @@ def _build_package(
                 "\n".join(c.judge_status for c in attribute.candidates),
                 "\n".join(_display(c.judge_reason) for c in attribute.candidates),
                 _display(attribute.reviewer_explanation or action),
+                min(confidence, key=lambda level: {"Low": 0, "Medium": 1, "High": 2}[level]) if confidence else "",
             ])
             binding = {
                 "Product ID": product.item_id, "MPN": product.mpn, "Attribute": attribute.attribute_id,
@@ -282,6 +287,7 @@ def _build_package(
         ["Evidence", "Check source quotations, original public URLs, retrieval time and exact-product applicability."],
         ["Pending", "Blank Decision remains pending. Missing evidence differs from an unverified generated value."],
         ["Descriptive inference", "inferred_from_description requires human review and is not certification or literal Boolean evidence."],
+        ["Confidence", "High: literal evidence from an exact-product row or page. Medium: derived or confirmed-family evidence. Low: inference or unconfirmed-family evidence. A row shows its lowest candidate confidence; Evidence shows each candidate. Confidence is not an accuracy percentage or approval."],
         ["Privacy", "Attempt identifiers, storage paths, source hashes and technical diagnostics are retained only in a separate private binding."],
     ]
     sheets = {
