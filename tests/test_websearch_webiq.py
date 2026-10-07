@@ -298,6 +298,16 @@ def test_bing_result_and_legacy_filter_behavior_preserved():
 
 @pytest.fixture
 def page(monkeypatch):
+    native_connection = websearch._PinnedHTTPSConnection
+    native_preflight = websearch._preflight_original_page_request
+
+    def preflight(*args, **kwargs):
+        # Response fixtures replace only the live connection. Admission must
+        # still exercise the genuine native constructor and HTTP serialization.
+        with monkeypatch.context() as native:
+            native.setattr(websearch, "_PinnedHTTPSConnection", native_connection)
+            return native_preflight(*args, **kwargs)
+
     response = Mock()
     response.status = 200
     response.headers = Message()
@@ -308,6 +318,7 @@ def page(monkeypatch):
     connection.getresponse.return_value = response
     factory = Mock(return_value=connection)
     resolver = Mock(return_value=[PUBLIC_ADDRESS])
+    monkeypatch.setattr(websearch, "_preflight_original_page_request", preflight)
     monkeypatch.setattr(websearch, "_PinnedHTTPSConnection", factory)
     monkeypatch.setattr(socket, "getaddrinfo", resolver)
     return response, connection, factory, resolver

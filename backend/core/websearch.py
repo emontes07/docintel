@@ -16,9 +16,11 @@ import logging
 import hashlib
 import http.client
 import ipaddress
+import json
 import re
 import socket
 import ssl
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -28,6 +30,7 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 from pydantic import BaseModel, Field
 
 from backend.core.config import settings
+from backend.sdk_preflight import SDKPreflightError
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +294,126 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             raise
 
 
+def _original_page_request(url, *, allowed_hosts, authorized, timeout, max_bytes):
+    if authorized is not True:
+        raise ExternalEvidenceError("Explicit source retrieval authorization is required.", code="authorization_required")
+    if (
+        isinstance(timeout, bool) or not isinstance(timeout, (float, int)) or not 0 < timeout <= 15
+        or type(max_bytes) is not int or not 1 <= max_bytes <= 262144
+    ):
+        raise ExternalEvidenceError("Invalid source retrieval limits.", code="invalid_limits")
+    hosts = exact_https_hosts(allowed_hosts)
+    final_url = validate_original_url(url, hosts)
+    parsed = urlsplit(final_url)
+    return final_url, parsed.hostname, hosts, {
+        "method": "GET", "url": parsed.path or "/",
+        "headers": {
+            "Accept": "text/plain, text/html",
+            "Accept-Encoding": "identity",
+            "User-Agent": "DocIntel-Authorized-Evidence/1.0",
+        },
+    }
+
+
+def _send_original_page_request(connection, arguments):
+    connection.request(arguments["method"], arguments["url"], headers=arguments["headers"])
+
+
+def _preflight_original_page_request(final_url, host, hosts, arguments, *, timeout, max_bytes):
+    connection = None
+    try:
+        wire_parts = []
+
+        def capture(data):
+            if not isinstance(data, bytes) or len(data) > 8192 or wire_parts:
+                raise ValueError("Unexpected native source-request framing")
+            wire_parts.append(data)
+
+        def denied_connect():
+            raise ValueError("A no-send source request must not connect")
+
+        # No address is resolved or certified here. Live retrieval still checks
+        # every DNS answer and pins the actual public address before connecting.
+        inert_address = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("192.0.2.1", 443))
+        connection = _PinnedHTTPSConnection(host, inert_address, timeout)
+        if not isinstance(connection, http.client.HTTPSConnection):
+            raise TypeError("Source preflight requires the native HTTPS client")
+        connection.send = capture
+        connection.connect = denied_connect
+        _send_original_page_request(connection, arguments)
+        if len(wire_parts) != 1:
+            raise ValueError("Native source request was not captured")
+        wire = wire_parts[0]
+        head, separator, body = wire.partition(b"\r\n\r\n")
+        lines = head.split(b"\r\n")
+        if (
+            separator != b"\r\n\r\n" or body
+            or lines[0] != f"GET {arguments['url']} HTTP/1.1".encode("ascii")
+        ):
+            raise ValueError("Native source request differs from the approved GET")
+        headers = {}
+        for line in lines[1:]:
+            name, delimiter, value = line.partition(b": ")
+            if not delimiter or name.lower() in headers:
+                raise ValueError("Unexpected native source-request headers")
+            headers[name.lower()] = value
+        expected_headers = {
+            b"host": host.encode("ascii"),
+            **{name.lower().encode("ascii"): value.encode("ascii") for name, value in arguments["headers"].items()},
+        }
+        if headers != expected_headers:
+            raise ValueError("Native source headers differ from production headers")
+
+        def digest(value):
+            return hashlib.sha256(value).hexdigest()
+
+        return {
+            "status": "validated_no_send", "provider": "web_retrieval",
+            "sdk_package": "http.client", "sdk_version": ".".join(map(str, sys.version_info[:3])),
+            "transport_package": "ssl", "transport_version": ssl.OPENSSL_VERSION,
+            "client": "_PinnedHTTPSConnection", "method": "GET", "api_version": None,
+            "endpoint_sha256": digest(final_url.encode()),
+            "path_sha256": digest(arguments["url"].encode()),
+            "request_sha256": digest(b"GET\n" + final_url.encode() + b"\n"),
+            "body_sha256": digest(b""), "body_bytes": 0,
+            "wire_request_sha256": digest(wire), "wire_request_bytes": len(wire),
+            "headers_sha256": digest(b"\r\n".join(lines[1:])),
+            "header_names": sorted(name.decode("ascii") for name in headers),
+            "allowed_hosts_sha256": digest(json.dumps(sorted(hosts), separators=(",", ":")).encode()),
+            "allowed_hosts_count": len(hosts),
+            "timeout_seconds": timeout, "response_max_bytes": max_bytes,
+            "transport": "in_memory_no_send", "captured_requests": 1,
+            "transport_real_calls": 0, "network_calls": 0, "dns_calls": 0,
+            "socket_connect_calls": 0, "tls_handshakes": 0, "credential_real_calls": 0,
+            "authentication_performed": False, "provider_send_performed": False,
+            "provider_response_fabricated": False, "dns_address_safety_verified": False,
+            "source_content_verified": False,
+        }
+    except Exception as error:
+        raise SDKPreflightError("web_retrieval", type(error).__name__) from None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def preflight_original_page(
+    url: str, *, allowed_hosts: Sequence[str], authorized: bool = False,
+    timeout: float = 15.0, max_bytes: int = 262144,
+) -> dict:
+    """Serialize the actual native GET before retrieval budget reservation.
+
+    URL/host/authorization/limit rejections remain ``ExternalEvidenceError``.
+    Only native client/request incompatibilities are fatal ``SDKPreflightError``.
+    No DNS, socket connection, TLS handshake, authentication, or page fetch occurs.
+    """
+    final_url, host, hosts, arguments = _original_page_request(
+        url, allowed_hosts=allowed_hosts, authorized=authorized, timeout=timeout, max_bytes=max_bytes,
+    )
+    return _preflight_original_page_request(
+        final_url, host, hosts, arguments, timeout=timeout, max_bytes=max_bytes,
+    )
+
+
 def fetch_original_page(
     url: str,
     *,
@@ -308,27 +431,19 @@ def fetch_original_page(
     HTML is normalized to static text with paragraph/row boundaries; it is not
     browser-rendered, and normalized line ordinals are not original coordinates.
     """
-    if authorized is not True:
-        raise ExternalEvidenceError("Explicit source retrieval authorization is required.", code="authorization_required")
-    if (
-        isinstance(timeout, bool) or not isinstance(timeout, (float, int)) or not 0 < timeout <= 15
-        or type(max_bytes) is not int or not 1 <= max_bytes <= 262144
-    ):
-        raise ExternalEvidenceError("Invalid source retrieval limits.", code="invalid_limits")
-    final_url = validate_original_url(url, allowed_hosts)
-    parsed = urlsplit(final_url)
+    final_url, host, hosts, arguments = _original_page_request(
+        url, allowed_hosts=allowed_hosts, authorized=authorized, timeout=timeout, max_bytes=max_bytes,
+    )
+    _preflight_original_page_request(
+        final_url, host, hosts, arguments, timeout=timeout, max_bytes=max_bytes,
+    )
     connection = None
     response = None
     try:
-        host = parsed.hostname
         assert host is not None
         address = _public_addresses(host)[0]
         connection = _PinnedHTTPSConnection(host, address, timeout)
-        connection.request("GET", parsed.path or "/", headers={
-            "Accept": "text/plain, text/html",
-            "Accept-Encoding": "identity",
-            "User-Agent": "DocIntel-Authorized-Evidence/1.0",
-        })
+        _send_original_page_request(connection, arguments)
         response = connection.getresponse()
         if 300 <= response.status < 400:
             raise ExternalEvidenceError("Source redirect was not followed.", code="redirect_not_followed")
