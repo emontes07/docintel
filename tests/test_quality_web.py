@@ -590,6 +590,23 @@ def test_missing_or_invalid_di_usage_stays_explicitly_unknown(reported_pages):
     assert records[0]["cost_usd"] is None and records[0]["pricing_basis"] is None
 
 
+def test_missing_di_configuration_is_a_pre_provider_failure_not_unpriced_usage():
+    from backend.core.docintel import NotConfiguredError
+
+    store, parser, records = OCRStore(), ocr_parser(), []
+    parser.extract_pdf_bytes.side_effect = NotConfiguredError("Missing endpoint")
+    with pytest.raises(NotConfiguredError):
+        CachedPDFOCR(store, parser, usage_callback=records.append)(
+            synthetic_pdf(), source="https://muellercompany.com/drawing.pdf", page_count=1,
+            retrieved_at=datetime.now(timezone.utc),
+        )
+    record, = records
+    assert record["status"] == "failed" and record["analysis_attempted"] is False
+    assert record["new_analysis"] is False and record["analyzed_pages"] == 0
+    assert record["cost_usd"] == 0 and record["usage_reported"] is True
+    assert store.keys("") == []
+
+
 def test_failed_ocr_usage_is_unknown_and_fix_then_rerun_succeeds():
     store, parser, records = OCRStore(), ocr_parser(), []
     failure = RuntimeError("private provider body")

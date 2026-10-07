@@ -520,6 +520,34 @@ def test_native_locked_sdk_serializes_responses_and_retains_usage(
     assert model.last_usage["estimated_cost_usd"] == pytest.approx(0.0057)
 
 
+def test_locked_sdk_sends_family_key_and_explicit_prefix_breakpoint(monkeypatch):
+    captured = []
+
+    def transport(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=response_payload('{"attributes":[]}'))
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        monkeypatch.setattr(quality_model, "AzureOpenAI", lambda **kwargs: AzureOpenAI(**kwargs, http_client=client))
+        model = ResponsesCompletion(token_provider=lambda: "offline-token")
+        for item in ("product-a", "product-b"):
+            model.complete_structured(
+                "same instructions", item, Extraction,
+                prompt_cache_key="family-v1", cache_prefix="shared definitions and source text",
+            )
+    assert len(captured) == 2
+    assert captured[0]["prompt_cache_key"] == captured[1]["prompt_cache_key"] == "family-v1"
+    assert captured[0]["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+    first, second = [body["input"][0]["content"] for body in captured]
+    assert first[0] == second[0] == {
+        "type": "input_text", "text": "shared definitions and source text",
+        "prompt_cache_breakpoint": {"mode": "explicit"},
+    }
+    assert first[1]["text"] == "product-a" and second[1]["text"] == "product-b"
+    assert model.last_usage["cached_input_tokens"] == 200
+    assert model.last_usage["explicit_cache_prefix"] is True
+
+
 @pytest.mark.parametrize("invalid_json", [False, True])
 def test_locked_sdk_preserves_newer_cache_write_usage_fields(monkeypatch, invalid_json):
     payload = response_payload("invalid" if invalid_json else '{"attributes":[]}')

@@ -1,7 +1,13 @@
+import json
+from typing import Any, cast
+
 import pytest
 
 from backend.batch import export_workbook
-from backend.quality_scoring import compare_answer_key, compare_reference, load_cowork_reference, values_agree
+from backend.quality_scoring import (
+    COMPARISON_CLASSES, compare_answer_key, compare_reference, load_cowork_reference,
+    normalize_cowork_reference, reference_from_normalized, values_agree,
+)
 
 
 DEFINITIONS = [{"product_id": "P1", "attribute_id": "Size", "value_type": "string"}]
@@ -69,3 +75,222 @@ def test_load_explicit_reference_and_reject_unrecognized_layout():
     assert load_cowork_reference(data) == {("P1", "Size"): [{"value": "3/4", "unit": "in"}]}
     with pytest.raises(ValueError, match="no recognized"):
         load_cowork_reference(export_workbook({"Draft": [["Unknown"], ["Not a scored table"]]}))
+
+
+DRAFT_HEADERS = [
+    "item_id", "vendor", "attribute_name", "expected_data_type", "proposed_value", "unit",
+    "source_tier", "source_locator", "system_confidence", "notes", "human_validation_status",
+]
+
+
+def draft_row(product="P1", attribute="Size", value="3/4", unit="in"):
+    return [
+        product, "Synthetic vendor", attribute, "Enumerated", value, unit,
+        "DO_NOT_IMPORT_TIER", "DO_NOT_IMPORT_CITATION", "DO_NOT_IMPORT_CONFIDENCE",
+        "DO_NOT_IMPORT_NOTES", "DO_NOT_IMPORT_APPROVAL",
+    ]
+
+
+def test_actual_layout_synthetic_ingestion_keeps_conflicts_and_not_found_slots():
+    content = export_workbook({"Draft": [
+        DRAFT_HEADERS, draft_row(value="3/4"), draft_row(value="1"), draft_row(value="1"),
+        draft_row(attribute="Material", value="NOT_FOUND", unit=""),
+        draft_row(product="P2", value=" not_found ", unit=""),
+        draft_row(product="P2", value=" 1 ", unit=" in "),
+    ], "Instructions": [["Read me"], ["Not an attribute table"]]})
+    artifact = normalize_cowork_reference(content)
+    reference = reference_from_normalized(json.loads(json.dumps(artifact)))
+    assert artifact["purpose"] == "scoring_only"
+    assert len(artifact["source_sha256"]) == 64
+    assert reference == {
+        ("P1", "Size"): [{"value": "3/4", "unit": "in"}, {"value": "1", "unit": "in"}],
+        ("P1", "Material"): [],
+        ("P2", "Size"): [{"value": " 1 ", "unit": " in "}],
+    }
+    assert "DO_NOT_IMPORT" not in json.dumps(artifact)
+    assert artifact["diagnostics"] == {
+        "sheets": [
+            {"sheet_index": 1, "layout": "long_form", "header_row": 1,
+             "columns": {"product_id": 1, "attribute_id": 3, "value": 5, "unit": 6},
+             "column_count": 11, "data_rows": 6, "value_rows": 4, "not_found_rows": 2},
+            {"sheet_index": 2, "layout": "ignored", "data_rows": 1},
+        ],
+        "recognized_sheets": 1, "ignored_sheets": 1, "data_rows": 6, "value_rows": 4, "not_found_rows": 2,
+        "products": 2, "attributes": 2, "slots": 3, "populated_slots": 2, "empty_slots": 1,
+        "duplicate_slots": 2, "multiple_value_slots": 1, "mixed_presence_slots": 1,
+    }
+    size = next(row for row in artifact["rows"] if (row["product_id"], row["attribute_id"]) == ("P1", "Size"))
+    assert [row["row"] for row in size["source_rows"]] == [2, 3, 4]
+    assert load_cowork_reference(content)[("P2", "Size")] == [{"value": "1", "unit": "in"}]
+
+
+def test_headers_only_and_empty_data_rows_are_supported():
+    assert load_cowork_reference(export_workbook({"Draft": [DRAFT_HEADERS]})) == {}
+    data = export_workbook({"Draft": [DRAFT_HEADERS, [""] * 11, draft_row(value="0")]})
+    assert normalize_cowork_reference(data)["diagnostics"]["data_rows"] == 1
+    assert load_cowork_reference(data)[("P1", "Size")][0]["value"] == "0"
+
+
+def test_source_rows_preserve_value_associations_across_sheets_and_json_roundtrip():
+    content = export_workbook({
+        "First": [
+            DRAFT_HEADERS, draft_row(value=" 1 ", unit=" in "), [""] * len(DRAFT_HEADERS),
+            draft_row(value="2", unit="in"), draft_row(value="2", unit="in"),
+        ],
+        "Second": [
+            DRAFT_HEADERS, draft_row(value=" NOT_FOUND ", unit=""),
+            draft_row(value=" 1 ", unit=" in "), draft_row(value="", unit=" "),
+        ],
+    })
+    artifact = json.loads(json.dumps(normalize_cowork_reference(content)))
+    assert artifact["diagnostics"]["slots"] == 1
+    assert artifact["diagnostics"]["data_rows"] == 6
+    slot = artifact["rows"][0]
+    assert slot["source_rows"] == [
+        {"sheet_index": 1, "row": 2, "not_found": False, "value": " 1 ", "unit": " in ", "candidate_index": 0},
+        {"sheet_index": 1, "row": 4, "not_found": False, "value": "2", "unit": "in", "candidate_index": 1},
+        {"sheet_index": 1, "row": 5, "not_found": False, "value": "2", "unit": "in", "candidate_index": 1},
+        {"sheet_index": 2, "row": 2, "not_found": True, "value": " NOT_FOUND ", "unit": "", "candidate_index": None},
+        {"sheet_index": 2, "row": 3, "not_found": False, "value": " 1 ", "unit": " in ", "candidate_index": 0},
+        {"sheet_index": 2, "row": 4, "not_found": True, "value": "", "unit": " ", "candidate_index": None},
+    ]
+    for source in slot["source_rows"]:
+        if source["candidate_index"] is not None:
+            assert slot["candidates"][source["candidate_index"]] == {
+                "value": source["value"], "unit": source["unit"],
+            }
+    assert reference_from_normalized(artifact) == {
+        ("P1", "Size"): [{"value": " 1 ", "unit": " in "}, {"value": "2", "unit": "in"}],
+    }
+    flattened = [
+        {"product_id": slot["product_id"], "attribute_id": slot["attribute_id"], **source}
+        for slot in artifact["rows"] for source in slot["source_rows"]
+    ]
+    assert len(flattened) == 6
+    assert len({(row["sheet_index"], row["row"]) for row in flattened}) == 6
+
+
+@pytest.mark.parametrize("value", ["", "Not Found", "NOT_FOUND", "not stated", "unknown", "N/A"])
+def test_explicit_missing_tokens(value):
+    data = export_workbook({"Draft": [DRAFT_HEADERS, draft_row(value=value)]})
+    assert load_cowork_reference(data) == {("P1", "Size"): []}
+
+
+@pytest.mark.parametrize("value", ["0", "False", "No", "Not Foundry brass", "not applicable", "none"])
+def test_missing_detection_never_uses_substrings_or_boolean_truthiness(value):
+    data = export_workbook({"Draft": [DRAFT_HEADERS, draft_row(value=value)]})
+    assert load_cowork_reference(data)[("P1", "Size")][0]["value"] == value
+
+
+@pytest.mark.parametrize(("product", "attribute"), [("", "Size"), ("P1", ""), ("", "")])
+def test_unidentified_value_rows_fail_closed(product, attribute):
+    data = export_workbook({"Draft": [DRAFT_HEADERS, draft_row(product=product, attribute=attribute)]})
+    with pytest.raises(ValueError, match="without its product or attribute"):
+        normalize_cowork_reference(data)
+
+
+def test_ambiguous_headers_are_rejected_instead_of_picking_a_value():
+    data = export_workbook({"Draft": [
+        ["item_id", "attribute_name", "proposed_value", "Value"], ["P1", "Size", "1", "2"],
+    ]})
+    with pytest.raises(ValueError, match="ambiguous"):
+        normalize_cowork_reference(data)
+
+
+def test_reference_identifiers_are_not_aliased_or_casefolded():
+    data = export_workbook({"Draft": [
+        DRAFT_HEADERS, draft_row(product="PIMITEM-1"), draft_row(product="1"),
+        draft_row(product="pimitem-1"),
+    ]})
+    assert len(load_cowork_reference(data)) == 3
+
+
+def test_normalized_artifact_requires_scoring_purpose_and_unique_slots():
+    artifact = normalize_cowork_reference(export_workbook({"Draft": [DRAFT_HEADERS, draft_row()]}))
+    for overrides in ({"purpose": "evidence"}, {"schema_version": "unknown"}):
+        with pytest.raises(ValueError, match="scoring-only"):
+            reference_from_normalized({**artifact, **overrides})
+    with pytest.raises(ValueError, match="Duplicate"):
+        reference_from_normalized({**artifact, "rows": artifact["rows"] * 2})
+
+
+@pytest.mark.parametrize(("generated", "reference", "expected"), [
+    ([{"value": "Brass"}], [{"value": "Brass"}], "agree"),
+    ([{"value": " BRASS "}], [{"value": "Brass"}], "format-only difference"),
+    ([{"value": '3/4"'}], [{"value": 0.75, "unit": "in"}], "format-only difference"),
+    ([{"value": "brass"}], [{"value": "low lead brass"}], "differ"),
+    ([{"value": "Brass"}], [], "DocIntel-only"),
+    ([], [{"value": "Brass"}], "Cowork-only"),
+    ([], [], "both-not-found"),
+])
+def test_exact_six_class_schema(generated, reference, expected):
+    result = compare_reference(
+        DEFINITIONS, [candidate(**entry) for entry in generated], {("P1", "Size"): reference},
+        comparison_schema="six_class",
+    )
+    assert result["counts"] == {expected: 1}
+    assert set(result["counts"]) <= set(COMPARISON_CLASSES)
+    assert len(COMPARISON_CLASSES) == 6
+
+
+@pytest.mark.parametrize(("left", "right", "kind", "expected"), [
+    ({"value": True}, {"value": "Yes"}, "boolean", "format-only difference"),
+    ({"value": True}, {"value": 1}, "boolean", "differ"),
+    ({"value": True}, {"value": "Yes"}, "string", "differ"),
+    ({"value": "FIP"}, {"value": "Female Iron Pipe"}, "string", "differ"),
+    ({"value": "low-lead brass"}, {"value": "no-lead brass"}, "string", "differ"),
+    ({"value": "Copper; Iron"}, {"value": "Iron; Copper"}, "string", "differ"),
+    ({"value": "3/4 in", "unit": "mm"}, {"value": "3/4 in"}, "string", "differ"),
+    ({"value": "1 in"}, {"value": "25.4 mm"}, "string", "differ"),
+    ({"value": 1}, {"value": 1.0}, "number", "format-only difference"),
+    ({"value": "No"}, {"value": "NOT_FOUND"}, "boolean", "DocIntel-only"),
+    ({"value": None}, {"value": "NOT_FOUND"}, "string", "both-not-found"),
+])
+def test_six_classes_do_not_guess_synonyms_or_resolve_units(left, right, kind, expected):
+    result = compare_reference(
+        [{**DEFINITIONS[0], "value_type": kind}], [candidate(**left)], {("P1", "Size"): [right]},
+        comparison_schema="six_class",
+    )
+    assert result["counts"] == {expected: 1}
+
+
+def test_six_class_format_detection_retains_reference_whitespace():
+    reference = reference_from_normalized(normalize_cowork_reference(
+        export_workbook({"Draft": [DRAFT_HEADERS, draft_row(value=" 3/4 ", unit=" in ")]}),
+    ))
+    result = compare_reference(
+        DEFINITIONS, [candidate("3/4", unit="in")], reference, comparison_schema="six_class",
+    )
+    assert result["counts"] == {"format-only difference": 1}
+
+
+@pytest.mark.parametrize("both_conflicted", [False, True])
+def test_six_class_conflicts_are_visible_even_when_both_sides_share_them(both_conflicted):
+    baseline = [{"value": "brass"}, {"value": "bronze"}]
+    proposals = [candidate("brass"), candidate("bronze")] if both_conflicted else [candidate("brass")]
+    result = compare_reference(DEFINITIONS, proposals, {("P1", "Size"): baseline}, comparison_schema="six_class")
+    assert result["counts"] == {"differ": 1}
+    assert result["rows"][0]["cowork"] == baseline
+    assert result["rows"][0]["cowork_conflict"] is True
+    assert result["rows"][0]["docintel_conflict"] is both_conflicted
+
+
+def test_exact_duplicate_proposals_do_not_create_a_conflict():
+    result = compare_reference(
+        DEFINITIONS, [candidate("brass"), candidate("brass")], {("P1", "Size"): [{"value": "brass"}]},
+        comparison_schema="six_class",
+    )
+    assert result["counts"] == {"agree": 1}
+    assert result["rows"][0]["docintel_conflict"] is False
+    assert len(result["rows"][0]["docintel"]) == 2
+
+
+def test_six_class_reference_only_slots_and_unavailable_reference():
+    result = compare_reference(
+        DEFINITIONS, [], {("P1", "Material"): [{"value": "Brass"}]}, comparison_schema="six_class",
+    )
+    assert result["counts"] == {"Cowork-only": 1, "both-not-found": 1}
+    with pytest.raises(ValueError, match="available reference"):
+        compare_reference(DEFINITIONS, [], None, comparison_schema="six_class")
+    with pytest.raises(ValueError, match="Unknown"):
+        compare_reference(DEFINITIONS, [], {}, comparison_schema=cast(Any, "typo"))

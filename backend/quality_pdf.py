@@ -31,7 +31,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Callable
 
 from backend.batch_store import Missing, read_json, write_json
-from backend.core.docintel import ParsedDocument
+from backend.core.docintel import NotConfiguredError, ParsedDocument
 from backend.core.websearch import OriginalPageEvidence
 from backend.pilot import PARSER_VERSION
 
@@ -200,6 +200,9 @@ class CachedPDFOCR:
         except Exception as error:
             failure = error
             entry.update(status="failed", error_type=type(error).__name__)
+            if isinstance(error, NotConfiguredError):
+                entry.update(new_analysis=False, analysis_attempted=False, analyzed_pages=0,
+                             usage_reported=True, cost_usd=0, pricing_basis="pre_provider_configuration_failure")
             raise
         finally:
             if self.usage_callback:

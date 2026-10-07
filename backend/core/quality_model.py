@@ -158,6 +158,8 @@ class ResponsesCompletion:
         *,
         images: list[str] | None = None,
         reasoning_effort: str | None = None,
+        prompt_cache_key: str | None = None,
+        cache_prefix: str | None = None,
     ) -> T:
         self.last_usage = {}
         effort = _nonempty(
@@ -178,6 +180,21 @@ class ResponsesCompletion:
         response: Any = None
         failure: Exception | None = None
         status = "request_failed"
+        extra_body = {}
+        if prompt_cache_key:
+            extra_body["prompt_cache_key"] = _nonempty(prompt_cache_key, "prompt_cache_key")
+        if cache_prefix:
+            if not prompt_cache_key:
+                raise QualityModelConfigurationError("A stable cache prefix requires prompt_cache_key")
+            # SDK 1.91 predates these v1 fields. extra_body preserves them on the wire.
+            extra_body.update({
+                "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+                "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": cache_prefix,
+                     "prompt_cache_breakpoint": {"mode": "explicit"}},
+                    *content,
+                ]}],
+            })
         try:
             response = self.client.responses.create(
                 model=self.deployment,
@@ -189,6 +206,7 @@ class ResponsesCompletion:
                 store=False,
                 # SDK 1.91 requires api_version at construction; the v1 API does not.
                 extra_query={"api-version": Omit()},
+                extra_body=extra_body or None,
             )
             status = "response_invalid"
             result = self._parse_response(response, schema)
@@ -204,6 +222,8 @@ class ResponsesCompletion:
             raise
         finally:
             record = self._usage_record(response, schema.__name__, effort, status, failure)
+            record["prompt_cache_key"] = prompt_cache_key
+            record["explicit_cache_prefix"] = bool(cache_prefix)
             self.last_usage = deepcopy(record)
             self.call_records.append(deepcopy(record))
             if self.usage_callback is not None:

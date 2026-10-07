@@ -66,6 +66,40 @@ do not satisfy these rules.
 Reviewer Proposed value cells show Yes/No, sentence-case all-caps vendor prose
 while retaining technical abbreviations, and display `NSF61` as `NSF 61`.
 Machine values and supporting quotations are unchanged.
+The reviewer Confidence column is separate from model probability: High for
+literal exact-product evidence, Medium for derived or confirmed-family evidence,
+and Low for inference or unconfirmed-family evidence. The row uses its weakest
+candidate confidence; Evidence retains each candidate's label. The pure
+applicability classifier supplies these labels; it does not grant human approval.
+
+### Stable judging and prompt reuse
+
+Grounded proposals are judged once per unique definition, typed value/unit,
+quote and versioned location. The key also versions the interpretation rule,
+judge instructions and deployment so a policy/source change cannot reuse a stale
+verdict. Persistent caches are owner-scoped and shared across products and runs.
+Fresh proposals are batched. An initial accepted verdict is final; only disputed
+verdicts receive two additional independent calls and a majority-of-three result.
+Missing/invalid votes remain visibly disputed and are not cached. Cache hit/miss
+and votes are recorded in technical diagnostics; acceptance is not human approval.
+Extraction/refinement remain bounded to two calls per product/tier; judging can
+add up to three calls for previously unseen identities.
+
+Packets put definitions and identical shared source passages before product data.
+Shared passages are the intersection of already product-scoped documents, never
+neighboring product rows. Each source family gets a stable `prompt_cache_key`.
+On the configured GPT-6 Sol deployment, the Responses request marks the shared
+prefix with an explicit `prompt_cache_breakpoint`, using
+`prompt_cache_options={"mode":"explicit","ttl":"30m"}`. The locked SDK transmits
+these v1 fields through `extra_body`; a native serializer test checks the wire
+shape. Actual cached-input tokens, not expected cache eligibility, measure reuse.
+See [Azure prompt caching](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/prompt-caching).
+
+The Cowork draft is scoring-only. It is not a source binding, packet input,
+instruction or citation. The offline scorer separately supports `agree`,
+`format-only difference`, `differ`, `DocIntel-only`, `Cowork-only` and
+`both-not-found`; tests capture actual extraction/refinement/judge arguments
+(including images and serialized payloads) to detect reference leakage.
 
 Manufacturer PDF retrieval uses pinned public HTTPS on Mueller/Ford domains,
 `pdftotext` first, then cached DI only for a textless PDF of at most five pages.
@@ -74,6 +108,11 @@ failures remain explicit and retryable. `QUALITY_DI_USD_PER_PAGE` defaults to
 the disclosed $0.01/page prebuilt-layout estimate. DI pages, cache hits and
 unknown usage join the same run meter; no separate reservation or admission
 system is introduced. Existing WebIQ search/browse caps remain unchanged.
+`QUALITY_OCR_SMOKE=true` explicitly verifies the approved textless Mueller PDF
+once in the worker before a run, using its actual page count (at most five).
+It uses the same meter and successful byte cache, and never gives the API DI
+permission. Leave it false after the requested verification. Missing local DI
+configuration is reported as a pre-provider failure, not an unpriced analysis.
 
 ```python
 from pydantic import BaseModel
@@ -128,7 +167,7 @@ unsupported. A judge decision is recorded separately from human approval.
 The optional canary records every grounded head-style interpretation and every
 rejected answer. Zero or multiple grounded candidates are diagnostic outcomes,
 not readiness failures. All grounded candidates and the spent call are carried
-into the product's vendor pass; its three-call limit is unchanged.
+into the product's vendor pass; it consumes one of its two extraction slots.
 
 `last_usage` starts as `{}` and describes the latest attempted provider request.
 `call_records` retains independent copies of every record. A synchronous optional

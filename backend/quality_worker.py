@@ -30,9 +30,10 @@ from backend.extract import source_evidence
 from backend.models.enrichment import Candidate, Evidence, Manifest, OfflineSource, RetrievalOutcome
 from backend.pilot import PARSER_VERSION
 from backend.quality_pipeline import (
-    SYSTEM, QualityExtraction, complete_quality_call, expand_citations,
-    ground_candidate, product_packet, run_product,
+    JUDGE_SYSTEM, SYSTEM, QualityExtraction, complete_quality_call, expand_citations,
+    ground_candidate, product_packet, run_product, shared_source_ids, source_family,
 )
+from backend.quality_judge import JudgeCache
 
 FORD_PDF_SHA256 = "b50c311840c19d96fd994a2a8f281f243c37e63257aad81c41821e0df6910cfa"
 FORD_PDF_BLOB = "documents/av-source-4.pdf"
@@ -368,6 +369,7 @@ def run_quality_batch(
     smoke_first: bool = False,
     cost_summary=None,
     execution_id: str | None = None,
+    ocr_smoke: bool = False,
 ) -> dict:
     """Append new immutable results and preserve the complete previous state chain."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
@@ -454,6 +456,35 @@ def run_quality_batch(
         if completion is None:
             from backend.core.quality_model import ResponsesCompletion
             completion = ResponsesCompletion()
+        judge_cache = JudgeCache(
+            store, namespace=owner, policy=JUDGE_SYSTEM + str(getattr(completion, "deployment", "")),
+        )
+        loaded = {item["item_key"]: loader.load(item) for item in record["items"]} if not smoke_only else {}
+        shared = shared_source_ids([data[0] for data in loaded.values()])
+        if ocr_smoke:
+            from backend.quality_pdf import CachedPDFOCR, pdf_text
+            if web is None or not isinstance(web.pdf_ocr, CachedPDFOCR):
+                raise ValueError("OCR verification requires the configured worker DI parser")
+            binding = next(source for item in record["items"] for source in item.get("sources", [])
+                           if source.get("sha256") == "51bd50b060bda424281f80c61b038cdc7221c07c05c80da432cd6c3dc2c34290")
+            content = store.read_bytes(binding["blob"], max_bytes=10 * 1024 * 1024)[0]
+            if digest(content) != binding["sha256"]:
+                raise ValueError("OCR verification PDF differs from the approved source")
+            text, pages = pdf_text(content)
+            if text.strip():
+                raise ValueError("OCR verification source unexpectedly contains a text layer")
+            context = {"item_id": "PIMITEM-213030", "tier": "internal_pdf", "phase": "ocr_verification"}
+            ocr = CachedPDFOCR(
+                store, web.pdf_ocr.parser,
+                usage_callback=lambda entry: persist_usage({**entry, **context}),
+                before_call=lambda entry: before_usage({**entry, **context}),
+            )
+            verified = ocr(content, source="batchblob:///" + binding["blob"], page_count=pages,
+                           retrieved_at=datetime.now(timezone.utc))
+            latest(prefix + "/ocr-verification.json", {
+                "status": "succeeded", "page_count": pages, "cache_hit": verified.cache_hit,
+                "characters": len(verified.document.raw_text), "source": verified.document.source,
+            })
         if smoke_only or smoke_first:
             smoke = run_model_smoke(record, loader, completion, run_id=run_id, usage_callback=persist_usage, before_call=before_usage)
             write_json(store, execution_prefix + "/smoke.json", smoke)
@@ -472,13 +503,14 @@ def run_quality_batch(
             attempt = digest(f"quality-v1:{batch_id}:{run_id}:{execution_id}:{item_key}".encode())
             result_key = f"results/{batch_id}/{item_key}/attempts/{attempt}.json"
             start = now()
-            evidence, retrieval, provenance = loader.load(item)
+            evidence, retrieval, provenance = loaded[item_key]
             ford = any(s.get("sha256") == FORD_PDF_SHA256 for s in item.get("sources", []))
             reuse_smoke = smoke is not None and smoke.get("item_id") == manifest.product.item_id
             result = run_product(
                 manifest, evidence, completion, run_id=run_id, item_key=item_key, web=web,
                 images=image if ford else None, usage_callback=persist_usage,
                 before_call=before_usage, retrieval=retrieval,
+                judge_cache=judge_cache, shared_ids=shared[source_family(evidence)],
                 initial_candidates={"vendor_table": [
                     Candidate.model_validate(candidate) for candidate in smoke["candidates"]
                 ]} if reuse_smoke else None,
@@ -536,7 +568,8 @@ def run_quality_batch(
                "execution_products": products,
                "usage": all_usage, "model_calls": sum(e.get("operation") == "model" for e in all_usage),
                "execution_model_calls": sum(e.get("operation") == "model" for e in usage_records),
-               "new_di_calls": 0, "error": type(failure).__name__ if failure else None,
+               "new_di_calls": sum(e.get("operation") == "document_intelligence" and e.get("analysis_attempted") is True
+                                   for e in all_usage), "error": type(failure).__name__ if failure else None,
                "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only, "smoke": smoke,
                "cost": cost}
     write_json(store, execution_prefix + "/summary.json", summary)
@@ -606,6 +639,7 @@ def main(argv=None) -> int:
             smoke_first=args.smoke_first and not args.smoke_only,
             usage_callback=priced_usage, before_call=meter.before_call, cost_summary=cost_snapshot,
             execution_id=args.execution_id,
+            ocr_smoke=os.environ.get("QUALITY_OCR_SMOKE", "false").lower() == "true",
         )
     finally:
         print(json.dumps({"quality_cost": meter.summary()}, ensure_ascii=True), flush=True)
