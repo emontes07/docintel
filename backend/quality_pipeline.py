@@ -32,6 +32,15 @@ from backend.quality_definitions import (
 TIERS: tuple[SourceTier, ...] = ("internal_pdf", "vendor_table", "manufacturer_web", "approved_web")
 logger = logging.getLogger(__name__)
 
+# Documented, grounding-enforced derivation (see _nonflanged_outlet); the only
+# attribute-specific prompt sentence naming a reference-comparison attribute. Listed in
+# docs/review/pilot-specific-constants.md for replacement by a per-category rule pack.
+NONFLANGED_OUTLET_RULE = """Exception: Flanged Outlet=False may be inferred from an explicitly stated
+different OUTLET mechanism: saddle meter swivel nut or female/male iron pipe
+thread (FIP/MIP). Quote the outlet role and mechanism, justify the inference,
+and require review. Never infer No from silence or from the inlet mechanism.
+"""
+
 EVIDENCE_RULES = """Every literal value must appear in its cited quote. Derived values require an
 explicit normalization_rule; inferred values require a clear justification.
 Follow structured_definitions for each expected type and allowed options.
@@ -50,11 +59,7 @@ Quote the complete assertion, not a header alone. These require review and
 justification. Never infer a feature from absence, alternatives,
 optional accessories, negation, or a different feature. Other Boolean values
 require a literal labeled yes/no.
-Exception: Flanged Outlet=False may be inferred from an explicitly stated
-different OUTLET mechanism: saddle meter swivel nut or female/male iron pipe
-thread (FIP/MIP). Quote the outlet role and mechanism, justify the inference,
-and require review. Never infer No from silence or from the inlet mechanism.
-For Pipe / Tubing Compatibility, derive Iron pipe from Female/Male Iron Pipe
+""" + NONFLANGED_OUTLET_RULE + """For Pipe / Tubing Compatibility, derive Iron pipe from Female/Male Iron Pipe
 Thread, and Copper from copper service, flare or compression connections.
 State connection_material_v1 and the actual mapping in the justification.
 For Primary Material, the paired product paragraphs about all potable-water
@@ -788,6 +793,7 @@ def run_product(
     judge_cache: JudgeCache | None = None, shared_ids: set[str] | None = None,
     definition_rows: list[dict] | None = None,
     tool_loop_enabled: bool = False, tool_prices: dict | None = None,
+    second_look_enabled: bool = False, tool_loop_max_steps: int = 6,
 ) -> EnrichmentResult:
     """No retries and no DI. Callbacks make usage persistent before the next request."""
     definitions = {a.attribute_id: a for a in manifest.attributes}
@@ -832,10 +838,7 @@ def run_product(
         pending = list(dict.fromkeys([*pending, *[candidate.attribute_id for candidate in seeds]]))
         if not pending:
             continue
-        if tier in {"manufacturer_web", "approved_web"} and web is not None:
-            fetched = web.load(manifest, tier, pending)
-            evidence.extend(fetched)
-            outcomes.append(RetrievalOutcome(source_tier=tier, status="success" if fetched else "no_evidence"))
+        # Web tiers are no longer fetched per product; only the optional tool loop may retrieve web sources.
         active = [entry for entry in evidence if entry.source_tier == tier]
         if not active:
             if not any(outcome.source_tier == tier for outcome in outcomes):
@@ -915,6 +918,96 @@ def run_product(
             for key in pending:
                 if not attributes[key].candidates and attributes[key].status != "definition_clarification_needed":
                     attributes[key].status = "extraction_failed"
+    def merge(candidate: Candidate) -> bool:
+        target = attributes[candidate.attribute_id]
+        identity = judge_cache.identity(definitions[candidate.attribute_id], candidate, evidence)
+        previous = next((entry for entry in target.candidates
+                         if judge_cache.identity(definitions[candidate.attribute_id], entry, evidence) == identity), None)
+        if previous is not None:
+            quality_pass = (candidate.grounding or {}).get("quality_pass", "")
+            previous.grounding = {**(previous.grounding or {}), f"{quality_pass}_rechecked".replace("tool_loop", "tool"): True}
+            return False
+        target.candidates.append(candidate)
+        if not definitions[candidate.attribute_id].unit_resolved:
+            target.status = "definition_clarification_needed"
+        else:
+            values = {(str(c.value).casefold(), c.unit) for c in target.candidates}
+            target.status = "conflict" if len(values) > 1 and structured[candidate.attribute_id].kind != "Multi-Select" else "proposed"
+        return True
+
+    if second_look_enabled and not tool_loop_enabled:
+        statuses = {
+            key: "resolved" if _resolved(attribute) else
+            "disputed" if any(c.judge_status == "judge_disputed" for c in attribute.candidates) else "unresolved"
+            for key, attribute in attributes.items()
+        }
+        pending = [key for key, status in statuses.items() if status != "resolved" and key not in manifest.existing_values]
+        local = [entry for entry in evidence if entry.source_tier in PASS1_TIERS]
+        if pending and local:
+            packet = product_packet(manifest, local, "internal_pdf", pending, shared_ids=shared_ids, structured=structured)
+            packet["active_tier"] = "all_local"
+            packet["attribute_status"] = {key: statuses[key] for key in pending}
+            packet["existing_candidates"] = [
+                {**echo, "judge_status": candidate.judge_status}
+                for key in pending for candidate in attributes[key].candidates
+                for echo in echo_candidates([candidate], packet)
+            ]
+            indexed = {entry.evidence_id: entry for entry in local}
+            mapping = build_applicability_map(manifest, evidence)
+            found: list[tuple[SourceTier, Candidate]] = []
+            try:
+                response = call("all_local", "second_look", packet, QualityExtraction)
+            except Exception as error:
+                if getattr(error, "quality_budget_stop", False):
+                    raise
+                response = None
+                for key in pending:
+                    attributes[key].rejected_candidates.append(
+                        {"phase": "second_look", "reason": f"Model second look failed ({type(error).__name__})."})
+            for proposal in response.candidates if response is not None else []:
+                key = proposal.attribute_id
+                if key not in pending:
+                    continue
+                try:
+                    proposal = expand_citations(proposal, packet)
+                    tiers = {indexed[k].source_tier for k in proposal.evidence_ids if k in indexed}
+                    if len(tiers) != 1:
+                        raise ValueError("A second-look candidate must cite evidence from exactly one local tier.")
+                    tier = tiers.pop()
+                    candidate = ground_structured_candidate(
+                        proposal, definitions[key], [e for e in local if e.source_tier == tier], structured[key],
+                    )
+                    candidate.grounding = {
+                        **(candidate.grounding or {}), "quality_pass": "second_look",
+                        "applicability": candidate_applicability(candidate, mapping, evidence).model_dump(mode="json"),
+                    }
+                    found.append((tier, candidate))
+                except (ValueError, TypeError) as error:
+                    attributes[key].rejected_candidates.append({
+                        "attribute_id": key, "value": proposal.value, "unit": proposal.unit,
+                        "supporting_quote": proposal.supporting_quote, "evidence_ids": proposal.evidence_ids,
+                        "phase": "second_look", "reason": str(error),
+                    })
+            for tier in PASS1_TIERS:
+                group = [candidate for cited_tier, candidate in found if cited_tier == tier]
+                if not group:
+                    continue
+                judge_candidates(
+                    group, definitions, evidence, cited_packet(product_packet(
+                        manifest, evidence, tier, pending, shared_ids=shared_ids, structured=structured, tier_only=True,
+                    ), group),
+                    lambda request, schema, tier=tier: call(tier, "judge", request, schema),
+                    judge_cache, diagnostics=diagnostics,
+                    context={"item_id": manifest.product.item_id, "run_id": run_id, "tier": tier},
+                )
+            added = sum(merge(candidate) for _, candidate in found)
+            diagnostics.append({
+                "operation": "second_look_summary", "phase": "second_look", "item_id": manifest.product.item_id,
+                "run_id": run_id, "requested_attributes": pending, "proposals": len(response.candidates) if response else 0,
+                "grounded": len(found), "added": added,
+                "accepted": sum(c.judge_status == "accepted" for _, c in found),
+            })
+
     if tool_loop_enabled:
         from backend.quality_cost import maximum_tool_cost
         from backend.quality_tool_loop import ProductSourceScope, run_tool_loop
@@ -994,6 +1087,7 @@ def run_product(
                 maximum_cost=lambda context: maximum_tool_cost(context, completion.pricing_usd_per_million, tool_prices),
                 usage_callback=usage_callback, before_call=before_call, run_id=run_id,
                 prompt_cache_key=cache_key, cache_prefix=prefix, structured_definitions=structured,
+                max_steps=tool_loop_max_steps,
             )
         except Exception as error:
             if getattr(error, "quality_budget_stop", False):
@@ -1019,17 +1113,7 @@ def run_product(
                     **submission.proposal.model_dump(mode="json"), "phase": "tool_loop", "reason": submission.reason,
                 })
                 continue
-            candidate = submission.candidate
-            identity = judge_cache.identity(definitions[candidate.attribute_id], candidate, evidence)
-            previous = next((entry for entry in target.candidates
-                             if judge_cache.identity(definitions[candidate.attribute_id], entry, evidence) == identity), None)
-            if previous is not None:
-                previous.grounding = {**(previous.grounding or {}), "tool_rechecked": True}
-                continue
-            target.candidates.append(candidate)
-            if definitions[candidate.attribute_id].unit_resolved:
-                values = {(str(c.value).casefold(), c.unit) for c in target.candidates}
-                target.status = "conflict" if len(values) > 1 and structured[candidate.attribute_id].kind != "Multi-Select" else "proposed"
+            merge(submission.candidate)
     final_mapping = build_applicability_map(manifest, evidence)
     for attribute in attributes.values():
         for candidate in attribute.candidates:

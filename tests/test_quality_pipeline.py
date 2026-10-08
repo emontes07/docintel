@@ -198,7 +198,7 @@ def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdi
     assert packet["unresolved_attributes"] == ["Primary Material"]
     assert "prior_tier_review" not in packet
     assert [entry["kind"] for entry in packet["evidence"]] == ["vendor_row"]  # tier-scoped
-    assert len(client.calls) == 6
+    assert len(client.calls) == 5  # a 2/2 dispute needs no third vote
     assert [candidate.judge_status for candidate in result.attributes[0].candidates] == [
         "judge_disputed", "accepted",
     ]
@@ -206,18 +206,38 @@ def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdi
                if schema == QualityJudgment)
 
 
-def test_disputed_verdicts_receive_three_votes_after_both_extraction_passes():
+def test_agreeing_disputes_stop_after_two_votes_after_both_extraction_passes():
     definitions = manifest().attributes + [AttributeDefinition(attribute_id="Valve Type", description="", value_type="string")]
     client = Completion([[proposal()], [proposal(attribute_id="Valve Type", value="angle valve", supporting_quote="angle valve")]], disputed=True)
     result = run_product(manifest(definitions), [evidence("Body: BRASS. Angle valve.")], client, run_id="r")
-    assert [schema for schema, _, _ in client.calls] == [QualityExtraction, QualityExtraction, *[QualityJudgment] * 3]
+    assert [schema for schema, _, _ in client.calls] == [QualityExtraction, QualityExtraction, *[QualityJudgment] * 2]
     assert client.calls[-1][2]["reasoning_effort"] == "low"
     assert len(client.calls[-1][1]["candidates"]) == 2
     assert all(a.candidates[0].judge_status == "judge_disputed" for a in result.attributes)
+    assert all(a.candidates[0].judge_reason.startswith("Majority 2/2") for a in result.attributes)
     assert all(a.reviewer_explanation for a in result.attributes)
     model_calls = [call for call in result.quality_diagnostics if call["operation"] == "model"]
-    assert len(model_calls) == 5
+    assert len(model_calls) == 4
     assert all(call["run_id"] == "r" and call["call_id"] for call in model_calls)
+
+
+@pytest.mark.parametrize("third,status", [("accepted", "accepted"), ("judge_disputed", "judge_disputed")])
+def test_third_vote_only_breaks_a_one_one_split(third, status):
+    class Split(Completion):
+        votes = iter(["judge_disputed", "accepted", third])
+
+        def complete_structured(self, system, user, schema, **kwargs):
+            result = super().complete_structured(system, user, schema, **kwargs)
+            if schema == QualityJudgment:
+                for decision in result.decisions:
+                    decision.decision = next(self.votes)
+            return result
+
+    client = Split([[proposal()]])
+    result = run_product(manifest(), [evidence()], client, run_id="split")
+    assert [schema for schema, _, _ in client.calls].count(QualityJudgment) == 3
+    candidate = result.attributes[0].candidates[0]
+    assert candidate.judge_status == status and candidate.judge_reason.startswith("Majority 2/3")
 
 
 def test_second_pass_reasks_material_using_already_cited_brass_and_nl_paragraphs():
@@ -565,8 +585,39 @@ def test_judge_identity_invalidates_changed_definition_source_quote_and_owner():
     assert JudgeCache(store, namespace="owner", policy="policy").get(key)["decision"] == "accepted"
     assert JudgeCache(store, namespace="another-owner", policy="policy").get(key) is None
     assert cache.identity(definition.model_copy(update={"description": "Different meaning"}), candidate, [original]) != key
-    assert cache.identity(definition, candidate, [original.model_copy(update={"source_version": "changed"})]) != key
     assert cache.identity(definition, candidate.model_copy(update={"supporting_quote": "other quote"}), [original]) != key
+    # Location-free: the same quote/value in another row, page or version reuses the verdict.
+    moved = original.model_copy(update={"source_version": "changed",
+                                        "source_locator": "https://example.com/other#page=9&paragraph=4"})
+    assert cache.identity(definition, candidate, [moved]) == key
+    # ...but a different document role or applicability status does not.
+    titled = original.model_copy(update={"source_locator": original.source_locator + "&role=manufacturerTitleBlock"})
+    assert cache.identity(definition, candidate, [titled]) != key
+    unconfirmed = candidate.model_copy(update={"grounding": {**candidate.grounding,
+                                                             "applicability": {"status": "family-unconfirmed"}}})
+    assert cache.identity(definition, unconfirmed, [original]) != key
+
+
+def test_vendor_judge_identity_uses_the_quoted_cell_column_not_the_row():
+    from backend.quality_judge import JudgeCache
+
+    def row(number, column):
+        return Evidence(
+            evidence_id=f"v{number}", source_id="vendor", source_tier="vendor_table", content_kind="source_excerpt",
+            source_locator=f"https://example.com/vendor.xlsx#sheet=S&row={number}", source_version="sha256:" + "c" * 64,
+            text=json.dumps({"sheet": "S", "row": number, "cells": [
+                {"cell": f"A{number}", "column": "Part #", "value": f"P{number}"},
+                {"cell": f"B{number}", "column": column, "value": "LOCKWING"}]}),
+            observed_at=NOW, provider_retrieved_at=NOW,
+        )
+    definition = AttributeDefinition(attribute_id="Locking Feature", description="", value_type="string")
+    cache = JudgeCache(policy="policy")
+    def key(entry):
+        candidate = Candidate(attribute_id="Locking Feature", value="Other: LOCKWING", evidence_ids=[entry.evidence_id],
+                              origin="derived", supporting_quote="LOCKWING")
+        return cache.identity(definition, candidate, [entry])
+    assert key(row(1096, "DescrGen4")) == key(row(2201, "DescrGen4"))
+    assert key(row(1096, "DescrGen4")) != key(row(1096, "Notes"))
 
 
 def test_incomplete_judge_votes_are_visible_and_never_cached():
@@ -671,7 +722,7 @@ def test_ford_image_fault_is_per_item_and_text_results_survive(monkeypatch, mode
     client = Completion([[proposal()], [proposal()]])
     summary = run_quality_batch(store, "batch", "owner", "image-" + mode, completion=client, ford_image_blob=blob)
     assert summary["state"] == "completed" and len(summary["products"]) == 2
-    assert summary["model_calls"] == 3
+    assert summary["model_calls"] == 4  # applicability differs between the products, so no verdict reuse
     ford = EnrichmentResult.model_validate(BatchService(store).detail("batch", "row-2", "owner")["machine_result"])
     other = EnrichmentResult.model_validate(BatchService(store).detail("batch", "row-3", "owner")["machine_result"])
     assert ford.attributes[0].candidates[0].value == other.attributes[0].candidates[0].value == "brass"
@@ -1068,31 +1119,20 @@ def test_cost_snapshot_survives_response_failure_and_discloses_unknown_usage(rep
     assert summary["state"] == "failed" and cost["model_calls"] == 1
 
 
-def test_web_usage_has_run_identity_and_is_exported_even_without_model_calls(monkeypatch):
+def test_per_product_web_tiers_are_not_fetched_and_web_yield_is_reported(monkeypatch):
     store, _ = seed_store(1)
     monkeypatch.setattr(CachedEvidenceLoader, "load", lambda *args: ([], [], []))
+
     class Web:
         def load(self, manifest, tier, pending):
-            event = {"operation": "web_search", "item_id": manifest.product.item_id, "tier": tier,
-                     "phase": "search", "status": "succeeded", "cost_usd": .002}
-            self.before_call(event)
-            self.usage_callback(event)
-            return []
-    contexts = []
-    summary = run_quality_batch(store, "batch", "owner", "web-run", completion=Completion(),
-                                web=Web(), before_call=contexts.append)
-    assert summary["model_calls"] == 0 and len(summary["usage"]) == 2
-    assert [call["call_id"] for call in summary["usage"]] == ["web-run:0001", "web-run:0002"]
-    assert [call["call_id"] for call in contexts] == ["web-run:0001", "web-run:0002"]
-    rows = read_workbook(BatchService(store).export("batch", "owner"))["Diagnostics"]
-    rows = [row for row in rows if row["Operation"] == "web_search"]
-    assert len(rows) == 2
-    assert all(row["Run ID"] == "web-run" and row["Operation"] == "web_search" for row in rows)
-    assert all(row["Row"] == "2" for row in rows)
-    assert sum(float(row["Cost USD"]) for row in rows) == pytest.approx(.004)
+            pytest.fail("Per-product web tiers must not be fetched")
+
+    summary = run_quality_batch(store, "batch", "owner", "web-run", completion=Completion(), web=Web())
+    assert summary["model_calls"] == 0 and summary["usage"] == []
+    assert summary["web_yield"]["total"] == {"web_cost_usd": 0, "web_operations": 0,
+                                             "accepted_web_values": 0, "accepted_per_usd": None}
     result = EnrichmentResult.model_validate(read_json(store, summary["products"][0]["result_key"])[0])
-    public = read_workbook(build_reviewer_package([result]).workbook)
-    assert "Diagnostics" not in public and public["Questions"]
+    assert {o.source_tier: o.status for o in result.retrieval}["manufacturer_web"] == "not_attempted"
 
 
 def test_smoke_cli_env_does_not_initialize_web(monkeypatch):

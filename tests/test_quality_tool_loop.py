@@ -1697,10 +1697,9 @@ def test_compact_pdf_projection_retains_exact_qualification_and_source_cache(mon
 
 
 @pytest.mark.parametrize("max_steps", [15, 4])
-def test_tool_requests_reuse_shared_rules_and_prioritize_attribute_names_only(max_steps):
+def test_tool_requests_reuse_shared_rules_without_a_reference_priority_list(max_steps):
     from backend.quality_pipeline import EVIDENCE_RULES
-    priorities = ["Port Type", "Material Standard", "Compatible Meter Size", "Flanged Outlet"]
-    names = ["Nominal Size", "Ball Coating", *priorities]
+    names = ["Nominal Size", "Ball Coating", "Port Type", "Material Standard", "Compatible Meter Size", "Flanged Outlet"]
     product = Manifest(product=PRODUCT, attributes=[
         AttributeDefinition(attribute_id=name, description="Synthetic definition", value_type="string")
         for name in names
@@ -1719,12 +1718,9 @@ def test_tool_requests_reuse_shared_rules_and_prioritize_attribute_names_only(ma
     instructions = request["instructions"]
     assert loop.EVIDENCE_RULES is EVIDENCE_RULES
     assert instructions.count(EVIDENCE_RULES) == 1
-    priority_line = instructions.split(
-        "Among unresolved/disputed definitions, investigate these attribute names first:\n", 1,
-    )[1].splitlines()[0]
-    assert priority_line.removesuffix(".").split("; ") == priorities
-    assert "Skip resolved names or names absent from the pending definitions" in instructions
-    assert "no expected values or evidence" in instructions
+    preamble = instructions.replace(EVIDENCE_RULES, "")
+    assert not any(name in preamble for name in names)
+    assert "investigate these attribute names first" not in instructions
     packet = json.loads(request["input"][0]["content"])
     assert packet["attributes"] == sorted(names)
     assert [definition["attribute_id"] for definition in packet["definitions"]] == sorted(names)

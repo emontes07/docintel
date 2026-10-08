@@ -288,7 +288,8 @@ def test_reference_is_absent_from_worker_tool_requests_continuation_and_native_j
         assert_no_reference(request)
         assert_no_reference(json.dumps(request, default=str))
         captured.append(deepcopy(request))
-        inputs = request["extra_body"]["input"]
+        # Closeouts send the definitions as plain text with no cache fields.
+        inputs = request.get("extra_body", {}).get("input", request["input"])
         content = inputs[0]["content"]
         prefix = json.loads(content[0]["text"])
         packet = json.loads(content[1]["text"])
@@ -355,7 +356,7 @@ def test_reference_is_absent_from_worker_tool_requests_continuation_and_native_j
             store, "isolation", "owner", "tool-reference-isolation", execution_id="offline",
             completion=completion, ford_image_blob="documents/catalog.png",
             before_call=lambda context: phases.append(context["phase"]),
-            tool_loop_enabled=True,
+            tool_loop_enabled=True, tool_loop_max_steps=15,
             tool_prices={"search_usd": 0.0125, "browse_usd": 0.0125, "di_usd_per_page": 0.01},
         )
 

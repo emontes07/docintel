@@ -104,7 +104,7 @@ def test_tool_rechecking_does_not_duplicate_an_existing_cached_dispute(tmp_path)
     material = next(attribute for attribute in result.attributes if attribute.attribute_id == "Material")
     assert len(material.candidates) == 1 and material.candidates[0].judge_status == "judge_disputed"
     assert material.candidates[0].grounding["tool_rechecked"] is True
-    assert len(judge_votes) == 3
+    assert len(judge_votes) == 2  # agreeing disputes need no third vote
     assert adapter.client.responses.create.call_count == 2
 
 
