@@ -61,6 +61,8 @@ class PdfItem:
         entry["presentation"] = {
             "kind": self.kind, **self.location, "context_only": self.context_only,
         }
+        if self.header_labels:
+            entry["presentation"]["header_labels"] = list(self.header_labels)
         return entry
 
 

@@ -160,8 +160,11 @@ class ResponsesCompletion:
         reasoning_effort: str | None = None,
         prompt_cache_key: str | None = None,
         cache_prefix: str | None = None,
+        max_output_tokens: int | None = None,
     ) -> T:
         self.last_usage = {}
+        if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens <= 0):
+            raise QualityModelConfigurationError("max_output_tokens must be a positive integer")
         effort = _nonempty(
             reasoning_effort if reasoning_effort is not None else self.effort,
             "reasoning_effort",
@@ -202,7 +205,7 @@ class ResponsesCompletion:
                 input=cast(ResponseInputParam, [{"role": "user", "content": content}]),
                 text={"format": text_format},
                 reasoning=cast(Reasoning, {"effort": effort}),
-                max_output_tokens=self.max_output_tokens,
+                max_output_tokens=max_output_tokens or self.max_output_tokens,
                 store=False,
                 # SDK 1.91 requires api_version at construction; the v1 API does not.
                 extra_query={"api-version": Omit()},

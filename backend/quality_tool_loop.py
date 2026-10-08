@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
+import os
 import re
 import socket
 from typing import Any, Literal, Protocol, TypeVar
@@ -43,9 +44,9 @@ from backend.core.quality_model import QualityModelResponseError, ResponsesCompl
 from backend.core.websearch import ExternalEvidenceError, OriginalPageEvidence, _public_addresses, validate_original_url
 from backend.models.enrichment import AttributeDefinition, Candidate, Contract, Evidence, Manifest, ProductKey
 from backend.quality_cost import CostAmount, CostLimitExceeded
-from backend.quality_definitions import StructuredDefinition, derive_definition, model_instruction
+from backend.quality_definitions import StructuredDefinition, compact_instruction, derive_definition, model_instruction
 from backend.quality_pdf import CachedPDFOCR, PDFPageEvidence, TEXT_MAX_BYTES
-from backend.quality_pipeline import EVIDENCE_RULES, QualityProposal, product_packet
+from backend.quality_pipeline import EVIDENCE_RULES, QualityProposal
 from backend.quality_tool_model import ResponsesToolModel, parse_turn, strict_json
 from backend.quality_web import (
     MAX_BROWSES_PER_PRODUCT, MAX_SEARCHES_PER_PRODUCT, BrowseUnavailable, QualityWeb, original_page,
@@ -423,42 +424,29 @@ def _approved_cache_prefix(
     prefix: str | None, manifest: Manifest, local: list[Evidence], pending: set[str],
     structured: dict[str, StructuredDefinition],
 ) -> str | None:
-    """Validate provenance, not wording: only exact definitions/approved projections."""
+    """Accept only the exact approved compact-definitions block; no evidence or hints."""
     if prefix is None:
         return None
+    expected = json.dumps({"definitions": [
+        compact_instruction(structured[a.attribute_id]) for a in manifest.attributes
+    ]}, ensure_ascii=False)
     try:
         if not isinstance(prefix, str) or not prefix.strip():
             raise ValueError("Expected a nonempty JSON prefix")
-        packet = strict_json(prefix)
-        required = {"definitions", "shared_source_documents"}
-        if (not isinstance(packet, dict) or not required <= set(packet)
-                or set(packet) - required - {"structured_definitions"}):
-            raise ValueError("Cache prefix requires definitions/shared_source_documents; only structured_definitions is optional")
-        authoritative = product_packet(
-            manifest, local, "internal_pdf", sorted(pending),
-            shared_ids={item.evidence_id for item in local}, structured=structured,
-        )
-        for key in packet:
-            def identity(entry: Any) -> str:
-                if not isinstance(entry, dict):
-                    raise ValueError("Cache entries must be objects")
-                entry = dict(entry)
-                if key == "shared_source_documents":
-                    # Citation ordinals change with a caller's shared-source subset;
-                    # the approved original evidence IDs/content must not change.
-                    citation = entry.pop("citation_id", None)
-                    if citation is not None and (not isinstance(citation, str) or not re.fullmatch(r"S[1-9][0-9]*", citation)):
-                        raise ValueError("Shared citation IDs must be ordinal references, not arbitrary context")
-                return json.dumps(entry, sort_keys=True, ensure_ascii=True, allow_nan=False)
-            if not isinstance(packet[key], list):
-                raise ValueError("Cache entry collections must be lists")
-            allowed = {identity(entry) for entry in authoritative[key]}
-            requested = [identity(entry) for entry in packet[key]]
-            if len(set(requested)) != len(requested) or not set(requested) <= allowed:
-                raise ValueError("Cache prefix includes data outside the approved definitions/source projections")
+        strict_json(prefix)
+        if prefix != expected:
+            raise ValueError("Cache prefix must be exactly the approved compact definitions")
         return prefix
     except (ValueError, TypeError) as error:
         raise ToolLoopError("Unapproved cache prefix; reference hints and arbitrary context are not accepted") from error
+
+
+def _tool_output_limit(closeout: bool) -> int:
+    name = "QUALITY_MAX_OUTPUT_TOKENS_" + ("CLOSEOUT" if closeout else "TOOL_STEP")
+    value = int(os.environ.get(name, 6000 if closeout else 4000))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
 
 
 def _model_evidence(item: Evidence) -> dict[str, Any]:
@@ -835,8 +823,10 @@ def run_tool_loop(
     inventory = [{"source_id": e.source_id, "source_tier": e.source_tier, "source_locator": e.source_locator}
                  for e in sources.local]
     packet = {"product": manifest.product.model_dump(mode="json"),
-              "attributes": [definitions[key].model_dump(mode="json") for key in sorted(pending)],
-              "structured_definitions": [model_instruction(structured[key]) for key in sorted(pending)],
+              "attributes": sorted(pending),
+              **({} if cache_prefix is not None else {
+                  "definitions": [compact_instruction(structured[key]) for key in sorted(pending)],
+              }),
               "pass1_status": {key: pass1_status[key] for key in sorted(pending)},
               "local_sources": inventory, "manufacturer_hosts": scope.manufacturer_hosts,
               "approved_hosts": scope.approved_hosts, "public_web_discovery": scope.allow_public_web_discovery}
@@ -847,10 +837,13 @@ def run_tool_loop(
         while True:
             remaining = actions.max_steps - result.steps
             closeout = remaining <= CLOSEOUT_STEPS
+            # Closeouts change tools/instructions, so a cached prefix would be a never-read write.
             request = model.build_request(
                 SYSTEM + ("\n" + CLOSEOUT_INSTRUCTION if closeout else ""), history,
-                [] if closeout else TOOLS, ToolConclusion, prompt_cache_key=prompt_cache_key, cache_prefix=cache_prefix,
+                [] if closeout else TOOLS, ToolConclusion, prompt_cache_key=None if closeout else prompt_cache_key,
+                cache_prefix=cache_prefix, cache_write=not closeout,
             )
+            request["max_output_tokens"] = min(request["max_output_tokens"], _tool_output_limit(closeout))
             if closeout:
                 request["tool_choice"] = "none"
             def invoke_model() -> tuple[list[dict[str, Any]], list[dict[str, Any]], Any]:
@@ -872,15 +865,12 @@ def run_tool_loop(
                     raise
                 fresh_closeout_attempted = True
                 closeout = True
-                terminal_packet = {
-                    key: packet[key] for key in ("product", "attributes", "structured_definitions", "pass1_status")
-                }
+                terminal_packet = {key: packet[key] for key in ("product", "attributes", "pass1_status")}
+                terminal_packet["definitions"] = [compact_instruction(structured[key]) for key in sorted(pending)]
                 terminal_packet["evidence"] = [_model_evidence(item) for item in sources.delivered.values()]
                 history = [{"role": "user", "content": json.dumps(terminal_packet, ensure_ascii=False)}]
-                request = model.build_request(
-                    SYSTEM + "\n" + CLOSEOUT_INSTRUCTION, history, [], ToolConclusion,
-                    prompt_cache_key=prompt_cache_key,
-                )
+                request = model.build_request(SYSTEM + "\n" + CLOSEOUT_INSTRUCTION, history, [], ToolConclusion)
+                request["max_output_tokens"] = min(request["max_output_tokens"], _tool_output_limit(True))
                 request["tool_choice"] = "none"
                 items, calls, conclusion = actions.call(
                     "model", invoke_model,

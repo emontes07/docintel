@@ -63,9 +63,23 @@ class ResponsesToolModel:
     def build_request(
         self, instructions: str, inputs: list[dict[str, Any]], tools: list[dict[str, Any]],
         conclusion: type[BaseModel], *, prompt_cache_key: str | None = None,
-        cache_prefix: str | None = None,
+        cache_prefix: str | None = None, cache_write: bool = True,
     ) -> dict[str, Any]:
+        """cache_write=False sends the prefix as ordinary text with no cache key or breakpoint."""
         extra_body: dict[str, Any] = {}
+        if cache_prefix is not None and not cache_write:
+            if not isinstance(cache_prefix, str) or not cache_prefix.strip():
+                raise QualityModelConfigurationError("cache_prefix must be nonempty text")
+            inputs = deepcopy(inputs)
+            if not inputs or inputs[0].get("role") != "user":
+                raise QualityModelConfigurationError("A prefix requires initial user input")
+            content = inputs[0].get("content")
+            if isinstance(content, str):
+                content = [{"type": "input_text", "text": content}]
+            if not isinstance(content, list):
+                raise QualityModelConfigurationError("Initial user content must be text or a content list")
+            inputs[0]["content"] = [{"type": "input_text", "text": cache_prefix}, *content]
+            cache_prefix, prompt_cache_key = None, None
         if prompt_cache_key is not None:
             if not isinstance(prompt_cache_key, str) or not prompt_cache_key.strip():
                 raise QualityModelConfigurationError("prompt_cache_key must be a nonempty string")

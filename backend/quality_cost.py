@@ -28,6 +28,7 @@ class QualityCostMeter:
         overnight_prior_cost_usd: CostAmount = 0, worker_usd_per_second: CostAmount = 0,
         search_usd: CostAmount = "0.0125", browse_usd: CostAmount = "0.0125",
         di_usd_per_page: CostAmount = "0.01", clock=monotonic,
+        run_cap_usd: CostAmount = 10, overnight_cap_usd: CostAmount = 40,
     ):
         self.store = store
         self.key = f"quality-runs/{batch_id}/{run_id}/cost.json"
@@ -38,6 +39,9 @@ class QualityCostMeter:
         self.worker_rate = _amount(worker_usd_per_second)
         self.search_rate, self.browse_rate = _amount(search_usd), _amount(browse_usd)
         self.di_rate = _amount(di_usd_per_page)
+        self.run_cap, self.overnight_cap = _amount(run_cap_usd), _amount(overnight_cap_usd)
+        if self.run_cap <= 0 or self.overnight_cap <= 0:
+            raise ValueError("Spend caps must be positive")
         try:
             self.state, self.version = read_json(store, self.key)
         except Missing:
@@ -62,7 +66,7 @@ class QualityCostMeter:
             worker_cost_usd=float(worker),
             known_run_cost_usd=float(total),
             known_overnight_cost_usd=float(self.overnight_prior + total),
-            run_cap_usd=10, overnight_cap_usd=40,
+            run_cap_usd=float(self.run_cap), overnight_cap_usd=float(self.overnight_cap),
             qualification="Price-basis estimate from logged usage and elapsed compute, not finalized billing. Unpriced calls are disclosed separately.",
         )
         self.version = write_json(self.store, self.key, self.state, self.version)
@@ -71,8 +75,8 @@ class QualityCostMeter:
     def before_call(self, context=None) -> None:
         current = self.summary()
         maximum = _amount((context or {}).get("maximum_cost_usd", 0))
-        if (Decimal(str(current["known_run_cost_usd"])) + maximum >= 10
-                or Decimal(str(current["known_overnight_cost_usd"])) + maximum >= 40):
+        if (Decimal(str(current["known_run_cost_usd"])) + maximum >= self.run_cap
+                or Decimal(str(current["known_overnight_cost_usd"])) + maximum >= self.overnight_cap):
             raise CostLimitExceeded(
                 f"Monetary cap reached: run ${current['known_run_cost_usd']:.4f}; "
                 f"overnight ${current['known_overnight_cost_usd']:.4f}"

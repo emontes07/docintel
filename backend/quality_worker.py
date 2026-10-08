@@ -30,7 +30,7 @@ from backend.extract import source_evidence
 from backend.models.enrichment import Candidate, Evidence, Manifest, OfflineSource, RetrievalOutcome
 from backend.pilot import PARSER_VERSION
 from backend.quality_pipeline import (
-    JUDGE_SYSTEM, SYSTEM, QualityExtraction, complete_quality_call, expand_citations,
+    EXTRACT_TASK, JUDGE_SYSTEM, QualityExtraction, complete_quality_call, expand_citations,
     ground_candidate, product_packet, run_product, shared_source_ids, source_family,
 )
 from backend.quality_judge import JudgeCache
@@ -305,10 +305,10 @@ def run_model_smoke(record, loader, completion, *, run_id, usage_callback=None, 
                 break
     if target is None or (cell_value or "").strip().casefold() != "lockwing":
         raise QualitySmokeError("Stored Mueller vendor cell T1096 must contain Lockwing; no model call was made.")
-    packet = product_packet(manifest, evidence, "vendor_table", [SMOKE_ATTRIBUTE])
+    packet = product_packet(manifest, evidence, "vendor_table", [SMOKE_ATTRIBUTE], tier_only=True)
     packet["smoke_target"] = {"attribute": SMOKE_ATTRIBUTE, "source_row": 1096, "source_cell": "T1096"}
     response = complete_quality_call(
-        completion, SYSTEM, packet, QualityExtraction,
+        completion, EXTRACT_TASK, packet, QualityExtraction,
         context={"operation": "model", "item_id": manifest.product.item_id, "item_key": item["item_key"],
                  "run_id": run_id, "call_id": f"{run_id}:{item['item_key']}:1",
                  "tier": "vendor_table", "phase": "smoke", "call_index": 1},
@@ -617,7 +617,12 @@ def main(argv=None) -> int:
         "browse_usd": os.environ.get("QUALITY_WEB_BROWSE_USD_PER_CALL", "0.0125"),
         "di_usd_per_page": os.environ.get("QUALITY_DI_USD_PER_PAGE", "0.01"),
     }
-    meter = QualityCostMeter(store, args.batch_id, cost_run_id, **prices)
+    caps = {
+        "run_cap_usd": os.environ.get("QUALITY_RUN_CAP_USD", "10"),
+        # The session (formerly "overnight") cap spans runs via QUALITY_OVERNIGHT_PRIOR_COST_USD.
+        "overnight_cap_usd": os.environ.get("QUALITY_SESSION_CAP_USD", os.environ.get("QUALITY_OVERNIGHT_CAP_USD", "40")),
+    }
+    meter = QualityCostMeter(store, args.batch_id, cost_run_id, **prices, **caps)
 
     def priced_usage(entry):
         return {**meter.record(entry), "cost_run_id": cost_run_id}

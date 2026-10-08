@@ -665,7 +665,7 @@ def test_pdf_over_ocr_page_limit_never_starts_ocr(monkeypatch):
 
 def test_real_sdk_explicit_cache_breakpoint_precedes_dynamic_and_continued_input():
     requests, admissions = [], []
-    prefix = json.dumps({"definitions": [manifest().attributes[0].model_dump(mode="json")], "shared_source_documents": []})
+    prefix = approved_prefix()
     reasoning = {"id": "rs_cache", "type": "reasoning", "summary": [], "encrypted_content": "continued-secret"}
     outputs = iter([response(reasoning, tool()), response(message())])
     def handle(request):
@@ -861,22 +861,18 @@ def test_reference_hints_cannot_enter_via_cache_prefix(kind):
 
 
 def test_matching_wording_in_authoritative_definition_and_source_is_permitted():
-    from backend.quality_pipeline import product_packet
-    product = manifest()
-    product.attributes[0].description = "Definition includes LEGITIMATE_DESCRIPTOR."
-    local = [evidence(text="Body: LEGITIMATE_DESCRIPTOR.")]
-    packet = product_packet(product, local, "internal_pdf", ["Material"], shared_ids={"e1"})
-    prefix = json.dumps({key: packet[key] for key in ("definitions", "shared_source_documents")})
+    specs = parent_structured_definitions()
+    local = [evidence(text="Body: SYNTHETIC_APPROVED_OPTION.")]
     adapter = completion([response(message())])
     result = loop.run_tool_loop(
-        product, local, adapter, pass1_status={"Material": "unresolved", "Resolved": "resolved"},
+        manifest(), local, adapter, pass1_status={"Material": "unresolved", "Resolved": "resolved"},
         scope=loop.ProductSourceScope(PRODUCT, frozenset({"e1"})),
         ground_candidate=ground_candidate, judge_candidates=judge, maximum_cost=maximum, usage_callback=price,
-        prompt_cache_key="family", cache_prefix=prefix,
+        prompt_cache_key="family", cache_prefix=approved_prefix(specs), structured_definitions=specs,
     )
     assert result.status == "completed"
     request = adapter.client.responses.create.call_args.kwargs
-    assert "LEGITIMATE_DESCRIPTOR" in request["extra_body"]["input"][0]["content"][0]["text"]
+    assert "SYNTHETIC_APPROVED_OPTION" in request["extra_body"]["input"][0]["content"][0]["text"]
     assert not result.evidence  # A cache prefix never authorizes unrequested evidence.
 
 
@@ -893,12 +889,16 @@ def test_composed_judge_override_logs_actual_request_reasoning_effort():
     adapter.usage_callback.assert_not_called()
 
 
-def structured_prefix(structured=None):
-    from backend.quality_pipeline import product_packet
+def approved_prefix(structured=None):
+    from backend.quality_pipeline import definitions_prefix, product_packet
     packet = product_packet(
         manifest(), [evidence()], "internal_pdf", ["Material"], shared_ids={"e1"}, structured=structured,
     )
-    return {key: packet[key] for key in ("definitions", "structured_definitions", "shared_source_documents")}
+    return definitions_prefix(packet)
+
+
+def structured_prefix(structured=None):
+    return json.loads(approved_prefix(structured))
 
 
 def parent_structured_definitions():
@@ -913,38 +913,34 @@ def parent_structured_definitions():
 
 
 def test_pr2_structured_prefix_derived_from_manifest_needs_no_explicit_input():
-    from backend.quality_definitions import derive_definition, model_instruction
+    from backend.quality_definitions import compact_instruction, derive_definition
     adapter = completion([response(message())])
     prefix = structured_prefix()
-    result = run(adapter, prompt_cache_key="family", cache_prefix=json.dumps(prefix))
+    result = run(adapter, prompt_cache_key="family", cache_prefix=approved_prefix())
     assert result.status == "completed"
     request = adapter.client.responses.create.call_args.kwargs
     dynamic = json.loads(request["input"][0]["content"])
-    expected = model_instruction(derive_definition(manifest().attributes[0].model_dump(mode="json")))
-    assert dynamic["structured_definitions"] == [expected]
+    expected = compact_instruction(derive_definition(manifest().attributes[0].model_dump(mode="json")))
+    assert "definitions" not in dynamic and dynamic["attributes"] == ["Material"]
+    assert prefix["definitions"][0] == expected
     assert json.loads(request["extra_body"]["input"][0]["content"][0]["text"]) == prefix
 
 
 def test_pr2_explicit_parent_definition_objects_enrich_prefix_and_dynamic_packet():
-    from backend.quality_definitions import model_instruction
     specs = parent_structured_definitions()
     adapter = completion([response(message())])
     prefix = structured_prefix(specs)
-    result = run(adapter, structured_definitions=specs, prompt_cache_key="family", cache_prefix=json.dumps(prefix))
+    result = run(adapter, structured_definitions=specs, prompt_cache_key="family", cache_prefix=approved_prefix(specs))
     assert result.status == "completed"
-    dynamic = json.loads(adapter.client.responses.create.call_args.kwargs["input"][0]["content"])
-    assert dynamic["structured_definitions"] == [model_instruction(specs["Material"])]
-    assert dynamic["structured_definitions"][0]["allowed_values"] == ["SYNTHETIC_APPROVED_OPTION"]
+    assert prefix["definitions"][0]["allowed_values"] == ["SYNTHETIC_APPROVED_OPTION"]
     assert not result.evidence
 
 
-def test_explicit_structured_objects_support_partial_mapping_and_legacy_prefix():
+def test_explicit_structured_objects_support_partial_mapping():
     specs = parent_structured_definitions()
-    prefix = structured_prefix()
-    del prefix["structured_definitions"]
     adapter = completion([response(message())])
     result = run(adapter, structured_definitions={"Material": specs["Material"]},
-                 prompt_cache_key="family", cache_prefix=json.dumps(prefix))
+                 prompt_cache_key="family", cache_prefix=approved_prefix(specs))
     assert result.status == "completed"
 
 
@@ -965,7 +961,7 @@ def test_enriched_prefix_is_rejected_without_explicit_approved_parent_definition
 ])
 def test_structured_prefix_cannot_introduce_arbitrary_hints_or_type_coercions(field, value):
     prefix = structured_prefix()
-    prefix["structured_definitions"][0][field] = value
+    prefix["definitions"][0][field] = value
     adapter = completion()
     with pytest.raises(loop.ToolLoopError, match="Unapproved cache prefix"):
         run(adapter, prompt_cache_key="family", cache_prefix=json.dumps(prefix))
@@ -1730,10 +1726,11 @@ def test_tool_requests_reuse_shared_rules_and_prioritize_attribute_names_only(ma
     assert "Skip resolved names or names absent from the pending definitions" in instructions
     assert "no expected values or evidence" in instructions
     packet = json.loads(request["input"][0]["content"])
-    assert [definition["attribute_id"] for definition in packet["attributes"]] == sorted(names)
+    assert packet["attributes"] == sorted(names)
+    assert [definition["attribute_id"] for definition in packet["definitions"]] == sorted(names)
     assert packet["pass1_status"] == statuses
     assert packet["local_sources"] == []
-    assert all(not definition["allowed_values"] and not definition["examples"] for definition in packet["attributes"])
+    assert all(not definition.get("allowed_values") and "examples" not in definition for definition in packet["definitions"])
     assert "REFERENCE_ONLY_VALUE" not in json.dumps(request, default=str)
     if max_steps == 4:
         assert request["tools"] == [] and request["tool_choice"] == "none"
@@ -1757,7 +1754,7 @@ def test_priority_name_does_not_override_resolved_attribute_scope():
             maximum_cost=maximum, usage_callback=price,
         )
     packet = json.loads(adapter.client.responses.create.call_args.kwargs["input"][0]["content"])
-    assert [definition["attribute_id"] for definition in packet["attributes"]] == ["Material Standard"]
+    assert packet["attributes"] == ["Material Standard"]
     assert packet["pass1_status"] == {"Material Standard": "unresolved"}
     infrastructure.search.assert_not_called()
 
@@ -1792,7 +1789,7 @@ def test_monetary_closeout_uses_fresh_complete_evidence_and_same_cached_judge(vo
         ])
         usage = Mock(side_effect=price)
         before = Mock()
-        prefix = json.dumps(structured_prefix())
+        prefix = approved_prefix()
         result = run(
             adapter, web=infrastructure, judge_candidates=cached_judge,
             maximum_cost=growing_history_maximum, usage_callback=usage, before_call=before,
@@ -1808,11 +1805,11 @@ def test_monetary_closeout_uses_fresh_complete_evidence_and_same_cached_judge(vo
         assert any(item.get("type") == "function_call_output" for item in requests[1]["extra_body"]["input"])
         fresh = requests[-1]
         assert fresh["tools"] == [] and fresh["tool_choice"] == "none"
-        assert fresh.get("extra_body") == {"prompt_cache_key": "family"}
+        assert fresh.get("extra_body") is None  # closeouts never write a cache entry
         assert "previous_response_id" not in fresh
         assert len(fresh["input"]) == 1 and fresh["input"][0]["role"] == "user"
         packet = json.loads(fresh["input"][0]["content"])
-        assert set(packet) == {"product", "attributes", "structured_definitions", "pass1_status", "evidence"}
+        assert set(packet) == {"product", "attributes", "definitions", "pass1_status", "evidence"}
         assert packet["product"] == PRODUCT.model_dump(mode="json")
         expected_evidence = []
         for item in result.evidence:
@@ -1984,7 +1981,7 @@ def test_real_sdk_sends_only_clean_fresh_terminal_input_after_monetary_denial():
     try:
         result = run(
             completion(client=client), maximum_cost=growing_history_maximum, initial_cost_usd=".7",
-            prompt_cache_key="family", cache_prefix=json.dumps(structured_prefix()),
+            prompt_cache_key="family", cache_prefix=approved_prefix(),
         )
     finally:
         client.close()
