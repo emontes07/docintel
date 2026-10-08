@@ -3,6 +3,7 @@
 API:
     derive_definition(manifest_fields, original_row=approved_row)
     model_instruction(definition)
+    compact_instruction(definition)  # model-facing; rules in DEFINITION_RULES
     normalize_proposal(definition, candidate.model_dump())
     source_bearing_texts(normalization_result)
 
@@ -318,6 +319,41 @@ def derive_definition(
     )
 
 
+DISPLAY_RULE = "Boolean: Yes/No; other scalars unchanged; numeric unit appended with one space."
+NORMALIZATION_RULE = (
+    "Use literal bool internally. Enumerated: exact listed value or Other: <verbatim source text>. "
+    "Multi-Select: exact listed/Other members separated by '; ', in source order; never split "
+    "commas, slashes, 'and', or 'or'. Text is verbatim, including whitespace. "
+    "With no approved options, retain unknown source text as Other and request definition review. "
+    "Numbers with resolved unit guidance require an exact matching supplied unit; with missing "
+    "guidance retain the supplied numeric value/unit, including absent unit, for clarification. "
+    "No synonym guessing, unit conversion, rounding, dropped qualifiers, or inferred booleans."
+)
+COMPONENT_RULE = (
+    "Only when explicitly allowed: '<declared label>: <member>' or "
+    "'<exact listed value> <declared label>'; keep labels and material text intact. "
+    "Multiple component-qualified members may use '; ' even for an Enumerated definition."
+    " Missing permission/label guidance retains source-bearing component text unchanged for "
+    "review, without claiming approved mapping; explicit prohibitions/violations still fail."
+)
+GROUNDING_RULE = (
+    "Definition/options/examples are not product evidence. Every value, Other payload, "
+    "number, unit, negation, alternative and component label must remain quote-grounded "
+    "to applicable source evidence. Structural validation never approves grounding."
+)
+UNRESOLVED_RULE = (
+    "definition_ready=false means invalid/conflicting structure; do not normalize. "
+    "Missing guidance is not absence of evidence: retain found candidates with requires_review "
+    "and definition_questions. Do not invent constraints or discard review candidates."
+)
+# Stated once in the shared model instructions instead of once per attribute.
+DEFINITION_RULES = (
+    "Structured definition rules (apply to every definition):\n"
+    f"- display: {DISPLAY_RULE}\n- normalization: {NORMALIZATION_RULE}\n"
+    f"- components: {COMPONENT_RULE}\n- grounding: {GROUNDING_RULE}\n- unresolved: {UNRESOLVED_RULE}\n"
+)
+
+
 def model_instruction(definition: StructuredDefinition) -> dict[str, Any]:
     """JSON-compatible model contract. Source fields/examples are not evidence."""
     return {
@@ -334,35 +370,39 @@ def model_instruction(definition: StructuredDefinition) -> dict[str, Any]:
         "definition_issues": list(definition.issues),
         "definition_questions": list(definition.definition_questions),
         "derivation_rule": _RULES[definition.kind],
-        "display_rule": "Boolean: Yes/No; other scalars unchanged; numeric unit appended with one space.",
-        "normalization_rule": (
-            "Use literal bool internally. Enumerated: exact listed value or Other: <verbatim source text>. "
-            "Multi-Select: exact listed/Other members separated by '; ', in source order; never split "
-            "commas, slashes, 'and', or 'or'. Text is verbatim, including whitespace. "
-            "With no approved options, retain unknown source text as Other and request definition review. "
-            "Numbers with resolved unit guidance require an exact matching supplied unit; with missing "
-            "guidance retain the supplied numeric value/unit, including absent unit, for clarification. "
-            "No synonym guessing, unit conversion, rounding, dropped qualifiers, or inferred booleans."
-        ),
-        "component_rule": (
-            "Only when explicitly allowed: '<declared label>: <member>' or "
-            "'<exact listed value> <declared label>'; keep labels and material text intact. "
-            "Multiple component-qualified members may use '; ' even for an Enumerated definition."
-            " Missing permission/label guidance retains source-bearing component text unchanged for "
-            "review, without claiming approved mapping; explicit prohibitions/violations still fail."
-        ),
-        "grounding_rule": (
-            "Definition/options/examples are not product evidence. Every value, Other payload, "
-            "number, unit, negation, alternative and component label must remain quote-grounded "
-            "to applicable source evidence. Structural validation never approves grounding."
-        ),
-        "unresolved_rule": (
-            "definition_ready=false means invalid/conflicting structure; do not normalize. "
-            "Missing guidance is not absence of evidence: retain found candidates with requires_review "
-            "and definition_questions. Do not invent constraints or discard review candidates."
-        ),
+        "display_rule": DISPLAY_RULE,
+        "normalization_rule": NORMALIZATION_RULE,
+        "component_rule": COMPONENT_RULE,
+        "grounding_rule": GROUNDING_RULE,
+        "unresolved_rule": UNRESOLVED_RULE,
         "field_provenance": dict(definition.provenance),
     }
+
+
+def compact_instruction(definition: StructuredDefinition) -> dict[str, Any]:
+    """Model-facing definition: per-attribute facts only; shared rules live in DEFINITION_RULES."""
+    entry: dict[str, Any] = {
+        "attribute_id": definition.attribute_id,
+        "expected_type": definition.kind,
+        "derivation_rule": _RULES[definition.kind],
+    }
+    if definition.allowed_values:
+        entry["allowed_values"] = list(definition.allowed_values)
+    if definition.unit is not None:
+        entry["unit"] = definition.unit
+    if not definition.unit_resolved:
+        entry["unit_resolved"] = False
+    if definition.allow_component_detail or definition.component_permission_resolved:
+        entry["allow_component_detail"] = definition.allow_component_detail
+    if definition.component_labels:
+        entry["component_labels"] = list(definition.component_labels)
+    if not definition.ready:
+        entry["definition_ready"] = False
+    if definition.issues:
+        entry["definition_issues"] = list(definition.issues)
+    if definition.definition_questions:
+        entry["definition_questions"] = list(definition.definition_questions)
+    return entry
 
 
 def _other(text: str) -> str | None:

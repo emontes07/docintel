@@ -223,12 +223,14 @@ def test_reference_is_absent_from_real_worker_model_requests_and_serialized_imag
     ]
     for body in captured:
         images = body["options"]["images"]
-        assert len(images) == 1
-        assert base64.b64decode(images[0].split(",", 1)[1]) == clean_image
+        if body["schema"]["title"] == "QualityJudgment":
+            assert images is None  # judges see cited text only
+        else:
+            assert len(images) == 1
+            assert base64.b64decode(images[0].split(",", 1)[1]) == clean_image
         assert body["system"]
         prefix = json.loads(body["options"]["cache_prefix"])
-        assert prefix["definitions"]
-        assert "shared_source_documents" in prefix
+        assert set(prefix) == {"definitions"} and prefix["definitions"]
         assert "definitions" not in json.loads(body["user"])
         assert_no_reference(body["options"])
         assert_no_reference(json.dumps(body))
@@ -320,8 +322,7 @@ def test_reference_is_absent_from_worker_tool_requests_continuation_and_native_j
             assert schema == "QualityExtraction"
             answer = {"candidates": []}
             if packet["active_tier"] == "internal_pdf" and "first_pass_candidates" not in packet:
-                entries = prefix["shared_source_documents"] + packet["evidence"]
-                entry = next(entry for entry in entries if entry["source_tier"] == "internal_pdf")
+                entry = next(entry for entry in packet["evidence"] if entry["kind"] != "vendor_row")
                 answer["candidates"] = [{
                     "attribute_id": "Primary Material", "value": "brass", "origin": "literal",
                     "supporting_quote": "Body: BRASS.", "evidence_ids": [entry["citation_id"]],
@@ -374,7 +375,7 @@ def test_reference_is_absent_from_worker_tool_requests_continuation_and_native_j
         assert json.loads(prefix_part["text"])["definitions"]
         assert_no_reference(request)
         assert_no_reference(json.dumps(request, default=str))
-    for request in captured[:3]:
+    for request in captured[:2]:
         images = [
             entry["image_url"] for entry in request["extra_body"]["input"][0]["content"]
             if entry["type"] == "input_image"
@@ -401,7 +402,8 @@ def test_reference_is_absent_from_worker_tool_requests_continuation_and_native_j
     assert native_judge["tools"] == [] and native_judge["reasoning"] == {"effort": "low"}
     judge_packet = json.loads(native_judge["input"][0]["content"])
     assert [candidate["attribute_id"] for candidate in judge_packet["candidates"]] == ["Valve Type"]
-    assert judge_packet["candidates"][0]["evidence_ids"] == [delivered[0]["evidence_id"]]
+    assert judge_packet["candidates"][0]["citation_ids"] == [judge_packet["evidence"][0]["citation_id"]]
+    assert "evidence_ids" not in judge_packet["candidates"][0]
     assert not any(key.startswith("scoring/") for key in store.reads)
     assert "documents/vendor.xlsx" in store.reads
     result = read_json(store, summary["products"][0]["result_key"])[0]

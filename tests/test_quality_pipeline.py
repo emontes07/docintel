@@ -56,9 +56,7 @@ def evidence(text="Part number: AV11-333W-NL. Body: BRASS.", tier="internal_pdf"
 def model_packet(user, kwargs):
     packet = json.loads(user)
     if kwargs.get("cache_prefix"):
-        prefix = json.loads(kwargs["cache_prefix"])
-        packet["definitions"] = prefix["definitions"]
-        packet["evidence"] = prefix["shared_source_documents"] + packet["evidence"]
+        packet["definitions"] = json.loads(kwargs["cache_prefix"])["definitions"]
     return packet
 
 
@@ -199,7 +197,7 @@ def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdi
                   if schema == QualityExtraction and packet["active_tier"] == "vendor_table")
     assert packet["unresolved_attributes"] == ["Primary Material"]
     assert "prior_tier_review" not in packet
-    assert len(packet["evidence"]) == 2
+    assert [entry["kind"] for entry in packet["evidence"]] == ["vendor_row"]  # tier-scoped
     assert len(client.calls) == 6
     assert [candidate.judge_status for candidate in result.attributes[0].candidates] == [
         "judge_disputed", "accepted",
@@ -241,7 +239,9 @@ def test_second_pass_reasks_material_using_already_cited_brass_and_nl_paragraphs
     assert len(client.calls) == 3
     refinement = client.calls[1][1]
     assert refinement["unresolved_attributes"] == ["Primary Material"]
-    assert {entry["evidence_id"] for entry in refinement["already_cited_passages"]} == {"e1", "e2"}
+    assert refinement["already_cited_citation_ids"] == ["E1", "E2"]
+    assert {c["attribute_id"] for c in refinement["first_pass_candidates"]} == {"Material Standard (Brass Alloy)", "Lead-Free"}
+    assert all(set(c) == {"attribute_id", "value", "unit", "citation_ids", "quote"} for c in refinement["first_pass_candidates"])
     material = next(attribute for attribute in result.attributes if attribute.attribute_id == "Primary Material")
     assert material.candidates[0].value == "No-lead brass"
     assert material.candidates[0].origin == "derived"
@@ -495,7 +495,7 @@ def test_four_product_worker_appends_attempts_preserves_history_and_persists_usa
     def answer(system, user, schema, **kwargs):
         packet = model_packet(user, kwargs)
         if schema == QualityExtraction:
-            client.responses.append([proposal(evidence_ids=[packet["evidence"][0]["evidence_id"]])])
+            client.responses.append([proposal(evidence_ids=[packet["evidence"][0]["citation_id"]])])
         return Completion.complete_structured(client, system, user, schema, **kwargs)
     client.complete_structured = answer
     summary = run_quality_batch(store, "batch", "owner", "first", completion=client, execution_id="first-execution")
@@ -680,8 +680,9 @@ def test_ford_image_fault_is_per_item_and_text_results_survive(monkeypatch, mode
     diagnostic = next(d for d in ford.input_diagnostics if d.get("operation") == "image_input")
     assert diagnostic["status"] == status and diagnostic["text_only"] is (mode != "present")
     assert diagnostic["target_mpn"] == ford.manifest.product.mpn
-    assert all(bool(kwargs["images"]) is (mode == "present") for _, _, kwargs in client.calls[:2])
-    assert all(kwargs["images"] is None for _, _, kwargs in client.calls[2:])
+    # The catalog image accompanies extraction only; judges see cited text entries.
+    assert bool(client.calls[0][2]["images"]) is (mode == "present")
+    assert all(kwargs["images"] is None for _, _, kwargs in client.calls[1:])
     assert all(packet["target_mpn"] == ford.manifest.product.mpn for _, packet, _ in client.calls[:2])
     public = read_workbook(build_reviewer_package([ford, other]).workbook)
     assert set(public) == {"Review", "Evidence", "Instructions", "Summary", "Questions"}
@@ -862,7 +863,7 @@ class SmokeCompletion(Completion):
 
     def complete_structured(self, system, user, schema, **kwargs):
         packet = json.loads(user)
-        row = next(entry for entry in packet["evidence"] if entry["source_tier"] == "vendor_table")
+        row = next(entry for entry in packet["evidence"] if entry["kind"] == "vendor_row")
         self.responses.append([proposal(
             attribute_id="Operating Head Style", value=self.value, supporting_quote=self.value,
             evidence_ids=[row["citation_id"]],
@@ -919,7 +920,7 @@ def test_grounded_live_canary_disagreement_continues_to_full_extraction_and_judg
             packet = json.loads(user)
             if schema == QualityExtraction:
                 if packet.get("smoke_target"):
-                    row = next(entry for entry in packet["evidence"] if entry["source_tier"] == "vendor_table")
+                    row = next(entry for entry in packet["evidence"] if entry["kind"] == "vendor_row")
                     self.responses.append([proposal(
                         attribute_id="Operating Head Style", value="Flat Head", supporting_quote=quote,
                         evidence_ids=[row["citation_id"]],
@@ -965,15 +966,15 @@ def test_smoke_first_processes_all_four_in_one_execution_and_reuses_vendor_call(
     class Combined(Completion):
         def complete_structured(self, system, user, schema, **kwargs):
             packet = model_packet(user, kwargs)
-            target = packet["manifest"]["product"]["item_id"] == "PIMITEM-213030"
+            target = packet["product"]["item_id"] == "PIMITEM-213030"
             if packet.get("smoke_target"):
-                row = next(entry for entry in packet["evidence"] if entry["source_tier"] == "vendor_table")
+                row = next(entry for entry in packet["evidence"] if entry["kind"] == "vendor_row")
                 generated = [proposal(attribute_id="Operating Head Style", value="Lockwing",
                                       supporting_quote="Lockwing", evidence_ids=[row["citation_id"]])]
-            else:
+            elif schema == QualityExtraction:
                 assert read_json(store, "quality-runs/batch/one-execution/smoke.json")[0]["status"] == "passed"
-                row = next(entry for entry in packet["evidence"] if entry["source_tier"] == "internal_pdf")
-                generated = [] if target else [proposal(evidence_ids=[row["citation_id"]])]
+                row = next((entry for entry in packet["evidence"] if entry["kind"] != "vendor_row"), None)
+                generated = [] if target or row is None else [proposal(evidence_ids=[row["citation_id"]])]
             if schema == QualityExtraction:
                 self.responses.append(generated)
             return super().complete_structured(system, user, schema, **kwargs)
