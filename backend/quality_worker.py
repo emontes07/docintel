@@ -29,6 +29,7 @@ from backend.evidence_verification import Fragment, match_text
 from backend.extract import source_evidence
 from backend.models.enrichment import Candidate, Evidence, Manifest, OfflineSource, RetrievalOutcome
 from backend.pilot import PARSER_VERSION
+from backend.quality_metrics import web_yield
 from backend.quality_pipeline import (
     EXTRACT_TASK, JUDGE_SYSTEM, QualityExtraction, complete_quality_call, expand_citations,
     ground_candidate, product_packet, run_product, shared_source_ids, source_family,
@@ -372,6 +373,8 @@ def run_quality_batch(
     ocr_smoke: bool = False,
     tool_loop_enabled: bool = False,
     tool_prices: dict | None = None,
+    second_look_enabled: bool = False,
+    tool_loop_max_steps: int = 6,
 ) -> dict:
     """Append new immutable results and preserve the complete previous state chain."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
@@ -414,7 +417,7 @@ def run_quality_batch(
         write_json(store, key, value, version)
 
     loader = CachedEvidenceLoader(store)
-    usage_records, products = [], []
+    usage_records, products, product_results = [], [], []
 
     def call_context(usage):
         sequence = sequence_offset + len(usage_records) + 1
@@ -515,6 +518,7 @@ def run_quality_batch(
                 judge_cache=judge_cache, shared_ids=shared[source_family(evidence)],
                 definition_rows=record.get("original_definitions"),
                 tool_loop_enabled=tool_loop_enabled, tool_prices=tool_prices,
+                second_look_enabled=second_look_enabled, tool_loop_max_steps=tool_loop_max_steps,
                 initial_candidates={"vendor_table": [
                     Candidate.model_validate(candidate) for candidate in smoke["candidates"]
                 ]} if reuse_smoke else None,
@@ -532,6 +536,7 @@ def run_quality_batch(
                     **image_diagnostic, "item_id": manifest.product.item_id, "target_mpn": manifest.product.mpn,
                 })
             write_json(store, result_key, result.model_dump(mode="json"))
+            product_results.append(result)
             status = "completed" if all(a.status in {"existing", "proposed"} for a in result.attributes) else "unresolved"
             state = {"state": status, "run_id": run_id, "execution_id": execution_id,
                      "result_key": result_key, "started_at": start, "finished_at": now(),
@@ -577,7 +582,7 @@ def run_quality_batch(
                "new_di_calls": sum(e.get("operation") == "document_intelligence" and e.get("analysis_attempted") is True
                                    for e in all_usage), "error": type(failure).__name__ if failure else None,
                "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only, "smoke": smoke,
-               "cost": cost}
+               "cost": cost, "web_yield": web_yield(product_results, usage_records)}
     write_json(store, execution_prefix + "/summary.json", summary)
     latest(prefix + "/summary.json", summary)
     if failure:
@@ -652,6 +657,8 @@ def main(argv=None) -> int:
             execution_id=args.execution_id,
             ocr_smoke=os.environ.get("QUALITY_OCR_SMOKE", "false").lower() == "true",
             tool_loop_enabled=os.environ.get("QUALITY_TOOL_LOOP_ENABLED", "false").lower() == "true",
+            second_look_enabled=os.environ.get("QUALITY_SECOND_LOOK_ENABLED", "true").lower() == "true",
+            tool_loop_max_steps=int(os.environ.get("QUALITY_TOOL_LOOP_MAX_STEPS", "6")),
             tool_prices=prices,
         )
     finally:

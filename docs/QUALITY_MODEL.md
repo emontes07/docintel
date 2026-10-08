@@ -92,10 +92,24 @@ and Low for inference or unconfirmed-family evidence. The row uses its weakest
 candidate confidence; Evidence retains each candidate's label. The pure
 applicability classifier supplies these labels; it does not grant human approval.
 
-### Bounded unresolved-attribute tools
+### Local second look (default)
 
-`QUALITY_TOOL_LOOP_ENABLED=true` adds one Responses function-calling pass per
-product after the ordinary tiers. Only unresolved/disputed attributes participate.
+After the internal PDF and vendor tiers, `QUALITY_SECOND_LOOK_ENABLED` (worker
+default `true`) sends one compact single-turn request per product over all of that
+product's local evidence for the still unresolved or disputed attributes. Existing
+candidates are echoed so they are not repeated. Each proposal must cite one local
+tier and goes through the same grounding, applicability and judge; a
+`second_look_summary` diagnostic records proposals, grounded, added and accepted.
+Per-product `manufacturer_web`/`approved_web` tiers are no longer fetched; their
+retrieval outcome is `not_attempted`. The run summary carries `web_yield`:
+accepted web-cited values per web dollar for each attribute, which stays empty
+while web is off.
+
+### Bounded unresolved-attribute tools (optional)
+
+`QUALITY_TOOL_LOOP_ENABLED=true` (default `false`) replaces the second look with
+one Responses function-calling pass per product after the ordinary tiers, capped
+at `QUALITY_TOOL_LOOP_MAX_STEPS` (default 6) counted actions. Only unresolved/disputed attributes participate.
 The five tools are `search_vendor_rows`, `read_pdf_page`, `web_search`, `browse`
 and `fetch_pdf`. Local tools read the already approved product-scoped evidence;
 search terms contain only the MPN and requested attribute, never a reference
@@ -103,8 +117,8 @@ answer. Manufacturer discovery/retrieval precedes other public web. Only exact
 discovered public URLs may be retrieved; search/Browse text alone is not evidence.
 PDF/OCR retrieval retains the Mueller/Ford domain and five-page OCR limits.
 
-Each product gets at most 15 counted actions and $1 additional tool-pass usage,
-inside the existing $10/$40 meter. Cost estimates include the complete effective
+Each product gets at most the configured actions (hard ceiling 15) and $1
+additional tool-pass usage, inside the configurable run/session meter. Cost estimates include the complete effective
 request, schema, tool definitions, source prefix, history, opaque reasoning replay
 and maximum output; they never assume a cache hit. Actual usage is charged once.
 Missing prices/unknown usage stop further requests, not a success-shaped result.
@@ -123,8 +137,9 @@ The cost estimate counts UTF-8 model text plus framing/schema/reasoning allowanc
 not additional HTTP JSON escaping. Invalid search-result URLs are recorded as
 rejected discovery entries and are never fetched; a bad lead does not invalidate
 the other safe results. Invalid model-supplied tool URLs remain errors.
-Both extraction and tools share the same type/origin/derivation rules. Tool
-priorities name attributes only, never reference answers.
+Both extraction and tools share the same type/origin/derivation rules. The tool
+prompt carries no attribute priority list; pending attributes are investigated in
+definition order.
 If growing continuation history would exceed the remaining product budget, one
 fresh no-tools terminal request can use all compact delivered evidence instead.
 It retains quotes and provenance and must still fit the same step/product/global
@@ -137,20 +152,23 @@ visible. The scoring-only workbook is never an available tool or input source.
 ### Stable judging and prompt reuse
 
 Grounded proposals are judged once per unique definition, typed value/unit,
-quote and versioned location. The key also versions the interpretation rule,
-judge instructions and deployment so a policy/source change cannot reuse a stale
-verdict. Persistent caches are owner-scoped and shared across products and runs.
-Fresh proposals are batched. An initial accepted verdict is final; only disputed
-verdicts receive two additional independent calls and a majority-of-three result.
+canonical quote, evidence context (vendor column header, or PDF document role/kind plus
+the cited entry text, so different component rows stay distinct),
+interpretation rule and applicability status. Source location and version are not
+part of the key, so the same quoted cell phrase is judged once across rows and
+products. The key also versions judge instructions and deployment.
+Persistent caches are owner-scoped and shared across products and runs.
+Fresh proposals are batched. An initial accepted verdict is final; a disputed
+first vote gets a second vote, and only a 1–1 split gets a third (majority of three).
 Missing/invalid votes remain visibly disputed and are not cached. Cache hit/miss
 and votes are recorded in technical diagnostics; acceptance is not human approval.
 Extraction/refinement remain bounded to two calls per product/tier; judging can
-add up to three calls for previously unseen identities.
+add up to three calls for previously unseen identities (usually one or two).
 
-Packets put definitions and identical shared source passages before product data.
-Shared passages are the intersection of already product-scoped documents, never
-neighboring product rows. Each source family gets a stable `prompt_cache_key`.
-On the configured GPT-6 Sol deployment, the Responses request marks the shared
+The cached prefix is the compact definitions block only (see "Model-facing
+packets"); its `prompt_cache_key` is derived from the shared instructions plus that
+block, so every phase, tier and product with the same definitions reuses one entry.
+On the configured GPT-6 Sol deployment, the Responses request marks the
 prefix with an explicit `prompt_cache_breakpoint`, using
 `prompt_cache_options={"mode":"explicit","ttl":"30m"}`. The locked SDK transmits
 these v1 fields through `extra_body`; a native serializer test checks the wire

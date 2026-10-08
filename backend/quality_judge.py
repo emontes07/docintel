@@ -7,6 +7,7 @@ import json
 import logging
 import unicodedata
 from typing import Literal
+from urllib.parse import parse_qs, urlsplit
 
 from backend.batch_store import Conflict, Missing, read_json, write_json
 from backend.models.enrichment import AttributeDefinition, Candidate, Contract, Evidence
@@ -28,6 +29,31 @@ def _canonical(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
+def evidence_context(entry: Evidence, quote: str) -> str:
+    """Location-free context: vendor column header, or PDF role/kind plus the cited entry text.
+
+    Cited PDF table-row candidates expand to every cell of the row, so including each
+    cited entry's text keeps different component rows (BODY vs COUPLING NUT) apart.
+    """
+    if entry.source_tier == "vendor_table":
+        try:
+            cells = json.loads(entry.text).get("cells", [])
+        except (ValueError, AttributeError):
+            cells = []
+        target = _canonical(quote)
+        columns = sorted({
+            str(cell.get("column")) for cell in cells
+            if _canonical(str(cell.get("value", ""))) and (
+                _canonical(str(cell.get("value", ""))) in target or target in _canonical(str(cell.get("value", "")))
+            )
+        })
+        return "vendor_table:" + "|".join(columns)
+    fields = parse_qs(urlsplit(entry.source_locator).fragment)
+    role = fields.get("role", [""])[0]
+    kind = "table" if "table" in fields else "paragraph" if "paragraph" in fields else "excerpt"
+    return f"{entry.source_tier}:{role or kind}:{_canonical(entry.text)}"
+
+
 class JudgeCache:
     def __init__(self, store=None, *, namespace: str = "offline", policy: str):
         self.store = store
@@ -36,20 +62,23 @@ class JudgeCache:
         self.memory: dict[str, dict] = {}
 
     def identity(self, definition: AttributeDefinition, candidate: Candidate, evidence: list[Evidence]) -> str:
+        """Location-free: the same quote/value/role verdict is reused across rows and products."""
         indexed = {entry.evidence_id: entry for entry in evidence}
+        applicability = ((candidate.grounding or {}).get("applicability") or {})
         identity = {
             "definition": definition.model_dump(mode="json"),
             "value": _canonical(candidate.value) if isinstance(candidate.value, str) else candidate.value,
             "value_type": type(candidate.value).__name__, "unit": candidate.unit,
             "quote": _canonical(candidate.supporting_quote or ""),
-            "locations": sorted(
-                (indexed[key].source_locator, indexed[key].source_version)
-                for key in candidate.evidence_ids
-            ),
+            "context": sorted({
+                evidence_context(indexed[key], candidate.supporting_quote or "")
+                for key in candidate.evidence_ids if key in indexed
+            }),
             "interpretation": {
                 "origin": candidate.origin, "rule": candidate.normalization_rule,
                 "inference_rule": candidate.inference_rule,
             },
+            "applicability": applicability.get("status") if isinstance(applicability, dict) else None,
             "policy": self.policy,
         }
         return hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
@@ -88,7 +117,7 @@ def judge_candidates(
     candidates: list[Candidate], definitions: dict[str, AttributeDefinition], evidence: list[Evidence],
     packet: dict, call, cache: JudgeCache, *, diagnostics: list[dict], context: dict,
 ) -> None:
-    """Batch fresh identities; only first-vote disputes receive two further votes."""
+    """Batch fresh identities; a first-vote dispute gets a second vote, a 1-1 split a third."""
     grouped: dict[str, list[Candidate]] = {}
     for candidate in candidates:
         key = cache.identity(definitions[candidate.attribute_id], candidate, evidence)
@@ -134,19 +163,24 @@ def judge_candidates(
         vote(fresh)
         disputed = {key: candidate for key, candidate in fresh.items()
                     if not votes[key] or votes[key][0].decision == "judge_disputed"}
-        for _ in range(2):
-            if disputed:
-                vote(disputed)
+        split: dict[str, Candidate] = {}
+        if disputed:
+            vote(disputed)
+            # A third vote is spent only to break a 1-1 split.
+            split = {key: candidate for key, candidate in disputed.items()
+                     if len(votes[key]) == 2 and votes[key][0].decision != votes[key][1].decision}
+            if split:
+                vote(split)
         for key in fresh:
-            expected = 3 if key in disputed else 1
+            expected = 3 if key in split else 2 if key in disputed else 1
             current = votes[key]
             complete = len(current) == expected
             accepted = sum(v.decision == "accepted" for v in current)
             decision = "accepted" if complete and accepted > expected // 2 else "judge_disputed"
             supporting = next((v.reason for v in current if v.decision == decision), None)
             reason = (
-                f"Majority {max(accepted, expected - accepted)}/3: {supporting}"
-                if complete and expected == 3 else supporting
+                f"Majority {max(accepted, expected - accepted)}/{expected}: {supporting}"
+                if complete and expected > 1 else supporting
                 if complete else "Incomplete judge votes; grounded proposal retained for human review, verdict not cached."
             )
             record = {"decision": decision, "reason": reason, "votes": [v.model_dump(mode="json") for v in current]}
