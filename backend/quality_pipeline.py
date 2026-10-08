@@ -1049,8 +1049,9 @@ def run_product(
                          if indexed[candidate.evidence_ids[0]].source_tier == tier]
                 if not group:
                     continue
+                # Not tier_only: a tool candidate may cite delivered evidence from more than one tier.
                 packet = cited_packet(product_packet(
-                    manifest, combined, tier, pending, shared_ids=set(), structured=structured, tier_only=True,
+                    manifest, combined, tier, pending, shared_ids=set(), structured=structured,
                 ), group)
 
                 def vote(packet, schema):

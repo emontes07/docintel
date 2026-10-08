@@ -152,7 +152,8 @@ visible. The scoring-only workbook is never an available tool or input source.
 ### Stable judging and prompt reuse
 
 Grounded proposals are judged once per unique definition, typed value/unit,
-canonical quote, evidence context (vendor column header, or PDF document role/kind),
+canonical quote, evidence context (vendor column header, or PDF document role/kind plus
+the cited entry text, so different component rows stay distinct),
 interpretation rule and applicability status. Source location and version are not
 part of the key, so the same quoted cell phrase is judged once across rows and
 products. The key also versions judge instructions and deployment.

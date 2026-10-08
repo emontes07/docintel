@@ -30,7 +30,11 @@ def _canonical(text: str) -> str:
 
 
 def evidence_context(entry: Evidence, quote: str) -> str:
-    """Tier plus column header (vendor rows) or document role/kind (PDF), never a location."""
+    """Location-free context: vendor column header, or PDF role/kind plus the cited entry text.
+
+    Cited PDF table-row candidates expand to every cell of the row, so including each
+    cited entry's text keeps different component rows (BODY vs COUPLING NUT) apart.
+    """
     if entry.source_tier == "vendor_table":
         try:
             cells = json.loads(entry.text).get("cells", [])
@@ -47,7 +51,7 @@ def evidence_context(entry: Evidence, quote: str) -> str:
     fields = parse_qs(urlsplit(entry.source_locator).fragment)
     role = fields.get("role", [""])[0]
     kind = "table" if "table" in fields else "paragraph" if "paragraph" in fields else "excerpt"
-    return f"{entry.source_tier}:{role or kind}"
+    return f"{entry.source_tier}:{role or kind}:{_canonical(entry.text)}"
 
 
 class JudgeCache:

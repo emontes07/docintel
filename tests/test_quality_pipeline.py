@@ -1311,3 +1311,26 @@ def test_failed_manual_retry_preserves_prior_run_product_references():
     assert latest["products"] == first["products"]
     assert latest["model_calls"] == 2 and latest["execution_model_calls"] == 0
     assert read_json(store, "quality-runs/batch/retry-products/executions/successful/summary.json")[0] == first
+
+
+def test_pdf_judge_identity_keeps_different_component_rows_apart():
+    from backend.quality_judge import JudgeCache
+
+    def cell(key, row, column, text):
+        return Evidence(
+            evidence_id=key, source_id="pdf", source_tier="internal_pdf", content_kind="source_excerpt",
+            source_locator=f"https://x/doc.pdf#page=1&table=0&row={row}&column={column}",
+            source_version="sha256:" + "a" * 64, text=text, observed_at=NOW, provider_retrieved_at=NOW,
+        )
+    body = [cell("b0", 1, 0, "BODY"), cell("b1", 1, 1, "BRASS")]
+    nut = [cell("n0", 2, 0, "COUPLING NUT"), cell("n1", 2, 1, "BRASS")]
+    moved = [cell("m0", 7, 0, "BODY"), cell("m1", 7, 1, "BRASS")]
+    definition = manifest().attributes[0]
+    cache = JudgeCache(policy="policy")
+
+    def key(entries):
+        candidate = Candidate(attribute_id="Primary Material", value="Brass", supporting_quote="BRASS",
+                              evidence_ids=[e.evidence_id for e in entries], origin="literal")
+        return cache.identity(definition, candidate, entries)
+    assert key(body) != key(nut)
+    assert key(body) == key(moved)  # same row content elsewhere reuses the verdict
