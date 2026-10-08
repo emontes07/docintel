@@ -79,12 +79,22 @@ task; definitions and examples are never evidence. The request's "task" field
 states the current phase and must be followed.
 Evidence entries carry citation_id, a short source alias (see "sources" for its
 tier, applicability and qualification), text and presentation fields (kind, page,
-table, row, column, document_role, header_labels). PDF table-row text is
-"Header=value" pairs; vendor-row text lists sheet cells with their column headers.
+table, row, column, document_role, header_labels). PDF table-row text is a
+presentation "Row N: HEADER=cell | HEADER=cell": values, Other payloads and quotes
+use only cell text, never "Row N:", header labels, "=" or "|"; cite the row's
+citation_id. A row's description cell names the component its material cell
+belongs to. Vendor-row text lists sheet cells with their column headers; quote the
+decoded cell value only.
 A manufacturerTitleBlock/identity_only entry establishes manufacturer identity
 only. "limited_to" names the only attributes an entry may support.
 Cite citation_id(s) and a contiguous quotation, allowing only whitespace, case and
 punctuation normalization. Retain conflicting values separately.
+Origin: "literal" when the value is exactly the quoted text; "derived" when it is
+quoted source text placed under "Other:" or normalized per the attribute's
+derivation_rule, with normalization_rule set to that derivation_rule (plus any
+documented derivation named below); "inferred" only for the descriptive Boolean
+inferences and documented exceptions below. A verbatim source phrase for an
+Enumerated, Multi-Select or Text attribute is derived, never inferred.
 """ + EVIDENCE_RULES + DEFINITION_RULES
 
 EXTRACT_TASK = """Extract candidates only for the listed unresolved attributes from the
@@ -119,7 +129,9 @@ never turn a component specification into a whole-product assertion."""
 
 SECOND_LOOK_TASK = """Second look: re-read ALL of this product's local evidence (every
 local tier) for the listed unresolved or disputed attributes only. Existing
-candidates are listed so you do not repeat them. Propose only new candidates that
+candidates are listed so you do not repeat them. Check every listed attribute
+against every entry, including drawing notes, material callouts and parts-table
+rows. Propose only new candidates that
 a quoted passage supports, including component-qualified values the definitions
 permit. Return no candidate when the evidence is silent; never infer from absence."""
 
