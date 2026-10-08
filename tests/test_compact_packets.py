@@ -185,3 +185,9 @@ def test_retained_mueller_and_ford_pass1_packets_fit_40k_characters():
             size = len(prefix) + len(json.dumps({"task": EXTRACT_TASK, **view}, ensure_ascii=False))
             assert size <= 40_000, (key, tier, size)
             assert not HASH.search(json.dumps(view)) and not TIMESTAMP.search(json.dumps(view))
+
+
+def test_shared_instructions_keep_origin_and_row_presentation_cues():
+    assert '"derived" when it is\nquoted source text placed under "Other:"' in SHARED_SYSTEM
+    assert "never inferred" in SHARED_SYSTEM
+    assert 'never "Row N:", header labels, "=" or "|"' in SHARED_SYSTEM
