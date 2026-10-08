@@ -191,3 +191,4 @@ def test_shared_instructions_keep_origin_and_row_presentation_cues():
     assert '"derived" when it is\nquoted source text placed under "Other:"' in SHARED_SYSTEM
     assert "never inferred" in SHARED_SYSTEM
     assert 'never "Row N:", header labels, "=" or "|"' in SHARED_SYSTEM
+    assert "family-unconfirmed source still yields candidates" in SHARED_SYSTEM

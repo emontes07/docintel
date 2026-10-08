@@ -87,6 +87,8 @@ belongs to. Vendor-row text lists sheet cells with their column headers; quote t
 decoded cell value only.
 A manufacturerTitleBlock/identity_only entry establishes manufacturer identity
 only. "limited_to" names the only attributes an entry may support.
+A family-unconfirmed source still yields candidates for what it explicitly states:
+they stay visible with Low confidence and its reviewer question; do not skip them.
 Cite citation_id(s) and a contiguous quotation, allowing only whitespace, case and
 punctuation normalization. Retain conflicting values separately.
 Origin: "literal" when the value is exactly the quoted text; "derived" when it is
@@ -130,8 +132,8 @@ never turn a component specification into a whole-product assertion."""
 SECOND_LOOK_TASK = """Second look: re-read ALL of this product's local evidence (every
 local tier) for the listed unresolved or disputed attributes only. Existing
 candidates are listed so you do not repeat them. Check every listed attribute
-against every entry, including drawing notes, material callouts and parts-table
-rows. Propose only new candidates that
+against every entry of every source, including family-unconfirmed sources, drawing
+notes, material callouts and parts-table rows. Propose only new candidates that
 a quoted passage supports, including component-qualified values the definitions
 permit. Return no candidate when the evidence is silent; never infer from absence."""
 
