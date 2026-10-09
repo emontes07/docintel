@@ -152,6 +152,18 @@ def test_variant_vendor_phrases_keep_exact_ford_rows_and_do_not_transfer_dimensi
     assert "cells=A899,B899" in e1[0].source_locator and e1[0].text.count('"cell"') == 2
     assert "cells=A900,B900" in e2[0].source_locator and e2[0].text.count('"cell"') == 2
 
+    duplicated_identity = json.loads(small_row.text)
+    duplicated_identity["cells"].append({
+        "cell": "C899", "column": "Legacy Item Number", "value": "AV11-333W-NL",
+    })
+    duplicate_row = small_row.model_copy(update={"text": json.dumps(duplicated_identity)})
+    duplicate_candidates, duplicate_evidence, duplicate_rejections = vendor_candidates_for_item(
+        phrase_map, small, [duplicate_row],
+    )
+    assert [candidate.value for candidate in duplicate_candidates] == ["Other: 3/4"]
+    assert "cells=A899,C899,B899" in duplicate_evidence[0].source_locator
+    assert duplicate_rejections == []
+
 
 class ProfileCompletion:
     deployment, effort, max_output_tokens = "offline", "low", 8000

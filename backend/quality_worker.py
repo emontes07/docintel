@@ -748,11 +748,33 @@ def main(argv=None) -> int:
     parser.add_argument("--smoke-first", action=argparse.BooleanOptionalAction,
                         default=os.environ.get("QUALITY_SMOKE_FIRST", "true").lower() == "true",
                         help="Run the Mueller smoke then all products, reusing its candidate within the three-call tier limit.")
+    parser.add_argument("--prepare-approved-slice", action="store_true",
+                        default=os.environ.get("QUALITY_PREPARE_APPROVED_SLICE", "false").lower() == "true")
+    parser.add_argument("--amortized-pipeline", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("QUALITY_AMORTIZED_PIPELINE_ENABLED", "false").lower() == "true")
+    parser.add_argument("--second-look", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("QUALITY_SECOND_LOOK_ENABLED", "true").lower() == "true")
+    parser.add_argument("--tool-loop", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("QUALITY_TOOL_LOOP_ENABLED", "false").lower() == "true")
+    parser.add_argument("--web-enabled", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("QUALITY_WEB_ENABLED", "true").lower() == "true")
+    parser.add_argument("--model-tiering", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("QUALITY_MODEL_TIERING_ENABLED", "false").lower() == "true")
+    parser.add_argument("--azure-batch", action=argparse.BooleanOptionalAction,
+                        default=os.environ.get("QUALITY_AZURE_BATCH_ENABLED", "false").lower() == "true")
+    parser.add_argument("--shard-index", type=int, default=int(os.environ.get("QUALITY_SHARD_INDEX", "0")))
+    parser.add_argument("--shard-count", type=int, default=int(os.environ.get("QUALITY_SHARD_COUNT", "1")))
+    parser.add_argument("--prior-cost-usd", default=os.environ.get("QUALITY_OVERNIGHT_PRIOR_COST_USD", "0"))
+    parser.add_argument("--run-base-cost-usd", default=os.environ.get("QUALITY_RUN_BASE_COST_USD", "0"))
+    parser.add_argument("--run-cap-usd", default=os.environ.get("QUALITY_RUN_CAP_USD", "10"))
+    parser.add_argument("--session-cap-usd", default=os.environ.get("QUALITY_SESSION_CAP_USD",
+                                                                    os.environ.get("QUALITY_OVERNIGHT_CAP_USD", "40")))
+    parser.add_argument("--cost-run-id", default=os.environ.get("QUALITY_COST_RUN_ID"))
     args = parser.parse_args(argv)
     if not all((args.batch_id, args.owner, args.run_id)):
         parser.error("QUALITY_BATCH_ID, QUALITY_OWNER and QUALITY_RUN_ID (or CLI equivalents) are required")
     store = configured_store()
-    if os.environ.get("QUALITY_PREPARE_APPROVED_SLICE", "false").lower() == "true":
+    if args.prepare_approved_slice:
         from backend.quality_slice import build_approved_angle_valve_slice
         record = build_approved_angle_valve_slice(store, args.batch_id, args.owner)
         print(json.dumps({"prepared_batch_id": record["id"], "items": record["product_count"],
@@ -765,26 +787,25 @@ def main(argv=None) -> int:
     from backend.core.docintel import DocumentIntelligenceService
     from azure.identity import ManagedIdentityCredential
 
-    cost_run_id = os.environ.get("QUALITY_COST_RUN_ID") or args.run_id
+    cost_run_id = args.cost_run_id or args.run_id
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", cost_run_id):
         parser.error("QUALITY_COST_RUN_ID must be a safe run identifier")
     prices = {
-        "run_base_cost_usd": os.environ.get("QUALITY_RUN_BASE_COST_USD", "0"),
-        "overnight_prior_cost_usd": os.environ.get("QUALITY_OVERNIGHT_PRIOR_COST_USD", "0"),
+        "run_base_cost_usd": args.run_base_cost_usd,
+        "overnight_prior_cost_usd": args.prior_cost_usd,
         "worker_usd_per_second": os.environ.get("QUALITY_WORKER_USD_PER_SECOND", "0"),
         "search_usd": os.environ.get("QUALITY_WEB_SEARCH_USD_PER_CALL", "0.0125"),
         "browse_usd": os.environ.get("QUALITY_WEB_BROWSE_USD_PER_CALL", "0.0125"),
         "di_usd_per_page": os.environ.get("QUALITY_DI_USD_PER_PAGE", "0.01"),
     }
     caps = {
-        "run_cap_usd": os.environ.get("QUALITY_RUN_CAP_USD", "10"),
-        # The session (formerly "overnight") cap spans runs via QUALITY_OVERNIGHT_PRIOR_COST_USD.
-        "overnight_cap_usd": os.environ.get("QUALITY_SESSION_CAP_USD", os.environ.get("QUALITY_OVERNIGHT_CAP_USD", "40")),
+        "run_cap_usd": args.run_cap_usd,
+        "overnight_cap_usd": args.session_cap_usd,
     }
     meter = QualityCostMeter(store, args.batch_id, cost_run_id, **prices, **caps)
 
     vendor_completion = None
-    model_tiering = os.environ.get("QUALITY_MODEL_TIERING_ENABLED", "false").lower() == "true"
+    model_tiering = args.model_tiering
     if model_tiering:
         if not os.environ.get("QUALITY_VENDOR_MODEL_DEPLOYMENT"):
             parser.error("QUALITY_VENDOR_MODEL_DEPLOYMENT is required when model tiering is enabled")
@@ -809,7 +830,7 @@ def main(argv=None) -> int:
         vendor_completion.pricing_basis = os.environ.get(
             "QUALITY_VENDOR_MODEL_PRICE_BASIS", "Configured vendor-model price basis",
         )
-    if os.environ.get("QUALITY_AZURE_BATCH_ENABLED", "false").lower() == "true":
+    if args.azure_batch:
         parser.error("Azure OpenAI Batch API is not implemented in this worker; leave QUALITY_AZURE_BATCH_ENABLED=false")
 
     def priced_usage(entry):
@@ -832,19 +853,18 @@ def main(argv=None) -> int:
             store, args.batch_id, args.owner, args.run_id,
             web=QualityWeb(pdf_ocr=CachedPDFOCR(store, DocumentIntelligenceService(
                 credential=ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID")),
-            ))) if not args.smoke_only and os.environ.get("QUALITY_WEB_ENABLED", "true").lower() == "true" else None,
+            ))) if not args.smoke_only and args.web_enabled else None,
             ford_image_blob=os.environ.get("QUALITY_FORD_IMAGE_BLOB"),
             smoke_only=args.smoke_only,
             smoke_first=args.smoke_first and not args.smoke_only,
             usage_callback=priced_usage, before_call=meter.before_call, cost_summary=cost_snapshot,
             execution_id=args.execution_id,
             ocr_smoke=os.environ.get("QUALITY_OCR_SMOKE", "false").lower() == "true",
-            tool_loop_enabled=os.environ.get("QUALITY_TOOL_LOOP_ENABLED", "false").lower() == "true",
-            second_look_enabled=os.environ.get("QUALITY_SECOND_LOOK_ENABLED", "true").lower() == "true",
+            tool_loop_enabled=args.tool_loop,
+            second_look_enabled=args.second_look,
             tool_loop_max_steps=int(os.environ.get("QUALITY_TOOL_LOOP_MAX_STEPS", "6")),
-            amortized_enabled=os.environ.get("QUALITY_AMORTIZED_PIPELINE_ENABLED", "false").lower() == "true",
-            shard_index=int(os.environ.get("QUALITY_SHARD_INDEX", "0")),
-            shard_count=int(os.environ.get("QUALITY_SHARD_COUNT", "1")),
+            amortized_enabled=args.amortized_pipeline,
+            shard_index=args.shard_index, shard_count=args.shard_count,
             vendor_completion=vendor_completion,
             tool_prices=prices,
         )
