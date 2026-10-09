@@ -6,7 +6,7 @@ from io import BytesIO
 from backend.core.vendor_tables import VendorTableConfig, parse_vendor_workbook, read_vendor_table, read_vendor_table_index
 from backend.models.enrichment import AttributeDefinition, Candidate, Evidence, Manifest, ProductKey
 from backend.quality_amortization import (
-    PROFILED_ROLES, VendorProfile, ProfileColumn, PhraseBatch, assign_family_shards, family_binding_key,
+    PROFILED_ROLES, VendorProfile, ProfileColumn, PhraseBatch, PhraseCandidate, assign_family_shards, family_binding_key,
     normalized_phrase, vendor_candidates_for_item, vendor_profile_and_candidates, _family_safe,
 )
 from backend.quality_worker import CachedEvidenceLoader
@@ -167,7 +167,11 @@ class ProfileCompletion:
             roles = {"Part": "identity", "Vendor": "identity", "Pressure": "attribute_data",
                      "Description": "product_description"}
             return VendorProfile(columns=[ProfileColumn(column=h, role=roles[h]) for h in headers])
-        return PhraseBatch(candidates=[])
+        phrase = next(p for p in self.calls[-1][1]["phrases"] if p["column"] == "Pressure")
+        return PhraseBatch(candidates=[PhraseCandidate(
+            phrase_id=phrase["phrase_id"], attribute_id="Pressure Rating", value=125, unit="psi",
+            quote="125", origin="literal", normalization_rule="literal_number_exact_unit_v1",
+        )])
 
 
 def test_vendor_profile_and_phrase_mapping_are_cached_per_file_and_definitions():
@@ -199,5 +203,7 @@ def test_vendor_profile_and_phrase_mapping_are_cached_per_file_and_definitions()
     assert first_stats["profile_cache"] == first_stats["phrase_cache"] == "miss"
     assert second_stats["profile_cache"] == second_stats["phrase_cache"] == "hit"
     assert first_stats["unique_phrases"] == 2
-    assert first == second == {}
+    phrase = "Pressure\u0000125"
+    assert first[phrase] == second[phrase]
+    assert first[phrase][0]["value"] == 125
     assert PROFILED_ROLES == {"product_description", "attribute_data", "component_detail"}

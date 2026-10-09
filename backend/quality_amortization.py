@@ -350,7 +350,7 @@ def vendor_profile_and_candidates(
     try:
         cached, _ = read_json(store, candidate_cache)
         for entry in cached["candidates"]:
-            phrase_results[entry["column"] + "\u0000" + entry["normalized_text"]].append(
+            phrase_results[(entry["column"], entry["normalized_text"])].append(
                 PhraseCandidate.model_validate(entry["candidate"])
             )
         phrase_hit = True
