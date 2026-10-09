@@ -11,11 +11,15 @@ the smoke candidate is reused within the vendor tier's three-call limit.
 from __future__ import annotations
 
 import argparse
+import gzip
 import base64
+import hashlib
 import json
 import os
 import re
+import resource
 import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 from io import BytesIO
@@ -24,12 +28,13 @@ from urllib.parse import parse_qs, quote, urlsplit
 from backend.batch import BatchService, digest, now
 from backend.batch_store import Conflict, Missing, configured_store, read_json, write_json
 from backend.core.docintel import ParsedDocument
-from backend.core.vendor_tables import VendorTableConfig, read_vendor_table
+from backend.core.vendor_tables import (
+    VendorTableConfig, build_vendor_mpn_index, parse_vendor_workbook, read_vendor_table,
+)
 from backend.evidence_verification import Fragment, match_text
 from backend.extract import source_evidence
 from backend.models.enrichment import Candidate, Evidence, Manifest, OfflineSource, RetrievalOutcome
 from backend.pilot import PARSER_VERSION
-from backend.quality_metrics import web_yield
 from backend.quality_pipeline import (
     EXTRACT_TASK, JUDGE_SYSTEM, QualityExtraction, complete_quality_call, expand_citations,
     ground_candidate, product_packet, run_product, shared_source_ids, source_family,
@@ -114,10 +119,39 @@ def scope_document(document: ParsedDocument, product, binding: dict) -> ParsedDo
 
 
 class CachedEvidenceLoader:
-    def __init__(self, store):
+    def __init__(self, store, *, namespace: str = "offline"):
         self.store = store
+        self.namespace = hashlib.sha256(namespace.encode()).hexdigest()[:24]
         self.parses = None
         self.contents = {}
+        self.vendor_indexes = {}
+        self.vendor_workbook_parses = 0
+        self.vendor_workbook_cache_hits = 0
+
+    def vendor_index(self, binding: dict, content: bytes) -> dict:
+        key = binding["sha256"]
+        if key in self.vendor_indexes:
+            return self.vendor_indexes[key]
+        cache_key = f"quality-vendor-index/{self.namespace}/{key}.json.gz"
+        try:
+            raw, _ = self.store.read_bytes(cache_key)
+            indexed = json.loads(gzip.decompress(raw))
+            self.vendor_workbook_cache_hits += 1
+        except Missing:
+            workbook = parse_vendor_workbook(content)
+            config = VendorTableConfig.model_validate(binding["table"])
+            indexed = {"workbook": workbook, "mpn_rows": build_vendor_mpn_index(workbook, config)}
+            packed = gzip.compress(json.dumps(indexed, ensure_ascii=False, separators=(",", ":")).encode())
+            try:
+                self.store.write_bytes(cache_key, packed)
+            except Conflict:
+                raw, _ = self.store.read_bytes(cache_key)
+                indexed = json.loads(gzip.decompress(raw))
+                self.vendor_workbook_cache_hits += 1
+            else:
+                self.vendor_workbook_parses += 1
+        self.vendor_indexes[key] = indexed
+        return indexed
 
     def cached_document(self, binding: dict) -> ParsedDocument:
         location = "batchblob:///" + binding["blob"]
@@ -192,8 +226,12 @@ class CachedEvidenceLoader:
                     content = self.contents[blob]
                     if digest(content) != binding["sha256"]:
                         raise ValueError("Vendor workbook hash mismatch")
-                    rows = read_vendor_table(content, config=VendorTableConfig.model_validate(binding["table"]),
-                                             product=product, source_id=binding["source_id"])
+                    index = self.vendor_index(binding, content)
+                    rows = read_vendor_table(
+                        content, config=VendorTableConfig.model_validate(binding["table"]),
+                        product=product, source_id=binding["source_id"], workbook_index=index["workbook"],
+                        mpn_rows=index["mpn_rows"],
+                    )
                     if not rows:
                         raise ValueError("No full exact-MPN vendor row matched")
                     for row in rows:
@@ -375,6 +413,10 @@ def run_quality_batch(
     tool_prices: dict | None = None,
     second_look_enabled: bool = False,
     tool_loop_max_steps: int = 6,
+    amortized_enabled: bool = False,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    vendor_completion=None,
 ) -> dict:
     """Append new immutable results and preserve the complete previous state chain."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
@@ -382,11 +424,33 @@ def run_quality_batch(
     execution_id = execution_id or uuid.uuid4().hex
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", execution_id):
         raise ValueError("QUALITY_EXECUTION_ID must be a safe execution identifier")
-    record = BatchService(store).get(batch_id, owner)
+    if (type(shard_index) is not int or type(shard_count) is not int
+            or shard_count < 1 or shard_count > 32 or shard_index < 0 or shard_index >= shard_count):
+        raise ValueError("Shard index must be within a shard count from 1 through 32")
+    record = BatchService(store).get(batch_id, owner, include_items=not amortized_enabled)
+    out_of_line_items = amortized_enabled and "items_prefix" in record
+    if amortized_enabled and not out_of_line_items:
+        from backend.quality_amortization import family_binding_key, vendor_binding_key
+        inline_items = {item["item_key"]: item for item in record["items"]}
+        record = dict(record)
+        record["item_routes"] = []
+        for item in record["items"]:
+            product = item["manifest"]["product"]
+            vendor = vendor_binding_key(item)
+            record["item_routes"].append({
+                "item_key": item["item_key"], "product": product, "mpn": product["mpn"],
+                "family_key": family_binding_key(item),
+                "vendor_binding": ({key: vendor[1].get(key) for key in
+                                    ("source_id", "sha256", "blob", "format", "source_tier", "table")}
+                                   if vendor else None),
+            })
+    else:
+        inline_items = {}
     prefix = f"quality-runs/{batch_id}/{run_id}"
     execution_prefix = f"{prefix}/executions/{execution_id}"
     started = {"run_id": run_id, "execution_id": execution_id, "batch_id": batch_id, "owner": owner, "started_at": now(),
-               "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only}
+               "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only,
+               "amortized": amortized_enabled, "shard_index": shard_index, "shard_count": shard_count}
     write_json(store, execution_prefix + "/started.json", started)
     try:
         write_json(store, prefix + "/started.json", started)
@@ -402,6 +466,35 @@ def run_quality_batch(
         prior_summary, _ = read_json(store, prefix + "/summary.json")
     except Missing:
         prior_summary = {}
+    if amortized_enabled:
+        from backend.quality_amortization import assign_family_shards
+        route_assignments = assign_family_shards(record["item_routes"], shard_count)
+        selected_items = [route for route in record["item_routes"]
+                          if route_assignments[route["item_key"]] == shard_index]
+    elif shard_count > 1:
+        from backend.quality_amortization import assign_family_shards
+        assignments = assign_family_shards(record["items"], shard_count)
+        selected_items = [item for item in record["items"] if assignments[item["item_key"]] == shard_index]
+    else:
+        selected_items = list(record["items"])
+    completed_prefix = f"{prefix}/completed/"
+    resumable = amortized_enabled or shard_count > 1
+    completed_keys = set(store.keys(completed_prefix)) if resumable else set()
+    pending_items = []
+    checkpoint_products = []
+    for item in selected_items:
+        item_key = item["item_key"]
+        checkpoint_key = completed_prefix + item["item_key"] + ".json"
+        if checkpoint_key not in completed_keys:
+            pending_items.append(item)
+            continue
+        checkpoint, _ = read_json(store, checkpoint_key)
+        try:
+            read_json(store, checkpoint["result_key"])
+        except Missing:
+            pending_items.append(item)
+        else:
+            checkpoint_products.append(checkpoint["product"])
 
     def latest(key, value):
         try:
@@ -416,8 +509,14 @@ def run_quality_batch(
                 pass
         write_json(store, key, value, version)
 
-    loader = CachedEvidenceLoader(store)
-    usage_records, products, product_results = [], [], []
+    loader = CachedEvidenceLoader(store, namespace=owner)
+    def item_loader(item_key):
+        if not out_of_line_items:
+            return inline_items[item_key]
+        return read_json(store, f"{record['items_prefix']}/{item_key}.json")[0]
+    usage_records, products = [], []
+    from backend.quality_metrics import WebYieldAccumulator
+    product_results = WebYieldAccumulator()
 
     def call_context(usage):
         sequence = sequence_offset + len(usage_records) + 1
@@ -464,8 +563,20 @@ def run_quality_batch(
         judge_cache = JudgeCache(
             store, namespace=owner, policy=JUDGE_SYSTEM + str(getattr(completion, "deployment", "")),
         )
-        loaded = {item["item_key"]: loader.load(item) for item in record["items"]} if not smoke_only else {}
-        shared = shared_source_ids([data[0] for data in loaded.values()])
+        if amortized_enabled and (smoke_only or smoke_first or ocr_smoke):
+            raise ValueError("Amortized slice mode does not run smoke or OCR probes")
+        if amortized_enabled:
+            from backend.quality_amortization import run_amortized_products
+            amortized_products = iter(run_amortized_products(
+                store, pending_items, record, loader, item_loader, completion, run_id=run_id,
+                judge_cache=judge_cache, usage_callback=persist_usage, before_call=before_usage,
+                vendor_completion=vendor_completion,
+            ))
+            loaded, shared = None, {}
+        else:
+            amortized_products = None
+            loaded = {item["item_key"]: loader.load(item) for item in pending_items} if not smoke_only else {}
+            shared = shared_source_ids([data[0] for data in loaded.values()])
         if ocr_smoke:
             from backend.quality_pdf import CachedPDFOCR, pdf_text
             if web is None or not isinstance(web.pdf_ocr, CachedPDFOCR):
@@ -495,9 +606,17 @@ def run_quality_batch(
             write_json(store, execution_prefix + "/smoke.json", smoke)
             latest(prefix + "/smoke.json", smoke)
             smoke_recorded = True
-        has_ford = any(source.get("sha256") == FORD_PDF_SHA256 for item in record["items"] for source in item.get("sources", []))
-        image, image_diagnostic = image_input(store, ford_image_blob) if not smoke_only and has_ford else (None, None)
-        for item in [] if smoke_only else record["items"]:
+        has_ford = (not amortized_enabled and any(
+            source.get("sha256") == FORD_PDF_SHA256
+            for item in pending_items for source in item.get("sources", [])
+        ))
+        image, image_diagnostic = image_input(store, ford_image_blob) if not smoke_only and has_ford and not amortized_enabled else (None, None)
+        for item in [] if smoke_only else pending_items:
+            if amortized_products is not None:
+                streamed_item, result, retrieval, provenance = next(amortized_products)
+                if streamed_item["item_key"] != item["item_key"]:
+                    raise ValueError("Amortized product stream order differs from selected batch routes")
+                item = streamed_item
             manifest = Manifest.model_validate(item["manifest"])
             item_key = item["item_key"]
             state_key = f"items/{batch_id}/{item_key}.json"
@@ -508,23 +627,27 @@ def run_quality_batch(
             attempt = digest(f"quality-v1:{batch_id}:{run_id}:{execution_id}:{item_key}".encode())
             result_key = f"results/{batch_id}/{item_key}/attempts/{attempt}.json"
             start = now()
-            evidence, retrieval, provenance = loaded[item_key]
+            if amortized_products is not None:
+                evidence = None
+            else:
+                evidence, retrieval, provenance = loaded[item_key]
             ford = any(s.get("sha256") == FORD_PDF_SHA256 for s in item.get("sources", []))
             reuse_smoke = smoke is not None and smoke.get("item_id") == manifest.product.item_id
-            result = run_product(
-                manifest, evidence, completion, run_id=run_id, item_key=item_key, web=web,
-                images=image if ford else None, usage_callback=persist_usage,
-                before_call=before_usage, retrieval=retrieval,
-                judge_cache=judge_cache, shared_ids=shared[source_family(evidence)],
-                definition_rows=record.get("original_definitions"),
-                tool_loop_enabled=tool_loop_enabled, tool_prices=tool_prices,
-                second_look_enabled=second_look_enabled, tool_loop_max_steps=tool_loop_max_steps,
-                initial_candidates={"vendor_table": [
-                    Candidate.model_validate(candidate) for candidate in smoke["candidates"]
-                ]} if reuse_smoke else None,
-                initial_diagnostics=[entry for entry in usage_records if entry.get("phase") == "smoke"
-                                     and entry.get("item_id") == manifest.product.item_id] if reuse_smoke else None,
-            )
+            if amortized_products is None:
+                result = run_product(
+                    manifest, evidence, completion, run_id=run_id, item_key=item_key, web=web,
+                    images=image if ford else None, usage_callback=persist_usage,
+                    before_call=before_usage, retrieval=retrieval,
+                    judge_cache=judge_cache, shared_ids=shared[source_family(evidence)],
+                    definition_rows=record.get("original_definitions"),
+                    tool_loop_enabled=tool_loop_enabled, tool_prices=tool_prices,
+                    second_look_enabled=second_look_enabled, tool_loop_max_steps=tool_loop_max_steps,
+                    initial_candidates={"vendor_table": [
+                        Candidate.model_validate(candidate) for candidate in smoke["candidates"]
+                    ]} if reuse_smoke else None,
+                    initial_diagnostics=[entry for entry in usage_records if entry.get("phase") == "smoke"
+                                         and entry.get("item_id") == manifest.product.item_id] if reuse_smoke else None,
+                )
             recorded_calls = {entry.get("call_id") for entry in result.quality_diagnostics if entry.get("call_id")}
             result.quality_diagnostics.extend(
                 entry for entry in usage_records
@@ -536,7 +659,7 @@ def run_quality_batch(
                     **image_diagnostic, "item_id": manifest.product.item_id, "target_mpn": manifest.product.mpn,
                 })
             write_json(store, result_key, result.model_dump(mode="json"))
-            product_results.append(result)
+            product_results.add(result)
             status = "completed" if all(a.status in {"existing", "proposed"} for a in result.attributes) else "unresolved"
             state = {"state": status, "run_id": run_id, "execution_id": execution_id,
                      "result_key": result_key, "started_at": start, "finished_at": now(),
@@ -551,6 +674,20 @@ def run_quality_batch(
                              "candidates": sum(len(a.candidates) for a in result.attributes)})
             write_json(store, f"{execution_prefix}/products/{item_key}.json", products[-1])
             latest(f"{prefix}/products/{item_key}.json", products[-1])
+            if resumable:
+                checkpoint = {"item_key": item_key, "product": products[-1], "result_key": result_key,
+                              "run_id": run_id, "execution_id": execution_id,
+                              "shard_index": shard_index, "shard_count": shard_count,
+                              "completed_at": now()}
+                try:
+                    write_json(store, completed_prefix + item_key + ".json", checkpoint)
+                except Conflict:
+                    existing, _ = read_json(store, completed_prefix + item_key + ".json")
+                    if existing.get("result_key") != result_key:
+                        raise
+                print(json.dumps({"quality_item_checkpoint": item_key, "item_id": manifest.product.item_id,
+                                  "run_id": run_id, "execution_id": execution_id,
+                                  "shard_index": shard_index, "state": status}, ensure_ascii=True), flush=True)
     except Exception as error:
         failure = error
         if (smoke_only or smoke_first) and smoke is None:
@@ -571,18 +708,28 @@ def run_quality_batch(
             cost = {"status": "unavailable", "error": type(error).__name__}
     all_usage = [*prior_usage, *usage_records]
     latest_products = {entry["item_key"]: entry for entry in prior_summary.get("products", [])}
+    latest_products.update({entry["item_key"]: entry for entry in checkpoint_products})
     latest_products.update({entry["item_key"]: entry for entry in products})
-    cumulative_products = [latest_products[item["item_key"]] for item in record["items"]
-                           if item["item_key"] in latest_products]
+    expected_item_keys = record.get("item_keys", [item["item_key"] for item in record.get("items", [])])
+    cumulative_products = [latest_products[item_key] for item_key in expected_item_keys
+                           if item_key in latest_products]
     summary = {"schema_version": 1, "run_id": run_id, "execution_id": execution_id, "batch_id": batch_id, "owner": owner,
                "state": "failed" if failure else "completed", "finished_at": now(), "products": cumulative_products,
                "execution_products": products,
+               "shard_index": shard_index, "shard_count": shard_count, "amortized": amortized_enabled,
+               "items_selected": len(selected_items), "items_skipped_completed": len(checkpoint_products),
+               "items_processed_this_execution": len(products),
                "usage": all_usage, "model_calls": sum(e.get("operation") == "model" for e in all_usage),
                "execution_model_calls": sum(e.get("operation") == "model" for e in usage_records),
                "new_di_calls": sum(e.get("operation") == "document_intelligence" and e.get("analysis_attempted") is True
                                    for e in all_usage), "error": type(failure).__name__ if failure else None,
                "smoke_only": smoke_only, "smoke_first": smoke_first and not smoke_only, "smoke": smoke,
-               "cost": cost, "web_yield": web_yield(product_results, usage_records)}
+               "cost": cost, "web_yield": product_results.report(usage_records),
+               "workbook_parses": loader.vendor_workbook_parses,
+               "workbook_index_cache_hits": loader.vendor_workbook_cache_hits,
+               "peak_worker_memory_mb": round(
+                   resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024 if sys.platform == "darwin" else 1024), 1
+               )}
     write_json(store, execution_prefix + "/summary.json", summary)
     latest(prefix + "/summary.json", summary)
     if failure:
@@ -604,13 +751,20 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if not all((args.batch_id, args.owner, args.run_id)):
         parser.error("QUALITY_BATCH_ID, QUALITY_OWNER and QUALITY_RUN_ID (or CLI equivalents) are required")
+    store = configured_store()
+    if os.environ.get("QUALITY_PREPARE_APPROVED_SLICE", "false").lower() == "true":
+        from backend.quality_slice import build_approved_angle_valve_slice
+        record = build_approved_angle_valve_slice(store, args.batch_id, args.owner)
+        print(json.dumps({"prepared_batch_id": record["id"], "items": record["product_count"],
+                          "valid": record["valid"], "slice": record.get("slice"),
+                          "mode": "prepare_only"}, ensure_ascii=True), flush=True)
+        return 0
     from backend.quality_web import QualityWeb
     from backend.quality_cost import QualityCostMeter
     from backend.quality_pdf import CachedPDFOCR
     from backend.core.docintel import DocumentIntelligenceService
     from azure.identity import ManagedIdentityCredential
 
-    store = configured_store()
     cost_run_id = os.environ.get("QUALITY_COST_RUN_ID") or args.run_id
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", cost_run_id):
         parser.error("QUALITY_COST_RUN_ID must be a safe run identifier")
@@ -628,6 +782,35 @@ def main(argv=None) -> int:
         "overnight_cap_usd": os.environ.get("QUALITY_SESSION_CAP_USD", os.environ.get("QUALITY_OVERNIGHT_CAP_USD", "40")),
     }
     meter = QualityCostMeter(store, args.batch_id, cost_run_id, **prices, **caps)
+
+    vendor_completion = None
+    model_tiering = os.environ.get("QUALITY_MODEL_TIERING_ENABLED", "false").lower() == "true"
+    if model_tiering:
+        if not os.environ.get("QUALITY_VENDOR_MODEL_DEPLOYMENT"):
+            parser.error("QUALITY_VENDOR_MODEL_DEPLOYMENT is required when model tiering is enabled")
+        from backend.core.quality_model import ResponsesCompletion
+        vendor_completion = ResponsesCompletion(
+            deployment=os.environ["QUALITY_VENDOR_MODEL_DEPLOYMENT"],
+            effort=os.environ.get("QUALITY_VENDOR_MODEL_EFFORT", "low"),
+            max_output_tokens=int(os.environ.get("QUALITY_VENDOR_MODEL_MAX_OUTPUT_TOKENS", "8000")),
+        )
+        prices_by_key = {
+            "input": "QUALITY_VENDOR_MODEL_INPUT_USD_PER_MILLION",
+            "cached_input": "QUALITY_VENDOR_MODEL_CACHED_INPUT_USD_PER_MILLION",
+            "cache_write": "QUALITY_VENDOR_MODEL_CACHE_WRITE_USD_PER_MILLION",
+            "output": "QUALITY_VENDOR_MODEL_OUTPUT_USD_PER_MILLION",
+        }
+        missing_prices = [name for name in prices_by_key.values() if name not in os.environ]
+        if missing_prices:
+            parser.error("Model tiering requires configured vendor-model prices: " + ", ".join(missing_prices))
+        vendor_completion.pricing_usd_per_million = {
+            key: float(os.environ[name]) for key, name in prices_by_key.items()
+        }
+        vendor_completion.pricing_basis = os.environ.get(
+            "QUALITY_VENDOR_MODEL_PRICE_BASIS", "Configured vendor-model price basis",
+        )
+    if os.environ.get("QUALITY_AZURE_BATCH_ENABLED", "false").lower() == "true":
+        parser.error("Azure OpenAI Batch API is not implemented in this worker; leave QUALITY_AZURE_BATCH_ENABLED=false")
 
     def priced_usage(entry):
         return {**meter.record(entry), "cost_run_id": cost_run_id}
@@ -659,6 +842,10 @@ def main(argv=None) -> int:
             tool_loop_enabled=os.environ.get("QUALITY_TOOL_LOOP_ENABLED", "false").lower() == "true",
             second_look_enabled=os.environ.get("QUALITY_SECOND_LOOK_ENABLED", "true").lower() == "true",
             tool_loop_max_steps=int(os.environ.get("QUALITY_TOOL_LOOP_MAX_STEPS", "6")),
+            amortized_enabled=os.environ.get("QUALITY_AMORTIZED_PIPELINE_ENABLED", "false").lower() == "true",
+            shard_index=int(os.environ.get("QUALITY_SHARD_INDEX", "0")),
+            shard_count=int(os.environ.get("QUALITY_SHARD_COUNT", "1")),
+            vendor_completion=vendor_completion,
             tool_prices=prices,
         )
     finally:

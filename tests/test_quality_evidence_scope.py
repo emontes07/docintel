@@ -53,6 +53,7 @@ def test_empty_attribute_scope_stays_empty_through_loading(monkeypatch, source_f
     raw = b"synthetic workbook"
     store = SimpleNamespace(read_bytes=lambda *args, **kwargs: (raw, "v"))
     loader = CachedEvidenceLoader(store)
+    monkeypatch.setattr(loader, "vendor_index", lambda binding, content: {"workbook": {}, "mpn_rows": {}})
     monkeypatch.setattr(loader, "cached_document", lambda binding: document([["Component", "Material"], ["Body", "Brass"]]))
     monkeypatch.setattr("backend.quality_worker.read_vendor_table", lambda *args, **kwargs: [
         SimpleNamespace(sheet="Sheet", row=2, cells={"B2": "Brass"}, text='{"row":2,"cells":[{"cell":"B2","value":"Brass"}]}'),

@@ -547,6 +547,25 @@ def test_four_product_worker_appends_attempts_preserves_history_and_persists_usa
     assert all("product-0" not in prefix and "product-1" not in prefix for prefix in prefixes)
 
 
+def test_amortized_shard_restart_skips_completed_items_and_persists_checkpoints():
+    store, items = seed_store(2)
+    first = run_quality_batch(
+        store, "batch", "owner", "prc-mueller-s00", completion=Completion(),
+        execution_id="first", amortized_enabled=True, shard_index=0, shard_count=1,
+    )
+    assert first["state"] == "completed" and len(first["execution_products"]) == 2
+    completed = store.keys("quality-runs/batch/prc-mueller-s00/completed/")
+    assert len(completed) == 2
+    second = run_quality_batch(
+        store, "batch", "owner", "prc-mueller-s00", completion=Completion(),
+        execution_id="restart", amortized_enabled=True, shard_index=0, shard_count=1,
+    )
+    assert second["state"] == "completed" and second["execution_products"] == []
+    assert second["execution_model_calls"] == 0
+    assert len(second["products"]) == 2
+    assert all(store.data[f"items/batch/{item['item_key']}.json"][0] for item in items)
+
+
 def test_first_disputed_vote_uses_majority_and_persists_for_next_product():
     from backend.quality_judge import JudgeCache
 

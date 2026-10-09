@@ -26,6 +26,10 @@ ambient static token over the worker's token provider.
 | `QUALITY_MAX_OUTPUT_TOKENS_EXTRACT` / `_REFINE` / `_SECOND_LOOK` / `_JUDGE` | Per-phase output limits (default `8000` / `8000` / `8000` / `2000`), never above `QUALITY_MODEL_MAX_OUTPUT_TOKENS`. Observed Phase 3 maxima: extract 4,711, refine 1,592, judge 1,009. |
 | `QUALITY_MAX_OUTPUT_TOKENS_TOOL_STEP` / `_CLOSEOUT` | Optional tool-loop limits (default `4000` / `6000`); observed maxima 109 / 3,784. |
 | `QUALITY_RUN_CAP_USD` / `QUALITY_SESSION_CAP_USD` | Monetary admission caps (default `10` / `40`). The session cap spans runs via `QUALITY_OVERNIGHT_PRIOR_COST_USD`; `QUALITY_OVERNIGHT_CAP_USD` is accepted as an alias. |
+| `QUALITY_AMORTIZED_PIPELINE_ENABLED` | `false`; use family PDF results plus cached vendor column-profile/unique-phrase mappings, then per-product applicability, grounding and judging. |
+| `QUALITY_SHARD_INDEX` / `QUALITY_SHARD_COUNT` | `0` / `1`; deterministic family shard. Use `./run.sh start-shards RUN_ID` to create one isolated execution and cost meter per shard. |
+| `QUALITY_MODEL_TIERING_ENABLED` | `false`; when enabled, profile and vendor-phrase calls use `QUALITY_VENDOR_MODEL_DEPLOYMENT`; a deployment and explicit four-class vendor-model prices are required. PDF, residual and judge stages stay on the standard deployment. |
+| `QUALITY_AZURE_BATCH_ENABLED` | `false`; Azure OpenAI Batch submission is not implemented in this worker; true fails explicitly rather than silently falling back. |
 
 Constructor arguments override environment defaults. `reasoning_effort` overrides
 effort for an individual call (for example a judge's configured `low`) without

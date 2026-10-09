@@ -808,6 +808,7 @@ def run_product(
     definition_rows: list[dict] | None = None,
     tool_loop_enabled: bool = False, tool_prices: dict | None = None,
     second_look_enabled: bool = False, tool_loop_max_steps: int = 6,
+    requested_attribute_ids: set[str] | None = None,
 ) -> EnrichmentResult:
     """No retries and no DI. Callbacks make usage persistent before the next request."""
     definitions = {a.attribute_id: a for a in manifest.attributes}
@@ -848,7 +849,9 @@ def run_product(
     for tier in TIERS:
         seeds = [candidate for candidate in (initial_candidates or {}).get(tier, [])
                  if candidate.attribute_id in attributes and candidate.attribute_id not in manifest.existing_values]
-        pending = [key for key, attribute in attributes.items() if not _resolved(attribute)]
+        pending = [key for key, attribute in attributes.items()
+                   if not _resolved(attribute)
+                   and (requested_attribute_ids is None or key in requested_attribute_ids)]
         pending = list(dict.fromkeys([*pending, *[candidate.attribute_id for candidate in seeds]]))
         if not pending:
             continue
