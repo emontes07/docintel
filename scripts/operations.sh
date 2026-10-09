@@ -86,8 +86,36 @@ docintel_start() {
   [[ -n "${QUALITY_MAX_OUTPUT_TOKENS_JUDGE:-}" ]] && environment+=("QUALITY_MAX_OUTPUT_TOKENS_JUDGE=$QUALITY_MAX_OUTPUT_TOKENS_JUDGE")
   [[ -n "${QUALITY_MAX_OUTPUT_TOKENS_TOOL_STEP:-}" ]] && environment+=("QUALITY_MAX_OUTPUT_TOKENS_TOOL_STEP=$QUALITY_MAX_OUTPUT_TOKENS_TOOL_STEP")
   [[ -n "${QUALITY_MAX_OUTPUT_TOKENS_CLOSEOUT:-}" ]] && environment+=("QUALITY_MAX_OUTPUT_TOKENS_CLOSEOUT=$QUALITY_MAX_OUTPUT_TOKENS_CLOSEOUT")
+  local image base_env_json
+  image=$(az containerapp job show --subscription "$subscription" --resource-group "$group" --name "$job" \
+    --query 'properties.template.containers[0].image' --output tsv)
+  [[ "$image" =~ ^crc4ryis6hullf4\.azurecr\.io/docintel/backend@sha256:[a-f0-9]{64}$ ]] \
+    || { printf 'Job does not have the approved immutable backend image.\n' >&2; return 1; }
+  base_env_json=$(az containerapp job show --subscription "$subscription" --resource-group "$group" --name "$job" \
+    --query 'properties.template.containers[0].env' --output json)
+  local -a merged_environment=()
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] && merged_environment+=("$entry")
+  done < <(printf '%s' "$base_env_json" | .venv/bin/python -c '
+import json,sys
+values={}
+for entry in json.load(sys.stdin) or []:
+    name=entry["name"]
+    if "secretRef" in entry:
+        values[name]=name+"=secretref:"+entry["secretRef"]
+    elif "value" in entry and entry["value"] is not None:
+        values[name]=name+"="+str(entry["value"])
+for entry in sys.argv[1:]:
+    name,sep,value=entry.partition("=")
+    if not sep:
+        raise SystemExit("Environment override must be key=value")
+    values[name]=entry
+print("\n".join(values.values()))
+' "${environment[@]}")
   az containerapp job start --subscription "$subscription" --resource-group "$group" --name "$job" \
-    --container-name "$job" --env-vars "${environment[@]}" --only-show-errors --query name --output tsv
+    --image "$image" --container-name "$job" --command /app/.venv/bin/python \
+    --args=-mbackend.quality_worker --env-vars "${merged_environment[@]}" \
+    --only-show-errors --query name --output tsv
 }
 
 docintel_start_shards() {
