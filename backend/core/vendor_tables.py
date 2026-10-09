@@ -1,6 +1,7 @@
 """Operator-selected XLSX rows are evidence, never attribute definitions."""
 
 import json
+from collections.abc import Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -35,19 +36,57 @@ class VendorTableChunk(BaseModel):
     text: str
 
 
-def read_vendor_table(
-    content: bytes, *, config: VendorTableConfig, product: ProductKey, source_id: str
-) -> list[VendorTableChunk]:
-    """Return only exact MPN/vendor matches, preserving original workbook addresses."""
+def parse_vendor_workbook(content: bytes) -> dict[str, list[dict]]:
+    """Parse a workbook once into address-preserving, JSON-safe cell values."""
     sheets = read_workbook_cells(content, max_rows=50001)
-    if config.sheet not in sheets:
+    return {
+        name: [
+            {"row": row.number, "cells": [
+                {"column_index": column, "address": cell.address, "value": cell.value,
+                 "kind": cell.kind, "number_format": cell.number_format}
+                for column, cell in sorted(row.cells.items()) if cell.value
+            ]}
+            for row in rows
+        ] for name, rows in sheets.items()
+    }
+
+
+def build_vendor_mpn_index(workbook: dict[str, list[dict]], config: VendorTableConfig) -> dict[str, list[int]]:
+    """Build the exact-text MPN -> row-number index once for a configured worksheet."""
+    rows = workbook.get(config.sheet)
+    if rows is None:
         raise WorkbookError("Configured vendor worksheet was not found")
-    rows = sheets[config.sheet]
-    header_row = next((row for row in rows if row.number == config.header_row), None)
-    if header_row is None:
+    header = next((row for row in rows if row["row"] == config.header_row), None)
+    if header is None:
         raise WorkbookError("Configured vendor header row was not found")
-    headers = {column: cell.text for column, cell in header_row.cells.items() if cell.value}
-    if not headers or len(set(headers.values())) != len(headers) or any(not title.strip() for title in headers.values()):
+    columns = {str(cell["value"]): cell["column_index"] for cell in header["cells"]}
+    if config.mpn_column not in columns:
+        raise WorkbookError("Configured vendor identity column was not found")
+    mpn_column = columns[config.mpn_column]
+    index: dict[str, list[int]] = {}
+    for row in rows:
+        if row["row"] <= config.header_row:
+            continue
+        cell = next((entry for entry in row["cells"] if entry["column_index"] == mpn_column), None)
+        if cell is not None:
+            index.setdefault(str(cell["value"]), []).append(row["row"])
+    return index
+
+
+def read_vendor_table_index(
+    workbook: dict[str, list[dict]], *, config: VendorTableConfig, product: ProductKey, source_id: str,
+    mpn_rows: Mapping[str, list[int]] | None = None,
+) -> list[VendorTableChunk]:
+    """Select exact MPN/vendor rows from an already-parsed workbook index."""
+    if config.sheet not in workbook:
+        raise WorkbookError("Configured vendor worksheet was not found")
+    rows = workbook[config.sheet]
+    header = next((row for row in rows if row["row"] == config.header_row), None)
+    if header is None:
+        raise WorkbookError("Configured vendor header row was not found")
+    headers = {cell["column_index"]: str(cell["value"]) for cell in header["cells"]}
+    if (not headers or len(set(headers.values())) != len(headers)
+            or any(not title.strip() for title in headers.values())):
         raise WorkbookError("Vendor headers must be nonblank and unique")
     columns = {title: column for column, title in headers.items()}
     if config.mpn_column not in columns or (config.vendor_column and config.vendor_column not in columns):
@@ -57,30 +96,46 @@ def read_vendor_table(
     mpn_column = columns[config.mpn_column]
     vendor_column = columns[config.vendor_column] if config.vendor_column else None
     chunks = []
-    for row in rows:
-        if row.number <= config.header_row:
-            continue
-        mpn = row.cells.get(mpn_column)
-        if mpn is None or mpn.text != product.mpn:
+    if mpn_rows is not None:
+        selected_rows = set(mpn_rows.get(product.mpn, []))
+        candidate_rows = (row for row in rows if row["row"] in selected_rows)
+    else:
+        candidate_rows = (row for row in rows if row["row"] > config.header_row)
+    for row in candidate_rows:
+        cells_by_col = {cell["column_index"]: cell for cell in row["cells"]}
+        mpn = cells_by_col.get(mpn_column)
+        if mpn is None or str(mpn["value"]) != product.mpn:
             continue
         if vendor_column is not None:
-            vendor = row.cells.get(vendor_column)
-            if vendor is None or vendor.text != product.vendor:
+            vendor = cells_by_col.get(vendor_column)
+            if vendor is None or str(vendor["value"]) != product.vendor:
                 continue
-        if any(cell.value and column not in headers for column, cell in row.cells.items()):
+        if any(cell["column_index"] not in headers for cell in row["cells"]):
             raise WorkbookError("Matched vendor data column has no header")
-        cells = {cell.address: cell.text for column, cell in sorted(row.cells.items()) if column in headers and cell.value}
+        cells = {cell["address"]: str(cell["value"]) for cell in row["cells"]
+                 if cell["column_index"] in headers and cell["value"] is not None}
         if not cells:
             continue
         quoted_sheet = "'" + config.sheet.replace("'", "''") + "'"
         addresses = list(cells)
         locator = f"{source_id}#{quoted_sheet}!{addresses[0]}:{addresses[-1]}"
         text = json.dumps(
-            {"sheet": config.sheet, "row": row.number, "cells": [
-                {"cell": cell.address, "column": headers[column], "value": cells[cell.address]}
-                for column, cell in sorted(row.cells.items()) if cell.address in cells
-            ]},
-            ensure_ascii=False,
+            {"sheet": config.sheet, "row": row["row"], "cells": [
+                {"cell": cell["address"], "column": headers[cell["column_index"]],
+                 "value": str(cell["value"])}
+                for cell in row["cells"] if cell["address"] in cells
+            ]}, ensure_ascii=False,
         )
-        chunks.append(VendorTableChunk(source_id=source_id, source_locator=locator, sheet=config.sheet, row=row.number, cells=cells, text=text))
+        chunks.append(VendorTableChunk(source_id=source_id, source_locator=locator, sheet=config.sheet,
+                                       row=row["row"], cells=cells, text=text))
     return chunks
+
+
+def read_vendor_table(
+    content: bytes, *, config: VendorTableConfig, product: ProductKey, source_id: str,
+    workbook_index: dict[str, list[dict]] | None = None,
+    mpn_rows: Mapping[str, list[int]] | None = None,
+) -> list[VendorTableChunk]:
+    """Return only exact MPN/vendor matches, preserving original workbook addresses."""
+    index = workbook_index if workbook_index is not None else parse_vendor_workbook(content)
+    return read_vendor_table_index(index, config=config, product=product, source_id=source_id, mpn_rows=mpn_rows)

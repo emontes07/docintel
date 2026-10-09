@@ -100,11 +100,10 @@ def synthetic_workbook():
     return content.getvalue()
 
 
-def test_ten_line_entrypoint_help_has_no_external_operations(invoke):
-    assert len((ROOT / "run.sh").read_text().splitlines()) == 10
+def test_entrypoint_help_has_no_external_operations(invoke):
     result, calls = invoke("--help")
     assert result.returncode == 0
-    assert all(name in result.stdout for name in ("build", "deploy", "start", "export", "cost"))
+    assert all(name in result.stdout for name in ("build", "deploy", "start", "start-shards", "export", "cost"))
     assert calls == []
 
 
@@ -164,14 +163,37 @@ def test_start_runs_exactly_one_new_worker_execution(invoke):
     })
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "caj-quality-execution"
-    assert len(calls) == 2 and calls[0].startswith("az <containerapp> <job> <update>")
-    assert calls[1].startswith("az <containerapp> <job> <start>")
-    assert "<--set-env-vars> <QUALITY_RUN_ID=quality-001> <QUALITY_BATCH_ID=batch-001> <QUALITY_OWNER=tenant/owner>" in calls[0]
+    assert len(calls) == 1 and calls[0].startswith("az <containerapp> <job> <start>")
+    assert "<QUALITY_RUN_ID=quality-001> <QUALITY_BATCH_ID=batch-001> <QUALITY_OWNER=tenant/owner>" in calls[0]
     assert "<QUALITY_WEB_ENABLED=false> <QUALITY_FORD_IMAGE_BLOB=rendered/ford.png>" in calls[0]
     assert "<QUALITY_SMOKE_ONLY=true>" in calls[0]
-    assert "<--output> <none>" in calls[0]
-    assert "<--query> <name> <--output> <tsv>" in calls[1]
-    assert "<--env-vars>" not in calls[1]
+    assert "<--container-name> <caj-docintel-batch-dev-erik3>" in calls[0]
+    assert "<--env-vars>" in calls[0]
+    assert "<--query> <name> <--output> <tsv>" in calls[0]
+
+
+def test_start_shards_uses_per_execution_environment_and_shard_local_cost_ids(invoke):
+    result, calls = invoke("start-shards", "quality-slice-001", environment={
+        "QUALITY_BATCH_ID": "batch-001", "QUALITY_OWNER": "tenant/owner",
+        "QUALITY_SHARD_COUNT": "2", "QUALITY_AMORTIZED_PIPELINE_ENABLED": "true",
+    })
+    assert result.returncode == 0, result.stderr
+    assert len(calls) == 2
+    assert all("<containerapp> <job> <start>" in call and "<--env-vars>" in call for call in calls)
+    assert all("<update>" not in call and "QUALITY_AMORTIZED_PIPELINE_ENABLED=true" in call for call in calls)
+    assert "QUALITY_RUN_ID=quality-slice-001-s00" in calls[0]
+    assert "QUALITY_COST_RUN_ID=quality-slice-001-s00" in calls[0]
+    assert "QUALITY_SHARD_INDEX=0" in calls[0] and "QUALITY_SHARD_COUNT=2" in calls[0]
+    assert "QUALITY_RUN_ID=quality-slice-001-s01" in calls[1]
+    assert "QUALITY_COST_RUN_ID=quality-slice-001-s01" in calls[1]
+    assert "QUALITY_SHARD_INDEX=1" in calls[1] and "QUALITY_SHARD_COUNT=2" in calls[1]
+
+
+def test_invalid_shard_count_never_reaches_azure(invoke):
+    result, calls = invoke("start-shards", "quality-slice-001", environment={
+        "QUALITY_BATCH_ID": "batch-001", "QUALITY_OWNER": "tenant/owner", "QUALITY_SHARD_COUNT": "33",
+    })
+    assert result.returncode == 2 and calls == []
 
 
 @pytest.mark.parametrize("operation", ["start", "export", "cost"])

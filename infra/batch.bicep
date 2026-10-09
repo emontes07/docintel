@@ -7,6 +7,14 @@ param environmentName string
 param backendImage string
 param jobName string
 param containerName string = 'docintel-batches'
+@minValue(1)
+@maxValue(32)
+@description('Maximum independent batch shards per manual run. Amortized workers must be started with one per-shard QUALITY_SHARD_INDEX.')
+param parallelism int = 1
+@minValue(60)
+@maxValue(7200)
+@description('Replica timeout in seconds; aligned to the deployed production job.')
+param replicaTimeout int = 7200
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
   name: storageAccountName
@@ -60,7 +68,8 @@ module worker './modules/containerAppJob.bicep' = {
     workerClientId: identity.properties.clientId
     scheduleEnabled: false
     syntheticAcceptanceOnly: true
-    replicaTimeout: 600
+    replicaTimeout: replicaTimeout
+    parallelism: parallelism
     AZURE_BLOB_SERVICE_URL: storage.properties.primaryEndpoints.blob
     AZURE_STORAGE_ACCOUNT_NAME: storageAccountName
     AZURE_CONTAINER_REGISTRY_ENDPOINT: registry.properties.loginServer

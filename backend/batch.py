@@ -277,11 +277,29 @@ class BatchService:
             record, _ = read_json(self.store, f"batches/{batch_id}.json")
         return record
 
-    def get(self, batch_id, actor):
+    def get(self, batch_id, actor, *, include_items: bool = True):
         record, _ = read_json(self.store, f"batches/{batch_id}.json")
         if record["owner"] != actor:
             raise Missing(batch_id)
+        if "items_prefix" in record:
+            record = dict(record)
+            if include_items:
+                record["items"] = [
+                    read_json(self.store, f"{record['items_prefix']}/{item_key}.json")[0]
+                    for item_key in record["item_keys"]
+                ]
+            else:
+                record["items"] = []
         return record
+
+    def iter_items(self, record):
+        """Yield slice items one at a time from an out-of-line batch manifest."""
+        if "items_prefix" not in record:
+            yield from record["items"]
+            return
+        for item_key in record["item_keys"]:
+            item, _ = read_json(self.store, f"{record['items_prefix']}/{item_key}.json")
+            yield item
 
     def list(self, actor):
         return [self.summary(record) for path in self.store.keys("batches/") if (record := read_json(self.store, path)[0])["owner"] == actor]

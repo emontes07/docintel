@@ -13,9 +13,11 @@ param scheduleEnabled bool = false
 param syntheticAcceptanceOnly bool = false
 
 @description('Seconds a replica may run before it is terminated')
-param replicaTimeout int = 1800
+param replicaTimeout int = 7200
 
 @description('Number of replicas to start per manual invocation')
+@minValue(1)
+@maxValue(32)
 param parallelism int = 1
 
 // AI Foundry endpoint (unified for all AI services)
