@@ -35,6 +35,10 @@ az() {
   printf ' <%s>' "$@" >> "$CALLS"
   printf '\\n' >> "$CALLS"
   if [[ "$1 $2" == "$FAILURE" ]]; then return 23; fi
+  if [[ "$1 $2 $3" == 'containerapp job show' && "$*" == *'containers[0].image'* ]]; then printf '%s\\n' "$IMAGE"; fi
+  if [[ "$1 $2 $3" == 'containerapp job show' && "$*" == *'containers[0].env'* ]]; then
+    printf '[{\"name\":\"DOCINTEL_BATCH_STORAGE_URL\",\"value\":\"https://storage.example\"},{\"name\":\"DOCINTEL_BATCH_CONTAINER\",\"value\":\"batches\"},{\"name\":\"AZURE_CLIENT_ID\",\"value\":\"identity\"},{\"name\":\"QUALITY_RUN_ID\",\"value\":\"old-run\"}]\\n'
+  fi
   if [[ "$1 $2 $3" == 'acr repository show' ]]; then printf '%s\\n' "$DIGEST"; fi
   if [[ "$1 $2 $3" == 'containerapp job start' ]]; then printf 'caj-quality-execution\\n'; fi
   if [[ "$1 $2 $3" == 'containerapp job logs' ]]; then printf '{"known_run_cost_usd":1.25}\\n'; fi
@@ -72,7 +76,7 @@ exec bash ./run.sh "$@"
             cwd=ROOT,
             env={**os.environ, "API_BASE_URL": "", "AUTH_COOKIE_FILE": "", "DOCINTEL_ACCESS_TOKEN": "",
                  "EXPORT_MODE": "http", "QUALITY_OWNER": "",
-                 "CALLS": str(calls), "DIGEST": DIGEST, "FAILURE": failure, **(environment or {})},
+                 "CALLS": str(calls), "DIGEST": DIGEST, "IMAGE": IMAGE, "FAILURE": failure, **(environment or {})},
             capture_output=True,
             text=True,
             input="",
@@ -163,13 +167,16 @@ def test_start_runs_exactly_one_new_worker_execution(invoke):
     })
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "caj-quality-execution"
-    assert len(calls) == 1 and calls[0].startswith("az <containerapp> <job> <start>")
-    assert "<QUALITY_RUN_ID=quality-001> <QUALITY_BATCH_ID=batch-001> <QUALITY_OWNER=tenant/owner>" in calls[0]
-    assert "<QUALITY_WEB_ENABLED=false> <QUALITY_FORD_IMAGE_BLOB=rendered/ford.png>" in calls[0]
-    assert "<QUALITY_SMOKE_ONLY=true>" in calls[0]
-    assert "<--container-name> <caj-docintel-batch-dev-erik3>" in calls[0]
-    assert "<--env-vars>" in calls[0]
-    assert "<--query> <name> <--output> <tsv>" in calls[0]
+    assert len(calls) == 3 and all(call.startswith("az <containerapp> <job> <show>") for call in calls[:2])
+    assert calls[2].startswith("az <containerapp> <job> <start>")
+    assert "<QUALITY_RUN_ID=quality-001> <QUALITY_BATCH_ID=batch-001> <QUALITY_OWNER=tenant/owner>" in calls[2]
+    assert "<QUALITY_WEB_ENABLED=false> <QUALITY_FORD_IMAGE_BLOB=rendered/ford.png>" in calls[2]
+    assert "<QUALITY_SMOKE_ONLY=true>" in calls[2]
+    assert "<DOCINTEL_BATCH_STORAGE_URL=https://storage.example>" in calls[2]
+    assert "<--container-name> <caj-docintel-batch-dev-erik3>" in calls[2]
+    assert "<--command> </app/.venv/bin/python> <--args=-mbackend.quality_worker>" in calls[2]
+    assert "<--env-vars>" in calls[2] and f"<--image> <{IMAGE}>" in calls[2]
+    assert "<--query> <name> <--output> <tsv>" in calls[2]
 
 
 def test_start_shards_uses_per_execution_environment_and_shard_local_cost_ids(invoke):
@@ -178,15 +185,16 @@ def test_start_shards_uses_per_execution_environment_and_shard_local_cost_ids(in
         "QUALITY_SHARD_COUNT": "2", "QUALITY_AMORTIZED_PIPELINE_ENABLED": "true",
     })
     assert result.returncode == 0, result.stderr
-    assert len(calls) == 2
-    assert all("<containerapp> <job> <start>" in call and "<--env-vars>" in call for call in calls)
-    assert all("<update>" not in call and "QUALITY_AMORTIZED_PIPELINE_ENABLED=true" in call for call in calls)
-    assert "QUALITY_RUN_ID=quality-slice-001-s00" in calls[0]
-    assert "QUALITY_COST_RUN_ID=quality-slice-001-s00" in calls[0]
-    assert "QUALITY_SHARD_INDEX=0" in calls[0] and "QUALITY_SHARD_COUNT=2" in calls[0]
-    assert "QUALITY_RUN_ID=quality-slice-001-s01" in calls[1]
-    assert "QUALITY_COST_RUN_ID=quality-slice-001-s01" in calls[1]
-    assert "QUALITY_SHARD_INDEX=1" in calls[1] and "QUALITY_SHARD_COUNT=2" in calls[1]
+    starts = [call for call in calls if "<start>" in call]
+    assert len(calls) == 6 and len(starts) == 2
+    assert all("<update>" not in call and "<--env-vars>" in call
+               and "QUALITY_AMORTIZED_PIPELINE_ENABLED=true" in call for call in starts)
+    assert "QUALITY_RUN_ID=quality-slice-001-s00" in starts[0]
+    assert "QUALITY_COST_RUN_ID=quality-slice-001-s00" in starts[0]
+    assert "QUALITY_SHARD_INDEX=0" in starts[0] and "QUALITY_SHARD_COUNT=2" in starts[0]
+    assert "QUALITY_RUN_ID=quality-slice-001-s01" in starts[1]
+    assert "QUALITY_COST_RUN_ID=quality-slice-001-s01" in starts[1]
+    assert "QUALITY_SHARD_INDEX=1" in starts[1] and "QUALITY_SHARD_COUNT=2" in starts[1]
 
 
 def test_invalid_shard_count_never_reaches_azure(invoke):

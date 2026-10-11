@@ -18,10 +18,15 @@ this worker does not implement Azure OpenAI Batch submission.
 
 ## Per-execution environment
 
-`./run.sh start RUN_ID` passes run-specific environment to
-`az containerapp job start --env-vars`; it no longer updates the shared job
-definition. Use `./run.sh start-shards RUN_ID` with `QUALITY_SHARD_COUNT=N`
-(1–32) to start one execution per shard. Each receives its own `QUALITY_RUN_ID`,
+`./run.sh start RUN_ID` reads the job's immutable image and base environment,
+merges run-specific overrides, and passes them to
+`az containerapp job start --image ... --command /app/.venv/bin/python
+--args=-mbackend.quality_worker --env-vars ...`; it does not update the shared
+job definition. Supplying the image and worker command/args is required: the
+Azure CLI otherwise omits execution environment overrides or starts the image's
+default API entrypoint. Use `./run.sh start-shards RUN_ID` with
+`QUALITY_SHARD_COUNT=N` (1–32) to start one execution per shard. Each receives
+its own `QUALITY_RUN_ID`,
 `QUALITY_SHARD_INDEX`, `QUALITY_SHARD_COUNT`, and therefore its own cost meter
 under `quality-runs/<batch>/<run-id>/cost.json`. Family groups are assigned
 deterministically and balanced by item count. Start the shards concurrently in

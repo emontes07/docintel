@@ -412,9 +412,8 @@ def vendor_candidates_for_item(
         parsed = json.loads(row.text)
         cells = parsed["cells"]
         identity_cells = [cell for cell in cells if cell["value"] == manifest.product.mpn]
-        if len(identity_cells) != 1:
-            raise ValueError("Exact MPN row must contain one identity cell for cell-level vendor citations")
-        identity_cell = identity_cells[0]
+        if not identity_cells:
+            raise ValueError("Exact MPN row must contain an identity cell for cell-level vendor citations")
         for column, text in ((cell["column"], cell["value"]) for cell in cells):
             for raw in phrase_candidates.get(column + "\u0000" + normalized_phrase(text), []):
                 proposal = PhraseCandidate.model_validate(raw)
@@ -424,7 +423,7 @@ def vendor_candidates_for_item(
                 key = (row.evidence_id, value_cell["cell"])
                 exact_evidence = cell_evidence.get(key)
                 if exact_evidence is None:
-                    cited_cells = [identity_cell] if identity_cell["cell"] != value_cell["cell"] else []
+                    cited_cells = [cell for cell in identity_cells if cell["cell"] != value_cell["cell"]]
                     cited_cells.append(value_cell)
                     fragment = (
                         f"sheet={quote(parsed['sheet'], safe='')}&row={parsed['row']}&cells="
