@@ -117,8 +117,60 @@ def test_slice_uses_only_approved_angle_rows_and_reuses_the_vendor_parse(monkeyp
     ]
     assert len(calls) == 2
     assert hydrated[0]["sources"][0]["applicability"][0]["qualification"].find("H14250") >= 0
+    pdfs = {item["manifest"]["product"]["mpn"]: [s["source_id"] for s in item["sources"] if s["format"] == "pdf"]
+            for item in hydrated}
+    assert pdfs == {"014255 215N": ["av-source-1"], "014267 216N": [], "AV11-333W-NL": ["av-source-4"],
+                    "AV11-444W-NL": ["av-source-4"], "AV21-333W-NL": []}
     assert all(len(source["products"]) == 1 for item in hydrated for source in item["sources"])
     again = build_approved_angle_valve_slice(store, BASE_ID, OWNER)
     assert again["id"] == result["id"] and len(calls) == 2
     index_keys = [key for key in store.values if key.startswith("quality-vendor-index/")]
     assert len(index_keys) == 2
+
+
+def _slice_with(mueller_rows, ford_rows):
+    mueller = workbook(mueller_rows, ["Part #", "Descr 1", "Descr Mat 1"])
+    ford = workbook(ford_rows, ["2nd Item Number", "Description", "Submittal File"])
+    pdf1, pdf4 = b"approved mueller pdf", b"approved ford pdf"
+    store = MemoryStore(base_record(mueller, ford, pdf1, pdf4), {
+        "documents/av-source-2.xlsx": mueller, "documents/av-source-5.xlsx": ford,
+        "documents/av-source-1.pdf": pdf1, "documents/av-source-4.pdf": pdf4,
+    })
+    result = build_approved_angle_valve_slice(store, BASE_ID, OWNER)
+    items = BatchService(store).get(result["id"], OWNER)["items"]
+    return result, {item["manifest"]["product"]["mpn"]: item for item in items}
+
+
+def test_documents_bind_only_to_named_or_series_matching_rows():
+    result, items = _slice_with([
+        ["014255 1 215N", "5/8X3/4 ANGLE MTR STOP", "LOW LEAD BRASS"],
+        ["014255 215N", "5/8X3/4 ANGLE MTR STOP", "SEE HS H14250"],
+        ["014266 216N", "ANGLE METER STOP", "SEE HS H14250"],
+        ["014278 203N", "ANGLE METER STOP", "REF HS 14250"],
+        ["014266 330N", "ANGLE METER STOP", "SEE HS H14255N"],
+        ["014258 215N", "ANGLE METER STOP", "LOW LEAD BRASS"],
+    ], [
+        ["AV11-333W-NL", "3/4 ANGLE KEY VALVE", "AV11-xxxW-NL.pdf"],
+        ["AV94-444W-Q-NL", "1IN ANGLE KEY VALVE", "AV94-444W-Q-NL.pdf"],
+        ["AV92-324D-NL", "ANGLE KEY VALVE", "AV92-xxxD-NL.pdf"],
+        ["AV21-333W-NL", "ANGLE KEY VALVE", ""],
+    ])
+
+    def pdfs(mpn):
+        return [s["source_id"] for s in items[mpn]["sources"] if s["format"] == "pdf"]
+
+    # Cross-model regression: other Ford models and other Mueller series are vendor-row-only.
+    assert pdfs("AV94-444W-Q-NL") == [] and pdfs("AV92-324D-NL") == [] and pdfs("AV21-333W-NL") == []
+    assert pdfs("014266 216N") == [] and pdfs("014278 203N") == [] and pdfs("014258 215N") == []
+    assert items["014266 216N"]["manifest"]["source_ids"] == ["av-source-2"]
+    # A row that names the stored drawing, a 14255-series MPN, and an AV11 MPN are bound.
+    assert pdfs("014266 330N") == ["av-source-1"]
+    assert items["014266 330N"]["document_binding"]["basis"] == "vendor_row_reference"
+    assert pdfs("014255 1 215N") == ["av-source-1"] and pdfs("014255 215N") == ["av-source-1"]
+    assert items["014255 1 215N"]["document_binding"]["basis"] == "mpn_series"
+    assert pdfs("AV11-333W-NL") == ["av-source-4"]
+    routes = {route["mpn"]: route["family_key"] for route in result["item_routes"]}
+    assert routes["AV94-444W-Q-NL"] == "no-pdf-av-source-5" and routes["014266 216N"] == "no-pdf-av-source-2"
+    missing = {entry["document"]: entry["items"] for entry in result["slice"]["missing_documents"]}
+    assert missing["H14250"] == 3 and missing["AV94-444W-Q-NL"] == 1 and missing["AV92-xxxD-NL"] == 1
+    assert "H14255N" not in missing and "AV11-xxxW-NL" not in missing

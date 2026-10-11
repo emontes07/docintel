@@ -199,9 +199,11 @@ def test_fallback_preserves_disputes_without_steering_new_calls_with_prior_verdi
     assert "prior_tier_review" not in packet
     assert [entry["kind"] for entry in packet["evidence"]] == ["vendor_row"]  # tier-scoped
     assert len(client.calls) == 5  # a 2/2 dispute needs no third vote
-    assert [candidate.judge_status for candidate in result.attributes[0].candidates] == [
-        "judge_disputed", "accepted",
-    ]
+    # Same value after display formatting: the accepted vendor candidate is kept and the
+    # disputed PDF citation stays inspectable as a format duplicate.
+    kept = result.attributes[0].candidates
+    assert [candidate.judge_status for candidate in kept] == ["accepted"]
+    assert kept[0].grounding["format_duplicates"][0]["judge_status"] == "judge_disputed"
     assert all("prior_tier_review" not in packet for schema, packet, _ in client.calls
                if schema == QualityJudgment)
 
@@ -518,7 +520,8 @@ def test_four_product_worker_appends_attempts_preserves_history_and_persists_usa
             client.responses.append([proposal(evidence_ids=[packet["evidence"][0]["citation_id"]])])
         return Completion.complete_structured(client, system, user, schema, **kwargs)
     client.complete_structured = answer
-    summary = run_quality_batch(store, "batch", "owner", "first", completion=client, execution_id="first-execution")
+    summary = run_quality_batch(store, "batch", "owner", "first", completion=client, execution_id="first-execution",
+                                extraction_cache_enabled=False)
     assert len(summary["products"]) == 4 and summary["model_calls"] == 5
     assert summary["new_di_calls"] == 0
     assert len(store.keys("quality-runs/batch/first/usage/")) == 5
@@ -528,7 +531,7 @@ def test_four_product_worker_appends_attempts_preserves_history_and_persists_usa
         assert state["previous_attempt"] == json.loads(old[key][0])
         assert "/attempts/" in state["result_key"]
     first_results = {key: value for key, value in store.data.items() if key.startswith("results/")}
-    run_quality_batch(store, "batch", "owner", "second", completion=client)
+    run_quality_batch(store, "batch", "owner", "second", completion=client, extraction_cache_enabled=False)
     assert all(store.data[key] == value for key, value in first_results.items())
     assert store.data["batches/batch.json"] == old["batches/batch.json"]
     assert len(BatchService(store).detail("batch", "row-2", "owner")["attempt_history"]) == 3
@@ -1291,6 +1294,7 @@ def test_same_run_manual_retry_appends_usage_and_immutable_execution_results():
             store, "batch", "owner", "retry-run", execution_id=execution_id,
             completion=Completion([[proposal(evidence_ids=["E1"])]]),
             usage_callback=meter.record, before_call=meter.before_call, cost_summary=meter.summary,
+            extraction_cache_enabled=False,
         )
         summaries.append(result)
         if first_records is None:

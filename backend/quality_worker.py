@@ -36,7 +36,7 @@ from backend.extract import source_evidence
 from backend.models.enrichment import Candidate, Evidence, Manifest, OfflineSource, RetrievalOutcome
 from backend.pilot import PARSER_VERSION
 from backend.quality_pipeline import (
-    EXTRACT_TASK, JUDGE_SYSTEM, QualityExtraction, complete_quality_call, expand_citations,
+    EXTRACT_TASK, JUDGE_SYSTEM, ExtractionCache, QualityExtraction, complete_quality_call, expand_citations,
     ground_candidate, product_packet, run_product, shared_source_ids, source_family,
 )
 from backend.quality_judge import JudgeCache
@@ -417,6 +417,7 @@ def run_quality_batch(
     shard_index: int = 0,
     shard_count: int = 1,
     vendor_completion=None,
+    extraction_cache_enabled: bool = True,
 ) -> dict:
     """Append new immutable results and preserve the complete previous state chain."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
@@ -563,6 +564,9 @@ def run_quality_batch(
         judge_cache = JudgeCache(
             store, namespace=owner, policy=JUDGE_SYSTEM + str(getattr(completion, "deployment", "")),
         )
+        extraction_cache = ExtractionCache(
+            store, namespace=owner, deployment=str(getattr(completion, "deployment", "")),
+        ) if extraction_cache_enabled else None
         if amortized_enabled and (smoke_only or smoke_first or ocr_smoke):
             raise ValueError("Amortized slice mode does not run smoke or OCR probes")
         if amortized_enabled:
@@ -570,7 +574,7 @@ def run_quality_batch(
             amortized_products = iter(run_amortized_products(
                 store, pending_items, record, loader, item_loader, completion, run_id=run_id,
                 judge_cache=judge_cache, usage_callback=persist_usage, before_call=before_usage,
-                vendor_completion=vendor_completion,
+                vendor_completion=vendor_completion, extraction_cache=extraction_cache,
             ))
             loaded, shared = None, {}
         else:
@@ -642,6 +646,7 @@ def run_quality_batch(
                     definition_rows=record.get("original_definitions"),
                     tool_loop_enabled=tool_loop_enabled, tool_prices=tool_prices,
                     second_look_enabled=second_look_enabled, tool_loop_max_steps=tool_loop_max_steps,
+                    extraction_cache=extraction_cache,
                     initial_candidates={"vendor_table": [
                         Candidate.model_validate(candidate) for candidate in smoke["candidates"]
                     ]} if reuse_smoke else None,
@@ -867,6 +872,7 @@ def main(argv=None) -> int:
             shard_index=args.shard_index, shard_count=args.shard_count,
             vendor_completion=vendor_completion,
             tool_prices=prices,
+            extraction_cache_enabled=os.environ.get("QUALITY_EXTRACTION_CACHE_ENABLED", "true").lower() == "true",
         )
     finally:
         print(json.dumps({"quality_cost": meter.summary()}, ensure_ascii=True), flush=True)

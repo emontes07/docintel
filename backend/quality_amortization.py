@@ -206,7 +206,7 @@ def _family_safe(candidate: Candidate, evidence: list[Evidence], mpns: set[str])
 
 def get_family_candidates(
     store, family_items: list[dict], representative: Manifest, pdf_evidence: list[Evidence],
-    completion, *, run_id: str, namespace: str, usage_callback=None, before_call=None,
+    completion, *, run_id: str, namespace: str, usage_callback=None, before_call=None, extraction_cache=None,
 ) -> tuple[list[Candidate], set[str], dict]:
     """Run one compact PDF extraction per cached source-family/definition/policy key."""
     if not pdf_evidence:
@@ -236,7 +236,7 @@ def get_family_candidates(
     result = run_product(
         representative, pdf_evidence, completion, run_id=run_id,
         usage_callback=usage_callback, before_call=before_call,
-        tool_loop_enabled=False, second_look_enabled=False,
+        tool_loop_enabled=False, second_look_enabled=False, extraction_cache=extraction_cache,
     )
     safe, ambiguous = [], set()
     all_candidates = [c for a in result.attributes for c in a.candidates]
@@ -488,8 +488,9 @@ def _transplant_family_candidates(
         if candidate.attribute_id not in definitions or not set(candidate.evidence_ids) <= indexed.keys():
             continue
         target_evidence = [indexed[key] for key in candidate.evidence_ids]
+        original_value = ((candidate.grounding or {}).get("display_format") or {}).get("original_value", candidate.value)
         proposal = QualityProposal(
-            attribute_id=candidate.attribute_id, value=candidate.value, unit=candidate.unit,
+            attribute_id=candidate.attribute_id, value=original_value, unit=candidate.unit,
             evidence_ids=candidate.evidence_ids, supporting_quote=candidate.supporting_quote or "",
             origin=candidate.origin, normalization_rule=candidate.normalization_rule,
             justification=candidate.justification, reviewer_explanation=candidate.reviewer_explanation or "",
@@ -499,9 +500,13 @@ def _transplant_family_candidates(
             proposal, definitions[candidate.attribute_id], target_evidence,
             derive_definition(definitions[candidate.attribute_id].model_dump(mode="json")),
         )
+        applicability = candidate_applicability(grounded, mapping, evidence)
+        if applicability.status == "family-unconfirmed":
+            # A document not confirmed to cover this product never transfers family-wide.
+            continue
         grounded.grounding = {
             **(grounded.grounding or {}), "quality_pass": "family",
-            "applicability": candidate_applicability(grounded, mapping, evidence).model_dump(mode="json"),
+            "applicability": applicability.model_dump(mode="json"),
             "family_cache_key": (candidate.grounding or {}).get("family_cache_key"),
         }
         output.append(grounded)
@@ -511,6 +516,7 @@ def _transplant_family_candidates(
 def run_amortized_products(
     store, routes: list[dict], record: dict, loader, item_loader, completion, *, run_id: str, judge_cache,
     usage_callback=None, before_call=None, tool_prices: dict | None = None, vendor_completion=None,
+    extraction_cache=None,
 ) -> Iterator[tuple[dict, EnrichmentResult, list[dict], list[dict]]]:
     """Prepare family/vendor candidates once, then stream each product through grounding/judging."""
     if not routes:
@@ -533,6 +539,7 @@ def run_amortized_products(
         family_candidates, ambiguous, family_stats = get_family_candidates(
             store, family_routes, manifest, pdf_evidence, completion, run_id=run_id,
             namespace=namespace, usage_callback=usage_callback, before_call=before_call,
+            extraction_cache=extraction_cache,
         )
         family_cache[family] = (family_candidates, ambiguous, family_stats)
 
@@ -585,7 +592,7 @@ def run_amortized_products(
             initial_candidates=initial, initial_diagnostics=markers, judge_cache=judge_cache,
             shared_ids={e.evidence_id for e in evidence if e.source_tier == "internal_pdf"},
             definition_rows=structured_defs, tool_loop_enabled=False, second_look_enabled=False,
-            requested_attribute_ids=ambiguous - vendor_mapped,
+            requested_attribute_ids=ambiguous - vendor_mapped, extraction_cache=extraction_cache,
         )
         for rejection in vendor_rejections:
             target = next((a for a in result.attributes if a.attribute_id == rejection["attribute_id"]), None)

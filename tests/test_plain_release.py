@@ -427,3 +427,25 @@ def test_container_smoke_checks_authentication_and_stops_its_server(monkeypatch,
         with pytest.raises(RuntimeError, match="Anonymous"):
             container_smoke.main()
     assert stopped == [True]
+
+
+def test_start_image_override_is_per_execution_and_never_updates_the_job(invoke):
+    override = "crc4ryis6hullf4.azurecr.io/docintel/backend@sha256:" + "b" * 64
+    result, calls = invoke("start", "quality-002", environment={
+        "QUALITY_BATCH_ID": "batch-001", "QUALITY_OWNER": "tenant/owner", "DOCINTEL_IMAGE": override,
+        "QUALITY_EXTRACTION_CACHE_ENABLED": "true",
+    })
+    assert result.returncode == 0, result.stderr
+    assert not any("<update>" in call for call in calls)
+    assert not any("containers[0].image" in call for call in calls)
+    start = next(call for call in calls if "<start>" in call)
+    assert f"<--image> <{override}>" in start and "<QUALITY_EXTRACTION_CACHE_ENABLED=true>" in start
+
+
+def test_start_rejects_a_mutable_image_override(invoke):
+    result, calls = invoke("start", "quality-003", environment={
+        "QUALITY_BATCH_ID": "batch-001", "QUALITY_OWNER": "tenant/owner",
+        "DOCINTEL_IMAGE": "crc4ryis6hullf4.azurecr.io/docintel/backend:latest",
+    })
+    assert result.returncode != 0
+    assert not any("<start>" in call for call in calls)

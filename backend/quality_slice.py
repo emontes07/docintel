@@ -16,8 +16,46 @@ from backend.models.enrichment import Manifest, ProductKey
 ANGLE_NODE = "Pipes, Valves & Fittings.Fittings.Brass Service Materials.Angle Valves"
 REFERENCE = "Angle_Valve_Attributes.xlsx"
 MAX_SLICE_ITEMS = 200
+SLICE_VERSION = "prc-angle-valves-v2"
 MUELLER_STOP = re.compile(r"\bANGLE\s+(?:MTR|METER)\s+STOP\b", re.I)
 FORD_AV = re.compile(r"AV\d{2,}-.+", re.I)
+MUELLER_DRAWING_REFERENCE = re.compile(r"\b(?:SEE|REF)\s+HS\s+((?:[A-Z]?\d{5}[A-Z]?\b\s*)+)", re.I)
+# The stored documents' own printed model/series identity. A PDF binds to a row only
+# when the row names this document or the MPN matches this printed series.
+STORED_DOCUMENTS = {
+    "mueller": {"source_id": "av-source-1", "identifier": "H14255N"},
+    "ford": {"source_id": "av-source-4", "identifier": "AV11-xxxW-NL"},
+}
+
+
+def referenced_documents(vendor: str, values: dict[str, str]) -> list[str]:
+    """Drawing/submittal identifiers named by a vendor row, in display form."""
+    if vendor == "ford":
+        submittal = values.get("Submittal File", "").strip()
+        return [re.sub(r"\.pdf$", "", submittal, flags=re.I)] if submittal else []
+    found = []
+    for column, text in values.items():
+        if column == "Part #":
+            continue
+        for match in MUELLER_DRAWING_REFERENCE.finditer(text):
+            for token in match[1].split():
+                token = token.upper()
+                found.append(token if token[0].isalpha() else "H" + token)
+    return list(dict.fromkeys(found))
+
+
+def document_binding(vendor: str, mpn: str, values: dict[str, str]) -> dict | None:
+    """Return the binding basis for the stored document, or None (vendor-row-only)."""
+    from backend.quality_applicability import _series_match
+
+    document = STORED_DOCUMENTS[vendor]
+    references = referenced_documents(vendor, values)
+    if any(_series_match(reference, document["identifier"]) or reference.casefold() == document["identifier"].casefold()
+           for reference in references):
+        return {"basis": "vendor_row_reference", "document": document["identifier"], "row_references": references}
+    if _series_match(document["identifier"], mpn):
+        return {"basis": "mpn_series", "document": document["identifier"], "row_references": references}
+    return None
 
 
 def _source_lookup(record: dict) -> dict[str, dict]:
@@ -110,7 +148,7 @@ def build_approved_angle_valve_slice(store, source_batch_id: str, owner: str) ->
     if not required <= sources.keys():
         raise ValueError("The source batch does not contain all four approved Mueller/Ford sources")
     batch_id = hashlib.sha256(
-        f"prc-angle-valves-v1:{owner}:{source_batch_id}".encode()
+        f"{SLICE_VERSION}:{owner}:{source_batch_id}".encode()
     ).hexdigest()
     try:
         existing, _ = read_json(store, f"batches/{batch_id}.json")
@@ -131,9 +169,9 @@ def build_approved_angle_valve_slice(store, source_batch_id: str, owner: str) ->
             "pdf": sources["av-source-1"], "xlsx": sources["av-source-2"],
             "xlsx_table": sources["av-source-2"]["table"],
             "pdf_qualification": (
-                "Approved stored Mueller drawing. Its title block identifies H14255N; vendor rows that "
-                "reference H14250 do not prove drawing applicability. Keep this reviewer question and do "
-                "not transfer variant-specific dimensions."
+                "Approved stored Mueller drawing H14255N, bound only to 14255-series MPNs or rows that name "
+                "it. Rows that reference a different drawing (for example H14250) keep the applicability "
+                "question; variant-specific dimensions are never transferred."
             ),
         },
         "ford": {
@@ -141,8 +179,8 @@ def build_approved_angle_valve_slice(store, source_batch_id: str, owner: str) ->
             "pdf": sources["av-source-4"], "xlsx": sources["av-source-5"],
             "xlsx_table": sources["av-source-5"]["table"],
             "pdf_qualification": (
-                "Approved stored Ford AV11 submittal. Applicability to other AV-series variants is "
-                "unconfirmed; keep the series question and do not transfer variant-specific dimensions."
+                "Approved stored Ford AV11-xxxW-NL submittal, bound only to rows whose Submittal File names "
+                "it or whose MPN matches AV11-xxxW-NL. Other AV-series variants are vendor-row-only."
             ),
         },
     }
@@ -170,29 +208,43 @@ def build_approved_angle_valve_slice(store, source_batch_id: str, owner: str) ->
             item_id=item_id, vendor=source_specs[key]["vendor_name"], mpn=mpn, hierarchy_node=ANGLE_NODE,
         ))
     items = []
+    missing: dict[str, dict] = {}
+    bindings_summary = {"mueller": {"bound": 0, "vendor_only": 0}, "ford": {"bound": 0, "vendor_only": 0}}
     for index, (key, source_row, mpn, values) in enumerate(selected, 2):
         spec = source_specs[key]
         product = next(product for product in products_by_vendor[key] if product.mpn == mpn)
+        basis = document_binding(key, mpn, values)
+        stored = STORED_DOCUMENTS[key]["identifier"].casefold()
+        references = referenced_documents(key, values)
+        for reference in references or ["(none referenced)"]:
+            if reference.casefold() == stored:
+                continue
+            entry = missing.setdefault(reference, {"document": reference, "vendor": key, "items": 0, "mpns": []})
+            entry["items"] += 1
+            entry["mpns"].append(mpn)
+        bindings_summary[key]["bound" if basis else "vendor_only"] += 1
         pdf_binding = _binding(
             spec["pdf"], product, reference=f"approved:{key}:pdf", tier="internal_pdf", fmt="pdf",
-            qualification=spec["pdf_qualification"], attributes=attributes,
-        )
+            qualification=spec["pdf_qualification"] + f" Binding basis: {basis['basis']}.", attributes=attributes,
+        ) if basis else None
         vendor_binding = _binding(
             spec["xlsx"], product, reference=f"approved:{key}:vendor", tier="vendor_table", fmt="xlsx",
             qualification="Exact MPN-matched row from the already-approved internal vendor workbook.",
             attributes=attributes, table=spec["xlsx_table"],
         )
+        sources = [binding for binding in (pdf_binding, vendor_binding) if binding]
         manifest = Manifest(product=product, attributes=pilot_manifest.attributes,
-                            source_ids=[pdf_binding["source_id"], vendor_binding["source_id"]])
+                            source_ids=[binding["source_id"] for binding in sources])
         original = {
             "PIMITEM Number": product.item_id, "Vendor Name": product.vendor, "MPN": mpn,
             "Hierarchy Node": ANGLE_NODE, "Attributes to Fill": REFERENCE,
-            "PDF Tech Spec": f"approved:{key}:pdf", "Vendor Tabular Data": f"approved:{key}:vendor",
+            "PDF Tech Spec": f"approved:{key}:pdf" if basis else "", "Vendor Tabular Data": f"approved:{key}:vendor",
         }
         items.append({
             "item_key": f"row-{index}", "row": index, "original": original,
-            "manifest": manifest.model_dump(mode="json"), "sources": [pdf_binding, vendor_binding],
-            "errors": [], "warnings": [],
+            "manifest": manifest.model_dump(mode="json"), "sources": sources,
+            "errors": [], "warnings": [], "document_binding": basis,
+            "referenced_documents": references, "vendor": key,
         })
     items_prefix = f"batches/{batch_id}/items"
     routes = []
@@ -200,10 +252,10 @@ def build_approved_angle_valve_slice(store, source_batch_id: str, owner: str) ->
         product = item["manifest"]["product"]
         pdfs = sorted((source["source_id"], source["sha256"])
                       for source in item["sources"] if source["format"] == "pdf")
+        vendor = next((source for source in item["sources"] if source["format"] == "xlsx"), None)
         family_key = ("pdf-family-" + hashlib.sha256(
             json.dumps(pdfs, separators=(",", ":")).encode()
-        ).hexdigest()[:24]) if pdfs else "no-pdf"
-        vendor = next((source for source in item["sources"] if source["format"] == "xlsx"), None)
+        ).hexdigest()[:24]) if pdfs else "no-pdf-" + (vendor["source_id"] if vendor else item["item_key"])
         routes.append({
             "item_key": item["item_key"], "product": product, "mpn": product["mpn"],
             "family_key": family_key,
@@ -224,8 +276,10 @@ def build_approved_angle_valve_slice(store, source_batch_id: str, owner: str) ->
         },
         "attribute_reference": REFERENCE, "original_definitions": definitions,
         "mode": "live_inference", "progress": {"processed": 0, "total": len(items)},
-        "slice": {"internal_only": True, "vendor_files": ["av-source-2", "av-source-5"],
-                  "pdf_files": ["av-source-1", "av-source-4"], "vendor_workbook_parses": 2},
+        "slice": {"internal_only": True, "version": SLICE_VERSION, "vendor_files": ["av-source-2", "av-source-5"],
+                  "pdf_files": ["av-source-1", "av-source-4"], "vendor_workbook_parses": 2,
+                  "document_bindings": bindings_summary,
+                  "missing_documents": sorted(missing.values(), key=lambda entry: (-entry["items"], entry["document"]))},
     }
     write_json(store, f"batches/{batch_id}.json", record)
     return record
