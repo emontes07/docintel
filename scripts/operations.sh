@@ -17,6 +17,7 @@ docintel_usage() {
     './run.sh cost EXECUTION' \
     './run.sh cost --file METER_JSON' \
     'Start requires QUALITY_BATCH_ID and QUALITY_OWNER; start-shards uses QUALITY_SHARD_COUNT (1-32) and returns one execution name per shard.' \
+    'Optional DOCINTEL_IMAGE=REGISTRY/REPOSITORY@sha256:DIGEST runs that immutable image for this execution only.' \
     'Export: API_BASE_URL + AUTH_COOKIE_FILE (frontend), or DOCINTEL_API_URL + DOCINTEL_ACCESS_TOKEN (backend).' \
     'Optional export: EXPORT_MODE=console + QUALITY_OWNER uses existing Azure app-exec permission.'
 }
@@ -86,9 +87,15 @@ docintel_start() {
   [[ -n "${QUALITY_MAX_OUTPUT_TOKENS_JUDGE:-}" ]] && environment+=("QUALITY_MAX_OUTPUT_TOKENS_JUDGE=$QUALITY_MAX_OUTPUT_TOKENS_JUDGE")
   [[ -n "${QUALITY_MAX_OUTPUT_TOKENS_TOOL_STEP:-}" ]] && environment+=("QUALITY_MAX_OUTPUT_TOKENS_TOOL_STEP=$QUALITY_MAX_OUTPUT_TOKENS_TOOL_STEP")
   [[ -n "${QUALITY_MAX_OUTPUT_TOKENS_CLOSEOUT:-}" ]] && environment+=("QUALITY_MAX_OUTPUT_TOKENS_CLOSEOUT=$QUALITY_MAX_OUTPUT_TOKENS_CLOSEOUT")
+  [[ -n "${QUALITY_EXTRACTION_CACHE_ENABLED:-}" ]] && environment+=("QUALITY_EXTRACTION_CACHE_ENABLED=$QUALITY_EXTRACTION_CACHE_ENABLED")
   local image base_env_json
-  image=$(az containerapp job show --subscription "$subscription" --resource-group "$group" --name "$job" \
-    --query 'properties.template.containers[0].image' --output tsv)
+  if [[ -n "${DOCINTEL_IMAGE:-}" ]]; then
+    # Per-execution image override; the job definition is never updated.
+    image="$DOCINTEL_IMAGE"
+  else
+    image=$(az containerapp job show --subscription "$subscription" --resource-group "$group" --name "$job" \
+      --query 'properties.template.containers[0].image' --output tsv)
+  fi
   [[ "$image" =~ ^crc4ryis6hullf4\.azurecr\.io/docintel/backend@sha256:[a-f0-9]{64}$ ]] \
     || { printf 'Job does not have the approved immutable backend image.\n' >&2; return 1; }
   base_env_json=$(az containerapp job show --subscription "$subscription" --resource-group "$group" --name "$job" \

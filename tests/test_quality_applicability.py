@@ -368,11 +368,34 @@ def test_ford_style_reference_and_exact_catalog_row_use_source_facts(mpn):
     assert candidate_applicability(candidate("family"), mapping, ev).confidence == "Medium"
 
 
-def test_ford_header_and_exact_product_row_do_not_invent_a_prefix_alias():
+def test_ford_printed_series_pattern_confirms_only_matching_models():
     ev = [excerpt("heading", "Angle Service Valves - (AV11-xxxW-NL style)"),
           excerpt("family", "Material: Brass")]
     ev += table([["Part Number", "Material"], ["AV11-333W-NL", "Brass"]])
-    assert classify(manifest("AV11-333W-NL"), ev, candidate("family")).confidence == "Low"
+    result = classify(manifest("AV11-333W-NL"), ev, candidate("family"))
+    assert (result.status, result.confidence) == ("family-confirmed", "Medium")
+    assert classify(manifest("AV11-444W-NL"), ev, candidate("family")).status == "family-confirmed"
+    # The other model's table row never applies to this model.
+    assert classify(manifest("AV11-444W-NL"), ev, candidate("pdf-p1-r1-c1")).status == "family-unconfirmed"
+
+
+@pytest.mark.parametrize(("mpn", "submittal"), [
+    ("AV94-444W-Q-NL", "AV94-444W-Q-NL.pdf"), ("AV92-324D-NL", "AV92-xxxD-NL.pdf"), ("AV21-333W-NL", None),
+])
+def test_other_ford_models_never_receive_the_av11_submittal(mpn, submittal):
+    fields = [("Submittal File", submittal)] if submittal else []
+    row = vendor(mpn, key_column="2nd Item Number", fields=fields)
+    ev = [row, excerpt("heading", "Angle Service Valves - (AV11-xxxW-NL style)"),
+          excerpt("family", "Material: Brass")]
+    result = classify(manifest(mpn), ev, candidate("family"))
+    assert (result.status, result.confidence) == ("family-unconfirmed", "Low")
+    assert result.reviewer_questions
+
+
+def test_av11_row_naming_another_submittal_is_not_confirmed_by_the_series():
+    row = vendor("AV11-333W-NL", key_column="2nd Item Number", fields=[("Submittal File", "AV12-xxxW-NL.pdf")])
+    ev = [row, excerpt("heading", "Angle Service Valves - (AV11-xxxW-NL style)"), excerpt("family", "Material: Brass")]
+    assert classify(manifest("AV11-333W-NL"), ev, candidate("family")).status == "family-unconfirmed"
 
 
 @pytest.mark.parametrize(("mpn", "reference"), [
@@ -388,10 +411,31 @@ def test_mueller_h14250_is_not_h14255n(mpn, reference):
     assert classify(manifest(mpn), ev, candidate(row.evidence_id)).confidence == "High"
 
 
-def test_mueller_variants_are_not_aliased_even_when_the_drawing_matches():
+def test_another_variants_row_is_not_an_identity_but_the_series_drawing_confirms():
     row = vendor("014255    203N", key_column="Part #", fields=[("Descr Mat 1", "REF HS H14255N")])
     ev = [row, excerpt("heading", "H14255N PART NUMBER"), excerpt("material", "Material: Brass")]
-    assert classify(manifest("014255    215N"), ev, candidate("material")).confidence == "Low"
+    assert classify(manifest("014255    215N"), ev, candidate(row.evidence_id)).status == "family-unconfirmed"
+    assert classify(manifest("014255    215N"), ev, candidate("material")).status == "family-confirmed"
+
+
+@pytest.mark.parametrize(("mpn", "fields"), [
+    ("014266    216N", []), ("014278    203N", [("Descr Mat 1", "REF HS 14250")]),
+    ("014258    215N", [("Descr Mat 1", "LOW LEAD BRASS STYLE")]), ("014255  1 215N", [("Descr Mat 1", "SEE HS H14250 H15008")]),
+])
+def test_other_mueller_series_or_conflicting_drawings_stay_unconfirmed(mpn, fields):
+    row = vendor(mpn, key_column="Part #", fields=fields)
+    ev = [row, excerpt("heading", "H14255N PART NUMBER")]
+    ev += table([["NO", "DESCRIPTION", "MATERIAL"], ["1", "BODY", "CAST BRASS ASTM B62 ALLOY C83600"]])
+    for evidence_id in ("pdf-p1-r1-c2", "heading"):
+        result = classify(manifest(mpn), ev, candidate(evidence_id))
+        assert (result.status, result.confidence) == ("family-unconfirmed", "Low")
+
+
+def test_14255_series_row_without_a_conflicting_reference_is_confirmed():
+    row = vendor("014255  1 215N", key_column="Part #", fields=[("DescrGen1", '3/4" COPPER SERVICE THREAD INLET  1957 STYLE')])
+    ev = [row, excerpt("heading", "H14255N PART NUMBER")]
+    ev += table([["NO", "DESCRIPTION", "MATERIAL"], ["1", "BODY", "CAST BRASS ASTM B62 ALLOY C83600"]])
+    assert classify(manifest("014255  1 215N"), ev, candidate("pdf-p1-r1-c2")).status == "family-confirmed"
 
 
 def test_explicit_matching_mueller_reference_would_confirm_without_an_alias():

@@ -29,6 +29,7 @@ ambient static token over the worker's token provider.
 | `QUALITY_AMORTIZED_PIPELINE_ENABLED` | `false`; use family PDF results plus cached vendor column-profile/unique-phrase mappings, then per-product applicability, grounding and judging. |
 | `QUALITY_SHARD_INDEX` / `QUALITY_SHARD_COUNT` | `0` / `1`; deterministic family shard. Use `./run.sh start-shards RUN_ID` to create one isolated execution and cost meter per shard. |
 | `QUALITY_MODEL_TIERING_ENABLED` | `false`; when enabled, profile and vendor-phrase calls use `QUALITY_VENDOR_MODEL_DEPLOYMENT`; a deployment and explicit four-class vendor-model prices are required. PDF, residual and judge stages stay on the standard deployment. |
+| `QUALITY_EXTRACTION_CACHE_ENABLED` | `true`; reuse persisted extraction outputs keyed by evidence fingerprint, definitions, prompts, schema and deployment. |
 | `QUALITY_AZURE_BATCH_ENABLED` | `false`; Azure OpenAI Batch submission is not implemented in this worker; true fails explicitly rather than silently falling back. |
 
 Constructor arguments override environment defaults. `reasoning_effort` overrides

@@ -24,6 +24,7 @@ from backend.models.enrichment import (
 from backend.pdf_presentation import pdf_items
 from backend.quality_judge import JudgeCache, JudgeDecision, QualityJudgment, judge_candidates
 from backend.quality_applicability import build_applicability_map, candidate_applicability
+from backend.quality_format import FORMAT_POLICY, canonical_value, comparison_key
 from backend.quality_definitions import (
     DEFINITION_RULES, StructuredDefinition, compact_instruction, derive_definition, model_instruction,
     normalize_proposal, source_bearing_texts,
@@ -771,6 +772,101 @@ def _confirmed(candidate: Candidate) -> bool:
     return not isinstance(applicability, dict) or applicability.get("status") != "family-unconfirmed"
 
 
+EXTRACTION_CACHE_POLICY = "extraction-output-cache-v1"
+_CACHED_PHASES = frozenset({"extract", "refine", "second_look"})
+
+
+class ExtractionCache:
+    """Persisted structured extraction outputs keyed by the complete model request.
+
+    The key covers the item evidence and definitions (both inside the packet),
+    the phase prompt, shared instructions, schema, images and deployment, so a
+    changed input, prompt, policy or deployment never reuses an old output.
+    """
+
+    def __init__(self, store=None, *, namespace: str = "offline", deployment: str = ""):
+        self.store = store
+        self.namespace = hashlib.sha256(namespace.encode()).hexdigest()[:24]
+        self.deployment = deployment
+        self.memory: dict[str, dict] = {}
+
+    def key(self, *, task: str, packet: dict, schema, images: list[str] | None, evidence: list[Evidence]) -> str:
+        prefix, view = cached_packet_parts(packet)
+        fingerprint = sorted((e.evidence_id, e.source_id, e.source_version, e.source_tier, e.source_locator, e.text)
+                             for e in evidence)
+        return hashlib.sha256(json.dumps({
+            "policy": EXTRACTION_CACHE_POLICY, "deployment": self.deployment, "system": SHARED_SYSTEM,
+            "evidence": hashlib.sha256(json.dumps(fingerprint, ensure_ascii=True).encode()).hexdigest(),
+            "task": task, "schema": schema.__name__, "schema_json": schema.model_json_schema(),
+            "prefix": prefix, "view": view,
+            "images": [hashlib.sha256(image.encode()).hexdigest() for image in images or []],
+        }, sort_keys=True, ensure_ascii=True, default=str).encode()).hexdigest()
+
+    def path(self, key: str) -> str:
+        return f"quality-extraction-cache/{self.namespace}/{key}.json"
+
+    def get(self, key: str, schema):
+        if key not in self.memory and self.store is not None:
+            from backend.batch_store import Missing, read_json
+            try:
+                self.memory[key] = read_json(self.store, self.path(key))[0]
+            except Missing:
+                return None
+        record = self.memory.get(key)
+        if record is None:
+            return None
+        if record.get("policy") != EXTRACTION_CACHE_POLICY or record.get("schema") != schema.__name__:
+            raise ValueError("Extraction cache record does not match its key policy")
+        return schema.model_validate(record["response"])
+
+    def put(self, key: str, schema, response) -> None:
+        record = {"policy": EXTRACTION_CACHE_POLICY, "schema": schema.__name__,
+                  "response": response.model_dump(mode="json"),
+                  "created_at": datetime.now(timezone.utc).isoformat()}
+        if self.store is not None:
+            from backend.batch_store import Conflict, read_json, write_json
+            try:
+                write_json(self.store, self.path(key), record)
+            except Conflict:
+                record = read_json(self.store, self.path(key))[0]
+        self.memory[key] = record
+
+
+def _judge_rank(candidate: Candidate) -> int:
+    return {"accepted": 0, "judge_disputed": 1}.get(str(candidate.judge_status), 2)
+
+
+def finalize_display(attribute: AttributeResult, definition: AttributeDefinition, kind: str) -> None:
+    """Canonical display values; drop duplicates that differ only in presentation.
+
+    The kept duplicate is the best-judged one; the citations of dropped
+    duplicates stay inspectable under grounding["format_duplicates"].
+    """
+    if not attribute.candidates:
+        return
+    kept: dict[tuple, Candidate] = {}
+    for candidate in sorted(attribute.candidates, key=_judge_rank):
+        value = canonical_value(attribute.attribute_id, candidate.value, definition.allowed_values)
+        if value != candidate.value:
+            candidate.grounding = {**(candidate.grounding or {}), "display_format": {
+                "policy": FORMAT_POLICY, "original_value": candidate.value}}
+            candidate.value = value
+        key = (comparison_key(attribute.attribute_id, value), (candidate.unit or "").casefold())
+        if key in kept:
+            first = kept[key]
+            first.grounding = {**(first.grounding or {}), "format_duplicates": [
+                *(first.grounding or {}).get("format_duplicates", []),
+                {"evidence_ids": candidate.evidence_ids, "judge_status": candidate.judge_status,
+                 "supporting_quote": candidate.supporting_quote},
+            ]}
+            continue
+        kept[key] = candidate
+    order = {id(candidate): index for index, candidate in enumerate(attribute.candidates)}
+    attribute.candidates = sorted(kept.values(), key=lambda candidate: order[id(candidate)])
+    if attribute.status in {"conflict", "proposed"}:
+        attribute.status = "conflict" if len(kept) > 1 and kind != "Multi-Select" else "proposed"
+
+
 def _resolved(attribute: AttributeResult) -> bool:
     return (attribute.status == "existing" or attribute.status == "proposed"
             and bool(attribute.candidates)
@@ -809,6 +905,7 @@ def run_product(
     tool_loop_enabled: bool = False, tool_prices: dict | None = None,
     second_look_enabled: bool = False, tool_loop_max_steps: int = 6,
     requested_attribute_ids: set[str] | None = None,
+    extraction_cache: ExtractionCache | None = None,
 ) -> EnrichmentResult:
     """No retries and no DI. Callbacks make usage persistent before the next request."""
     definitions = {a.attribute_id: a for a in manifest.attributes}
@@ -837,12 +934,25 @@ def run_product(
         context = {"operation": "model", "item_id": manifest.product.item_id, "item_key": item_key,
                    "run_id": run_id, "call_id": f"{run_id}:{item_key or manifest.product.item_id}:{len(diagnostics) + 1}",
                    "tier": tier, "phase": phase, "call_index": len(diagnostics) + 1}
+        call_images = images if tier == "internal_pdf" and phase in {"extract", "refine"} else None
+        cache_key = None
+        if extraction_cache is not None and phase in _CACHED_PHASES:
+            cache_key = extraction_cache.key(task=tasks[phase], packet=packet, schema=schema, images=call_images,
+                                             evidence=evidence)
+            cached = extraction_cache.get(cache_key, schema)
+            if cached is not None:
+                diagnostics.append({**context, "operation": "extraction_cache", "status": "hit",
+                                    "cache_key": cache_key, "cost_usd": 0})
+                succeeded += 1
+                return cached
         response = complete_quality_call(
             completion, tasks[phase], packet, schema,
-            context=context, images=images if tier == "internal_pdf" and phase in {"extract", "refine"} else None,
+            context=context, images=call_images,
             usage_callback=usage_callback, before_call=before_call, diagnostics=diagnostics,
             prompt_cache_key=prompt_cache_key(definitions_prefix(packet)),
         )
+        if cache_key is not None:
+            extraction_cache.put(cache_key, schema, response)
         succeeded += 1
         return response
 
@@ -1140,6 +1250,7 @@ def run_product(
                 "applicability": candidate_applicability(candidate, final_mapping, evidence).model_dump(mode="json"),
             }
         attribute.reviewer_explanation = _sentence(attribute)
+        finalize_display(attribute, definitions[attribute.attribute_id], structured[attribute.attribute_id].kind)
     return EnrichmentResult(
         execution_mode="live_inference", candidate_source="llm",
         model_call_status="succeeded" if succeeded else "failed" if diagnostics else "skipped",

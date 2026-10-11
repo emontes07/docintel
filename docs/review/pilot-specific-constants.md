@@ -37,3 +37,12 @@ The proposed replacement direction is the same throughout. Keep rules as version
 
 - **Untrusted-evidence, citation, normalization and definition rules** in `SHARED_SYSTEM` / `DEFINITION_RULES`.
 - **Applicability statuses** (`exact`, `family-confirmed`, `family-unconfirmed`) and their reviewer questions.
+
+## Document binding and display formatting (added with the applicability-safe slice)
+
+| Location | Constant | What it does | Proposed data-driven replacement |
+|---|---|---|---|
+| `backend/quality_slice.py:25` | `STORED_DOCUMENTS` (`av-source-1` = `H14255N`, `av-source-4` = `AV11-xxxW-NL`) | The printed model/series identity of each stored PDF, used to bind it only to rows that name it or MPNs in that series. | A per-document `printed_identity` field captured at document registration (reviewed once per document), stored with the source binding. |
+| `backend/quality_slice.py:22` | `SEE/REF HS <drawing>` pattern; Ford `Submittal File` column | Reads the drawing/submittal a vendor row references. | A per-vendor-file profile entry `document_reference_columns` (the column-profiling call can classify it as a `link`/reference role). |
+| `backend/quality_applicability.py:345` | `_series_match`: `xx…` wildcard series patterns and five-digit drawing-number cores | Confirms a document for an MPN in its printed series unless the row names another document. | Per-vendor `mpn_series_rule` (pattern or core extraction) in the vendor master table. |
+| `backend/quality_format.py:19` | Technical tokens kept upper case; `MTR` → meter | Display formatting before scoring/review. | A category glossary (shared with the abbreviation map above). |

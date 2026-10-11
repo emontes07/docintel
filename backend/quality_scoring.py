@@ -344,6 +344,54 @@ def compare_reference(
     }
 
 
+RUN_STABILITY_CLASSES = ("identical", "format-only", "both-not-found", "changed", "only-left", "only-right")
+STABLE_RUN_CLASSES = frozenset({"identical", "format-only", "both-not-found"})
+
+
+def compare_runs(
+    slots: Sequence[tuple[str, str]],
+    left: Mapping[tuple[str, str], Sequence[Mapping]],
+    right: Mapping[tuple[str, str], Sequence[Mapping]],
+) -> dict:
+    """Run-to-run stability over complete candidate sets.
+
+    A slot is stable when both runs have the same multiset of (value, unit,
+    judge status) after display formatting, even if that set contains several
+    values. Conflicting values are not penalized when they recur identically.
+    Format-only differences (case, inch notation, inlet/outlet suffix, MTR)
+    with identical judge states are stable too.
+    """
+    from backend.quality_format import comparison_key
+
+    def raw(attribute: str, candidates: Sequence[Mapping]) -> list[tuple]:
+        return sorted((str(c.get("value")), str(c.get("unit") or ""), str(c.get("judge_status"))) for c in candidates)
+
+    def canonical(attribute: str, candidates: Sequence[Mapping]) -> list[tuple]:
+        return sorted(set((comparison_key(attribute, c.get("value")), _text(c.get("unit") or ""),
+                           str(c.get("judge_status"))) for c in candidates))
+
+    rows = []
+    for product, attribute in slots:
+        a, b = list(left.get((product, attribute), [])), list(right.get((product, attribute), []))
+        if not a and not b:
+            label = "both-not-found"
+        elif not b:
+            label = "only-left"
+        elif not a:
+            label = "only-right"
+        elif raw(attribute, a) == raw(attribute, b):
+            label = "identical"
+        elif canonical(attribute, a) == canonical(attribute, b):
+            label = "format-only"
+        else:
+            label = "changed"
+        rows.append({"product_id": product, "attribute_id": attribute, "comparison": label,
+                     "left": [dict(c) for c in a], "right": [dict(c) for c in b]})
+    counts = Counter(row["comparison"] for row in rows)
+    return {"counts": dict(counts), "stable": sum(counts[key] for key in STABLE_RUN_CLASSES),
+            "slots": len(rows), "rows": rows}
+
+
 def compare_answer_key(proposals: Sequence[Mapping], judgments: Mapping[tuple[str, str], Mapping]) -> dict:
     """Retain the Track B exact typed equality rule and explicit human decisions."""
     by_slot: dict[tuple[str, str], list[Mapping]] = {}

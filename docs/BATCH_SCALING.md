@@ -24,7 +24,8 @@ merges run-specific overrides, and passes them to
 --args=-mbackend.quality_worker --env-vars ...`; it does not update the shared
 job definition. Supplying the image and worker command/args is required: the
 Azure CLI otherwise omits execution environment overrides or starts the image's
-default API entrypoint. Use `./run.sh start-shards RUN_ID` with
+default API entrypoint. `DOCINTEL_IMAGE=<registry>/<repo>@sha256:<digest>` runs a
+different immutable image for that execution only. Use `./run.sh start-shards RUN_ID` with
 `QUALITY_SHARD_COUNT=N` (1–32) to start one execution per shard. Each receives
 its own `QUALITY_RUN_ID`,
 `QUALITY_SHARD_INDEX`, `QUALITY_SHARD_COUNT`, and therefore its own cost meter
@@ -44,6 +45,19 @@ bounded parameter (1–32). Keep ACA `parallelism=1` when using
 per-execution environment. ACA internal replicas do not receive distinct shard
 environment by themselves and must not all process the same shard.
 
+## Document-to-item binding
+
+A stored PDF is attached to a slice item only when the item's vendor row names
+that drawing/submittal (Mueller `SEE/REF HS …`, Ford `Submittal File`) or the
+MPN matches the document's printed model/series (`H14255N` → 14255-series MPNs;
+`AV11-xxxW-NL` → `AV11-nnnW-NL`). All other items are vendor-row-only, routed to a
+`no-pdf-<vendor file>` family, and the referenced-but-missing documents are
+listed in the batch record (`slice.missing_documents`). The applicability map
+confirms a bound document only when no different drawing/submittal is named by
+the exact product row; unconfirmed values stay Low confidence with a reviewer
+question, are not counted as confirmed coverage, and are never transferred
+family-wide.
+
 ## Amortized stages and caches
 
 - The family stage is keyed by PDF source identity/version, the complete
@@ -62,6 +76,12 @@ environment by themselves and must not all process the same shard.
   Candidate phrase maps are stored per `(source hash, definitions hash, policy
   version)`. Exact row/cell evidence is still loaded and cited separately for
   each item. Workbook parsing/index metrics are emitted in the run summary.
+- Extraction outputs (extract/refine/second-look) are persisted under
+  `quality-extraction-cache/<owner hash>/` keyed by the complete request: item
+  evidence fingerprint (IDs, versions, locators, text), definitions, phase
+  prompt, shared instructions, schema, images and deployment. A rerun on
+  identical inputs reuses them with no model call; set
+  `QUALITY_EXTRACTION_CACHE_ENABLED=false` to force fresh extraction.
 - Per-item results and checkpoints are written as soon as each item completes;
   the result stream and web-yield accumulator are bounded-memory. Cost state
   stays shard-local; there is no cross-shard read/modify/write cost object.

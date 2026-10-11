@@ -342,12 +342,39 @@ def _question(mpn: str, identifiers: list[str], references: list[str]) -> str:
     return question
 
 
+def _series_match(identifier: str, mpn: str) -> bool:
+    """A printed model series or drawing number that names this MPN's series.
+
+    ``AV11-xxxW-NL`` style patterns treat each run of two or more x's as that
+    many wildcard characters and must match the complete MPN. A drawing number
+    such as ``H14255N`` matches MPNs whose first token carries the same five
+    digit series core (``014255``, ``G14255``, ``0142550 2``); different cores
+    such as 14250 or 14258 never match.
+    """
+    ident, target = _text(identifier), _text(mpn)
+    if re.search(r"x{2,}", ident):
+        pattern = "".join(
+            f"[0-9a-z]{{{len(part)}}}" if re.fullmatch(r"x{2,}", part) else re.escape(part)
+            for part in re.split(r"(x{2,})", ident) if part
+        )
+        return re.fullmatch(pattern, target) is not None
+    drawing = re.fullmatch(r"[a-z]?(\d{5})[a-z]?", ident)
+    tokens = target.split()
+    product = re.fullmatch(r"[a-z0]?(\d{5})(?:\d{2})?", tokens[0]) if tokens else None
+    return bool(drawing and product and drawing[1] == product[1])
+
+
+_PHOTO_LABELS = {"photo id", "photo id path"}
+
+
 def build_applicability_map(manifest: Manifest, evidence: list[Evidence]) -> ApplicabilityMap:
     """Classify observed rows/pages, retaining the proof and unresolved questions.
 
     A family link requires a family/drawing reference in an exact product row
-    AND that same printed identifier in the target source. A source binding,
-    filename, MPN prefix, or prose mentioning the product is insufficient.
+    AND that same printed identifier in the target source, or a printed model
+    series/drawing number that matches the MPN (``_series_match``) while the
+    exact product row names no different drawing or submittal. A source binding,
+    filename, or prose mentioning the product is insufficient.
     Missing manifest sources and generated answers remain unconfirmed.
     """
     ids = [entry.evidence_id for entry in evidence]
@@ -360,6 +387,7 @@ def build_applicability_map(manifest: Manifest, evidence: list[Evidence]) -> App
     mpn = manifest.product.mpn
     exact: dict[str, list[ApplicabilityProof]] = {}
     references: dict[str, list[ApplicabilityProof]] = defaultdict(list)
+    row_documents: set[str] = set()
     foreign_rows: set[str] = set()
     for cells in rows:
         identity = _row_identity(cells, mpn)
@@ -373,6 +401,14 @@ def build_applicability_map(manifest: Manifest, evidence: list[Evidence]) -> App
             exact[cell.entry.evidence_id] = proofs
         for identifier, named_proofs in _references(cells):
             references[identifier].extend(proofs + named_proofs)
+        for cell in cells:
+            if cell.label in _PHOTO_LABELS or _UNCERTAIN_LINK.search(cell.value):
+                continue
+            candidates = [_identifier(cell.value)] if cell.label in _FAMILY_LABELS else _named(cell.value)
+            drawing_reference = re.search(r"\b(?:ref|see)\s+hs\b", cell.value, re.I) is not None
+            row_documents.update(value for value in candidates
+                                 if re.search(r"[a-z]", value) and re.search(r"\d", value)
+                                 or drawing_reference and re.fullmatch(r"\d{5}", value))
 
     scoped: dict[tuple, list[Evidence]] = defaultdict(list)
     for entry in usable:
@@ -440,6 +476,13 @@ def build_applicability_map(manifest: Manifest, evidence: list[Evidence]) -> App
             status = "family-confirmed"
             proofs = [proof for identifier in named for proof in named[identifier] + references[identifier]]
             reason = "An exact product row explicitly names the same family/drawing printed in this source."
+        elif ((series := [identifier for identifier in named if _series_match(identifier, mpn)])
+              and all(document in named or _series_match(document, mpn) for document in row_documents)
+              and entry.evidence_id not in foreign_rows and _scope(entry) not in foreign_pages):
+            status = "family-confirmed"
+            proofs = [proof for identifier in series for proof in named[identifier]]
+            reason = ("The MPN matches the model series or drawing number printed in this source, and its "
+                      "exact product row names no different drawing or submittal.")
         if status != "family-unconfirmed":
             question = None
         result[entry.source_id].evidence[entry.evidence_id] = EvidenceApplicability(
