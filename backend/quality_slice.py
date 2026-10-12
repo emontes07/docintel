@@ -216,7 +216,8 @@ def build_approved_angle_valve_slice(store, source_batch_id: str, owner: str) ->
         basis = document_binding(key, mpn, values)
         stored = STORED_DOCUMENTS[key]["identifier"].casefold()
         references = referenced_documents(key, values)
-        for reference in references or ["(none referenced)"]:
+        # Rows already covered by a stored document need no request when they name nothing else.
+        for reference in references or ([] if basis else ["(none referenced)"]):
             if reference.casefold() == stored:
                 continue
             entry = missing.setdefault(reference, {"document": reference, "vendor": key, "items": 0, "mpns": []})
