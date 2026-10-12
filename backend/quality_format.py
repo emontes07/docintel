@@ -17,8 +17,11 @@ _INCH = re.compile(r"(?<=\d)\s*(?:inches|inch|in\b|[\"\u2033\u201d])", re.I)
 _TRAILING = {"Inlet": re.compile(r"\s+INLET\s*$", re.I), "Outlet": re.compile(r"\s+OUTLET\s*$", re.I)}
 _MTR = re.compile(r"\bMTR\b", re.I)
 _TECHNICAL = re.compile(
-    r"\b(?:AWWA|ASTM|UNS|NSF|ANSI|EPDM|PTFE|PVC|PEP|CTS|FPT|MPT|FIP|MIP|PSI|NL|IPS|PE|DI)\b", re.I,
+    r"\b(?:AWWA|ASTM|UNS|NSF|ANSI|EPDM|PTFE|PVC|PEP|CTS|FPT|MPT|FIP|MIP|PSI|NL|IPS|IP|NPT|OD|ID|PE|DI)\b", re.I,
 )
+# Letter-digit codes (NSF61, C83600, D2000) keep their printed capitals.
+_CODE = re.compile(r"\b(?=[A-Z0-9-]*[A-Z])(?=[A-Z0-9-]*\d)[A-Z0-9-]+\b")
+_DIMENSION_X = re.compile(r'(?<=[\d"])(\s*)[Xx](?=\s*\d)')
 
 
 def _sentence_case(text: str) -> str:
@@ -26,10 +29,13 @@ def _sentence_case(text: str) -> str:
     if not letters or not all(char.isupper() for char in letters):
         return text
     lowered = text.lower()
+    if len(lowered) == len(text):
+        keep = [False] * len(text)
+        for match in _CODE.finditer(text):
+            keep[match.start():match.end()] = [True] * (match.end() - match.start())
+        lowered = "".join(original if kept else low for original, low, kept in zip(text, lowered, keep))
     lowered = lowered[:1].upper() + lowered[1:]
-    lowered = _TECHNICAL.sub(lambda match: match[0].upper(), lowered)
-    # Alloy and specification codes such as C83600 or B62 keep their capital letter.
-    return re.sub(r"\b([a-z])(?=\d)", lambda match: match[1].upper(), lowered)
+    return _TECHNICAL.sub(lambda match: match[0].upper(), lowered)
 
 
 def canonical_text(attribute_id: str, text: str) -> str:
@@ -42,7 +48,7 @@ def canonical_text(attribute_id: str, text: str) -> str:
                 body = stripped
     body = _MTR.sub(lambda match: "METER" if match[0].isupper() else "meter", body)
     body = " ".join(body.split())
-    return _sentence_case(body)
+    return _DIMENSION_X.sub(lambda match: match[1] + "x", _sentence_case(body))
 
 
 def canonical_value(attribute_id: str, value, allowed_values: list | tuple = ()):

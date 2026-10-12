@@ -29,6 +29,12 @@ NOW = datetime(2026, 10, 11, tzinfo=timezone.utc)
     ("Valve Type", "Other: ANGLE MTR STOP", "Other: Angle meter stop"),
     ("Material Standard (Brass Alloy)", "Other: CAST BRASS ASTM B62 ALLOY C83600", "Other: Cast brass ASTM B62 alloy C83600"),
     ("Valve Type", "Other: Angle Key Service Valves", "Other: Angle Key Service Valves"),
+    ("Certifications / Standards Compliance", "Other: NSF61", "Other: NSF61"),
+    ("Inlet Size", 'Other: 1.625" OD TUBING INLET', 'Other: 1.625" OD tubing inlet'),
+    ("Inlet Connection Type", "Other: INSIDE IP THREAD INLET", "Other: Inside IP thread"),
+    ("Valve Type", 'Other: 5/8 X 3/4 X1" ANGLE METER STOP', 'Other: 5/8 x 3/4 x1" angle meter stop'),
+    ("Compatible Meter Size", 'Other: 5/8X3/4"', 'Other: 5/8x3/4"'),
+    ("Seal / Softgoods Material", "Other: NITRILE ASTM D2000", "Other: Nitrile ASTM D2000"),
 ])
 def test_canonical_display_formatting(attribute, value, expected):
     assert canonical_value(attribute, value) == expected
