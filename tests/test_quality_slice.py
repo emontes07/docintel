@@ -174,3 +174,5 @@ def test_documents_bind_only_to_named_or_series_matching_rows():
     missing = {entry["document"]: entry["items"] for entry in result["slice"]["missing_documents"]}
     assert missing["H14250"] == 3 and missing["AV94-444W-Q-NL"] == 1 and missing["AV92-xxxD-NL"] == 1
     assert "H14255N" not in missing and "AV11-xxxW-NL" not in missing
+    none = next(entry for entry in result["slice"]["missing_documents"] if entry["document"] == "(none referenced)")
+    assert "014255 1 215N" not in none["mpns"] and "AV21-333W-NL" in none["mpns"] and "014258 215N" in none["mpns"]
