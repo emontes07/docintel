@@ -53,13 +53,14 @@ docintel_start() {
   : "${QUALITY_BATCH_ID:?Set QUALITY_BATCH_ID to the existing batch ID}"
   : "${QUALITY_OWNER:?Set QUALITY_OWNER to the existing tenant/object owner identity}"
   docintel_run_id "$QUALITY_BATCH_ID"
-  local environment=("QUALITY_RUN_ID=$1" "QUALITY_BATCH_ID=$QUALITY_BATCH_ID" "QUALITY_OWNER=$QUALITY_OWNER")
+  # Run-specific values must never be inherited from the job's base environment.
+  local environment=("QUALITY_RUN_ID=$1" "QUALITY_BATCH_ID=$QUALITY_BATCH_ID" "QUALITY_OWNER=$QUALITY_OWNER"
+    "QUALITY_COST_RUN_ID=${QUALITY_COST_RUN_ID:-$1}")
   [[ -n "${QUALITY_WEB_ENABLED:-}" ]] && environment+=("QUALITY_WEB_ENABLED=$QUALITY_WEB_ENABLED")
   [[ -n "${QUALITY_FORD_IMAGE_BLOB:-}" ]] && environment+=("QUALITY_FORD_IMAGE_BLOB=$QUALITY_FORD_IMAGE_BLOB")
   [[ -n "${QUALITY_SMOKE_ONLY:-}" ]] && environment+=("QUALITY_SMOKE_ONLY=$QUALITY_SMOKE_ONLY")
   [[ -n "${QUALITY_SMOKE_FIRST:-}" ]] && environment+=("QUALITY_SMOKE_FIRST=$QUALITY_SMOKE_FIRST")
   [[ -n "${QUALITY_OCR_SMOKE:-}" ]] && environment+=("QUALITY_OCR_SMOKE=$QUALITY_OCR_SMOKE")
-  [[ -n "${QUALITY_COST_RUN_ID:-}" ]] && environment+=("QUALITY_COST_RUN_ID=$QUALITY_COST_RUN_ID")
   [[ -n "${QUALITY_RUN_BASE_COST_USD:-}" ]] && environment+=("QUALITY_RUN_BASE_COST_USD=$QUALITY_RUN_BASE_COST_USD")
   [[ -n "${QUALITY_OVERNIGHT_PRIOR_COST_USD:-}" ]] && environment+=("QUALITY_OVERNIGHT_PRIOR_COST_USD=$QUALITY_OVERNIGHT_PRIOR_COST_USD")
   [[ -n "${QUALITY_RUN_CAP_USD:-}" ]] && environment+=("QUALITY_RUN_CAP_USD=$QUALITY_RUN_CAP_USD")

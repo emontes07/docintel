@@ -193,3 +193,20 @@ def test_unconfirmed_document_values_are_never_transferred_family_wide():
     av11 = manifest.model_copy(update={"product": manifest.product.model_copy(update={"mpn": "AV11-444W-NL"})})
     transferred = _transplant_family_candidates([family], av11, [heading, body])
     assert transferred and transferred[0].grounding["applicability"]["status"] == "family-confirmed"
+
+
+def test_format_duplicates_keep_the_confirmed_citation_over_an_unconfirmed_one():
+    from backend.models.enrichment import AttributeResult
+    from backend.quality_pipeline import finalize_display
+
+    definition = AttributeDefinition(attribute_id="Primary Material", description="", value_type="string")
+    unconfirmed = Candidate(attribute_id="Primary Material", value="Other: LOW LEAD BRASS", evidence_ids=["pdf"],
+                            supporting_quote="LOW LEAD BRASS", judge_status="accepted",
+                            grounding={"applicability": {"status": "family-unconfirmed"}})
+    exact = Candidate(attribute_id="Primary Material", value="Other: Low lead brass", evidence_ids=["row"],
+                      supporting_quote="LOW LEAD BRASS", judge_status="accepted",
+                      grounding={"applicability": {"status": "exact"}})
+    attribute = AttributeResult(attribute_id="Primary Material", status="conflict", candidates=[unconfirmed, exact])
+    finalize_display(attribute, definition, "Enumerated")
+    assert [c.evidence_ids for c in attribute.candidates] == [["row"]]
+    assert attribute.candidates[0].grounding["format_duplicates"][0]["applicability"] == "family-unconfirmed"

@@ -832,14 +832,17 @@ class ExtractionCache:
         self.memory[key] = record
 
 
-def _judge_rank(candidate: Candidate) -> int:
-    return {"accepted": 0, "judge_disputed": 1}.get(str(candidate.judge_status), 2)
+def _judge_rank(candidate: Candidate) -> tuple[int, int]:
+    applicability = ((candidate.grounding or {}).get("applicability") or {}).get("status")
+    return ({"accepted": 0, "judge_disputed": 1}.get(str(candidate.judge_status), 2),
+            {"exact": 0, "family-confirmed": 1}.get(applicability, 2))
 
 
 def finalize_display(attribute: AttributeResult, definition: AttributeDefinition, kind: str) -> None:
     """Canonical display values; drop duplicates that differ only in presentation.
 
-    The kept duplicate is the best-judged one; the citations of dropped
+    The kept duplicate is the best-judged one, then the one with the strongest
+    applicability (exact, family-confirmed, unconfirmed); the citations of dropped
     duplicates stay inspectable under grounding["format_duplicates"].
     """
     if not attribute.candidates:
@@ -857,7 +860,8 @@ def finalize_display(attribute: AttributeResult, definition: AttributeDefinition
             first.grounding = {**(first.grounding or {}), "format_duplicates": [
                 *(first.grounding or {}).get("format_duplicates", []),
                 {"evidence_ids": candidate.evidence_ids, "judge_status": candidate.judge_status,
-                 "supporting_quote": candidate.supporting_quote},
+                 "supporting_quote": candidate.supporting_quote,
+                 "applicability": ((candidate.grounding or {}).get("applicability") or {}).get("status")},
             ]}
             continue
         kept[key] = candidate
