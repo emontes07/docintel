@@ -449,3 +449,12 @@ def test_start_rejects_a_mutable_image_override(invoke):
     })
     assert result.returncode != 0
     assert not any("<start>" in call for call in calls)
+
+
+def test_start_defaults_the_cost_meter_to_the_run_id_not_the_job_environment(invoke):
+    result, calls = invoke("start", "quality-004", environment={
+        "QUALITY_BATCH_ID": "batch-001", "QUALITY_OWNER": "tenant/owner",
+    })
+    assert result.returncode == 0, result.stderr
+    start = next(call for call in calls if "<start>" in call)
+    assert "<QUALITY_COST_RUN_ID=quality-004>" in start
