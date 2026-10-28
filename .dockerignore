@@ -20,6 +20,7 @@ notebooks
 tests
 docs
 output
+ops-backup
 tools
 scripts
 run.sh

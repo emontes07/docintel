@@ -41,6 +41,18 @@
     "frontDoorName": {
       "value": "${AZURE_FRONT_DOOR_NAME}"
     },
+    "sharedFrontDoorProfileId": {
+      "value": "${SHARED_FRONT_DOOR_PROFILE_ID=}"
+    },
+    "frontDoorEndpointName": {
+      "value": "${AZURE_FRONT_DOOR_ENDPOINT_NAME=}"
+    },
+    "frontDoorOriginGroupName": {
+      "value": "${AZURE_FRONT_DOOR_ORIGIN_GROUP_NAME=}"
+    },
+    "frontDoorOriginName": {
+      "value": "${AZURE_FRONT_DOOR_ORIGIN_NAME=}"
+    },
     "frontendCustomDomain": {
       "value": "${FRONTEND_CUSTOM_DOMAIN}"
     },

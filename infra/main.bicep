@@ -94,6 +94,16 @@ param vnetName string = 'vnet-${environmentName}'
 @description('Name of the Azure Front Door profile')
 param frontDoorName string = 'afd-${environmentName}'
 
+@description('Full resource ID of an existing Premium Front Door profile. Empty preserves dedicated-profile provisioning. Shared resources must be deployed in Incremental mode.')
+param sharedFrontDoorProfileId string = ''
+
+@description('Optional endpoint name. Shared mode defaults to <environmentName>-ep.')
+param frontDoorEndpointName string = ''
+@description('Optional origin group name. Shared mode defaults to <environmentName>-storage-origin-group.')
+param frontDoorOriginGroupName string = ''
+@description('Optional origin name. Shared mode defaults to <environmentName>-storage-blob-origin.')
+param frontDoorOriginName string = ''
+
 // Custom domain for frontend
 @description('Custom domain name for the frontend (e.g., visionary.go-agentic.com). Leave empty to skip.')
 param frontendCustomDomain string = ''
@@ -212,10 +222,20 @@ module cosmosPrivateEndpointMod './modules/privateEndpoint.bicep' = {
 
 // ─── Azure Front Door (CDN with private link to storage) ───
 var storageHostName = replace(replace(storageAccountMod.outputs.storageAccountPrimaryEndpoint, 'https://', ''), '/', '')
+var useSharedFrontDoor = !empty(sharedFrontDoorProfileId)
+var effectiveFrontDoorName = useSharedFrontDoor ? last(split(sharedFrontDoorProfileId, '/')) : frontDoorName
 module frontDoorMod './modules/frontDoor.bicep' = {
-  name: 'frontDoorMod'
+  name: useSharedFrontDoor ? 'frontDoor-${environmentName}' : 'frontDoorMod'
+  scope: resourceGroup(
+    useSharedFrontDoor ? split(sharedFrontDoorProfileId, '/')[2] : subscription().subscriptionId,
+    useSharedFrontDoor ? split(sharedFrontDoorProfileId, '/')[4] : resourceGroup().name
+  )
   params: {
-    frontDoorName: frontDoorName
+    frontDoorName: effectiveFrontDoorName
+    createProfile: !useSharedFrontDoor
+    endpointName: !empty(frontDoorEndpointName) ? frontDoorEndpointName : (useSharedFrontDoor ? '${environmentName}-ep' : '${frontDoorName}-ep')
+    originGroupName: !empty(frontDoorOriginGroupName) ? frontDoorOriginGroupName : (useSharedFrontDoor ? '${environmentName}-storage-origin-group' : 'storage-origin-group')
+    originName: !empty(frontDoorOriginName) ? frontDoorOriginName : (useSharedFrontDoor ? '${environmentName}-storage-blob-origin' : 'storage-blob-origin')
     storageAccountHostName: storageHostName
     storageAccountId: storageAccountMod.outputs.storageAccountId
     storageAccountLocation: location
@@ -498,6 +518,7 @@ output BACKEND_URI string = 'https://${containerAppBackend.outputs.containerAppF
 output BACKEND_INTERNAL_URI string = 'https://${containerAppBackend.outputs.containerAppFqdn}'
 output FRONTEND_URI string = 'https://${containerAppFrontend.outputs.containerAppFqdn}'
 output AZURE_STORAGE_ACCOUNT_NAME string = storageAccountName
+output AZURE_STORAGE_ACCOUNT_ID string = storageAccountMod.outputs.storageAccountId
 output AZURE_BLOB_SERVICE_URL string = storageAccountMod.outputs.storageAccountPrimaryEndpoint
 output AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT string = documentIntelligenceMod.outputs.docIntelEndpoint
 output AZURE_SEARCH_ENDPOINT string = searchServiceMod.outputs.searchEndpoint
@@ -508,3 +529,4 @@ output COSMOS_DB_ENDPOINT string = cosmosDbMod.outputs.cosmosAccountEndpoint
 output COSMOS_DB_DATABASE_NAME string = cosmosDbMod.outputs.databaseName
 output COSMOS_DB_CONTAINER_NAME string = cosmosDbMod.outputs.containerName
 output CDN_BLOB_URL string = 'https://${frontDoorMod.outputs.frontDoorEndpointHostName}'
+output AZURE_FRONT_DOOR_PRIVATE_LINK_REQUEST_MESSAGE string = frontDoorMod.outputs.privateLinkRequestMessage
