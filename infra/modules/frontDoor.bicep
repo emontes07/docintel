@@ -4,6 +4,13 @@
 @description('Name of the Front Door profile')
 param frontDoorName string
 
+@description('Create a dedicated Premium profile. Set false when deploying children into an existing shared profile.')
+param createProfile bool = true
+
+param endpointName string = '${frontDoorName}-ep'
+param originGroupName string = 'storage-origin-group'
+param originName string = 'storage-blob-origin'
+
 @description('Hostname of the storage account blob endpoint (e.g., stxxx.blob.core.windows.net)')
 param storageAccountHostName string
 
@@ -13,7 +20,11 @@ param storageAccountId string
 @description('Location of the storage account (required for private link)')
 param storageAccountLocation string
 
-resource frontDoorProfile 'Microsoft.Cdn/profiles@2024-02-01' = {
+var privateLinkRequestMessage = createProfile
+  ? 'Front Door private link to blob storage'
+  : 'Front Door private link: ${frontDoorName}/${originGroupName}/${originName}'
+
+resource newFrontDoorProfile 'Microsoft.Cdn/profiles@2024-02-01' = if (createProfile) {
   name: frontDoorName
   location: 'global'
   sku: {
@@ -22,18 +33,25 @@ resource frontDoorProfile 'Microsoft.Cdn/profiles@2024-02-01' = {
   properties: {}
 }
 
+resource frontDoorProfile 'Microsoft.Cdn/profiles@2024-02-01' existing = {
+  name: frontDoorName
+}
+
 resource frontDoorEndpoint 'Microsoft.Cdn/profiles/afdEndpoints@2024-02-01' = {
   parent: frontDoorProfile
-  name: '${frontDoorName}-ep'
+  name: endpointName
   location: 'global'
   properties: {
     enabledState: 'Enabled'
   }
+  dependsOn: [
+    newFrontDoorProfile
+  ]
 }
 
 resource originGroup 'Microsoft.Cdn/profiles/originGroups@2024-02-01' = {
   parent: frontDoorProfile
-  name: 'storage-origin-group'
+  name: originGroupName
   properties: {
     loadBalancingSettings: {
       sampleSize: 4
@@ -41,11 +59,14 @@ resource originGroup 'Microsoft.Cdn/profiles/originGroups@2024-02-01' = {
     }
     healthProbeSettings: null
   }
+  dependsOn: [
+    newFrontDoorProfile
+  ]
 }
 
 resource origin 'Microsoft.Cdn/profiles/originGroups/origins@2024-02-01' = {
   parent: originGroup
-  name: 'storage-blob-origin'
+  name: originName
   properties: {
     hostName: storageAccountHostName
     originHostHeader: storageAccountHostName
@@ -60,7 +81,7 @@ resource origin 'Microsoft.Cdn/profiles/originGroups/origins@2024-02-01' = {
       }
       groupId: 'blob'
       privateLinkLocation: storageAccountLocation
-      requestMessage: 'Front Door private link to blob storage'
+      requestMessage: privateLinkRequestMessage
     }
   }
 }
@@ -89,3 +110,4 @@ resource route 'Microsoft.Cdn/profiles/afdEndpoints/routes@2024-02-01' = {
 
 output frontDoorEndpointHostName string = frontDoorEndpoint.properties.hostName
 output frontDoorProfileId string = frontDoorProfile.id
+output privateLinkRequestMessage string = privateLinkRequestMessage

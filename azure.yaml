@@ -26,32 +26,42 @@ hooks:
     posix:
       shell: sh
       run: |
+        set -eu
         echo "Infrastructure provisioned successfully"
         echo "Approving Front Door private link connection to storage account..."
-        STORAGE_NAME=$(azd env get-value AZURE_STORAGE_ACCOUNT_NAME 2>/dev/null || echo "")
-        if [ -n "$STORAGE_NAME" ]; then
-          PE_CONN_ID=$(az storage account show --name "$STORAGE_NAME" --query "privateEndpointConnections[?privateLinkServiceConnectionState.status=='Pending'].id" -o tsv 2>/dev/null | head -1)
-          if [ -n "$PE_CONN_ID" ]; then
-            az network private-endpoint-connection approve --id "$PE_CONN_ID" --description "Approved by azd postprovision" 2>/dev/null && echo "Private link connection approved." || echo "Warning: Could not auto-approve private link. Approve manually in Azure Portal."
-          else
-            echo "No pending private link connections found (may already be approved)."
-          fi
+        STORAGE_ID=$(azd env get-value AZURE_STORAGE_ACCOUNT_ID)
+        REQUEST_MESSAGE=$(azd env get-value AZURE_FRONT_DOOR_PRIVATE_LINK_REQUEST_MESSAGE)
+        test -n "$STORAGE_ID" && test -n "$REQUEST_MESSAGE" || { echo "Missing storage ID or Front Door request message" >&2; exit 1; }
+        PE_CONN_ID=$(az storage account show --ids "$STORAGE_ID" --query "privateEndpointConnections[?privateLinkServiceConnectionState.status=='Pending' && privateLinkServiceConnectionState.description=='$REQUEST_MESSAGE'].id" -o tsv)
+        if [ -z "$PE_CONN_ID" ]; then
+          echo "No matching pending Front Door private link connection."
+          exit 0
         fi
+        case "$PE_CONN_ID" in
+          *[[:space:]]*) echo "Multiple matching connections; refusing to approve" >&2; exit 1 ;;
+        esac
+        az network private-endpoint-connection approve --id "$PE_CONN_ID" --description "Approved by azd postprovision"
+        echo "Private link connection approved."
     windows:
       shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
         Write-Host "Infrastructure provisioned successfully"
         Write-Host "Approving Front Door private link connection to storage account..."
-        $storageName = azd env get-value AZURE_STORAGE_ACCOUNT_NAME 2>$null
-        if ($storageName) {
-          $peConnId = az storage account show --name $storageName --query "privateEndpointConnections[?privateLinkServiceConnectionState.status=='Pending'].id" -o tsv 2>$null | Select-Object -First 1
-          if ($peConnId) {
-            az network private-endpoint-connection approve --id $peConnId --description "Approved by azd postprovision" 2>$null
-            if ($LASTEXITCODE -eq 0) { Write-Host "Private link connection approved." } else { Write-Host "Warning: Could not auto-approve private link. Approve manually in Azure Portal." }
-          } else {
-            Write-Host "No pending private link connections found (may already be approved)."
-          }
+        $storageId = azd env get-value AZURE_STORAGE_ACCOUNT_ID
+        if ($LASTEXITCODE -ne 0 -or !$storageId) { throw "Missing storage ID" }
+        $requestMessage = azd env get-value AZURE_FRONT_DOOR_PRIVATE_LINK_REQUEST_MESSAGE
+        if ($LASTEXITCODE -ne 0 -or !$requestMessage) { throw "Missing Front Door request message" }
+        $peConnIds = @(az storage account show --ids $storageId --query "privateEndpointConnections[?privateLinkServiceConnectionState.status=='Pending' && privateLinkServiceConnectionState.description=='$requestMessage'].id" -o tsv)
+        if ($LASTEXITCODE -ne 0) { throw "Could not read private link connections" }
+        if ($peConnIds.Count -eq 0) {
+          Write-Host "No matching pending Front Door private link connection."
+          exit 0
         }
+        if ($peConnIds.Count -ne 1) { throw "Multiple matching connections; refusing to approve" }
+        az network private-endpoint-connection approve --id $peConnIds[0] --description "Approved by azd postprovision"
+        if ($LASTEXITCODE -ne 0) { throw "Private link approval failed" }
+        Write-Host "Private link connection approved."
 
 infra:
   provider: bicep

@@ -1,5 +1,6 @@
 # Azure Developer CLI
 .azure/
+ops-backup/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
